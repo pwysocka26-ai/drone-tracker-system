@@ -1,0 +1,10 @@
+﻿__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.mp4
+tmp_fix*.py
+fix_*.py
+patch_*.py
+video_test.py
+test.py

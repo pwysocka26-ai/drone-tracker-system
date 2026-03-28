@@ -4,11 +4,13 @@ import numpy as np
 from ultralytics import YOLO
 from core.target_manager import TargetManager
 from core.narrow_tracker import NarrowTracker
+from core.stable_registry import StableTargetRegistry
 
 
 class Track:
-    def __init__(self, track_id, bbox_xyxy, center_xy, confidence):
+    def __init__(self, track_id, bbox_xyxy, center_xy, confidence, raw_id=None):
         self.track_id = int(track_id)
+        self.raw_id = int(raw_id if raw_id is not None else track_id)
         self.bbox_xyxy = bbox_xyxy
         self.center_xy = center_xy
         self.confidence = float(confidence)
@@ -188,28 +190,34 @@ def parse_tracks(result, frame_shape):
 
     xyxy = boxes.xyxy.cpu().numpy()
     confs = boxes.conf.cpu().numpy().tolist() if boxes.conf is not None else [0.0] * len(xyxy)
-    ids = boxes.id.cpu().numpy().astype(int).tolist() if boxes.id is not None else list(range(1, len(xyxy) + 1))
+    raw_ids = boxes.id.cpu().numpy().astype(int).tolist() if boxes.id is not None else list(range(1, len(xyxy) + 1))
 
-    for box, conf, tid in zip(xyxy, confs, ids):
+    for box, conf, raw_id in zip(xyxy, confs, raw_ids):
         x1, y1, x2, y2 = [float(v) for v in box]
         cy = (y1 + y2) / 2.0
+
+        # odfiltruj śmieci nisko w kadrze
         if cy > h * 0.78:
             continue
 
         bw = x2 - x1
         bh = y2 - y1
         area = bw * bh
+
+        # odfiltruj ewidentnie za duże obiekty
         if area > (w * h * 0.03):
             continue
 
-        tracks.append(Track(
-            track_id=int(tid),
-            bbox_xyxy=(x1, y1, x2, y2),
-            center_xy=((x1 + x2) / 2.0, (y1 + y2) / 2.0),
-            confidence=float(conf),
-        ))
+        tracks.append(
+            Track(
+                track_id=int(raw_id),
+                raw_id=int(raw_id),
+                bbox_xyxy=(x1, y1, x2, y2),
+                center_xy=((x1 + x2) / 2.0, (y1 + y2) / 2.0),
+                confidence=float(conf),
+            )
+        )
 
-    tracks.sort(key=lambda t: t.center_xy[0])
     return tracks
 
 
@@ -236,8 +244,9 @@ def run_app(config):
         print(f"Nie moge otworzyc pliku: {source}")
         return
 
-    target_manager = TargetManager(reacquire_radius_auto=85.0, reacquire_radius_manual=120.0, sticky_frames=60)
-    narrow_tracker = NarrowTracker(hold_frames=120)
+    stable_registry = StableTargetRegistry(max_missing=25, match_distance=140.0, min_iou=0.01)
+    target_manager = TargetManager(reacquire_radius_auto=100.0, reacquire_radius_manual=140.0, sticky_frames=75)
+    narrow_tracker = NarrowTracker(hold_frames=140)
 
     window_name = "Drone Tracker Multiview"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
@@ -250,6 +259,9 @@ def run_app(config):
         ret, frame = cap.read()
         if not ret:
             cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            stable_registry.reset()
+            target_manager.set_auto_mode()
+            narrow_tracker.reset()
             ret, frame = cap.read()
             if not ret:
                 break
@@ -267,19 +279,13 @@ def run_app(config):
                 verbose=False,
             )
             result = results[0]
-            tracks = parse_tracks(result, frame.shape)
+            det_tracks = parse_tracks(result, frame.shape)
+            tracks = stable_registry.update(det_tracks)
 
-        visible_sorted = sorted(tracks, key=lambda t: t.center_xy[0])[:9]
-        display_map = {tr.track_id: i for i, tr in enumerate(visible_sorted, start=1)}
-
+        visible_sorted = sorted(tracks, key=lambda t: t.track_id)
         predicted_center = narrow_tracker.kalman.predict()
 
-        if not target_manager.manual_lock:
-            target_manager.update(tracks, predicted_center, frame.shape)
-        else:
-            # w MANUAL próbujemy odzyskać ten sam cel, ale nie przełączamy się samoczynnie na "losowy"
-            target_manager.update(tracks, predicted_center, frame.shape)
-
+        target_manager.update(tracks, predicted_center, frame.shape)
         active_track = target_manager.find_active_track(tracks)
 
         predicted_center, smooth_center, smooth_zoom, hold_count, pan_speed, tilt_speed = narrow_tracker.update(frame, active_track)
@@ -287,11 +293,11 @@ def run_app(config):
         wide_program = crop_group(frame, tracks, (780, 360))
 
         debug_frame = draw_tracks(frame, tracks, target_manager.selected_id)
-        for i, tr in enumerate(visible_sorted, start=1):
+        for tr in visible_sorted:
             x1, y1, x2, y2 = [int(v) for v in tr.bbox_xyxy]
             cv2.putText(
                 debug_frame,
-                f"[{i}]",
+                f"[{tr.track_id}]",
                 (x1, max(30, y1 - 30)),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.9,
@@ -314,8 +320,7 @@ def run_app(config):
             cv2.putText(narrow_output, f"HOLD {hold_count}", (20, 184), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
 
             if active_track is not None:
-                display_no = display_map.get(active_track.track_id, "?")
-                narrow_output = draw_target_on_narrow(narrow_output, narrow_crop_rect, active_track, display_no)
+                narrow_output = draw_target_on_narrow(narrow_output, narrow_crop_rect, active_track, active_track.track_id)
 
             cv2.line(narrow_output, (390, 0), (390, 360), (0, 255, 255), 1)
             cv2.line(narrow_output, (0, 180), (780, 180), (0, 255, 255), 1)
@@ -344,9 +349,9 @@ def run_app(config):
             target_manager.set_auto_mode()
             narrow_tracker.reset()
         elif key in (ord("1"), ord("2"), ord("3"), ord("4"), ord("5"), ord("6"), ord("7"), ord("8"), ord("9")):
-            idx = int(chr(key)) - 1
-            if idx < len(visible_sorted):
-                tr = visible_sorted[idx]
+            wanted = int(chr(key))
+            tr = next((t for t in tracks if t.track_id == wanted), None)
+            if tr is not None:
                 target_manager.set_manual_target(tr.track_id)
                 narrow_tracker.reset()
                 narrow_tracker.kalman.init_state(tr.center_xy[0], tr.center_xy[1])

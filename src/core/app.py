@@ -2,6 +2,8 @@
 import numpy as np
 
 from ultralytics import YOLO
+from core.target_manager import TargetManager
+from core.narrow_tracker import NarrowTracker
 
 
 class Track:
@@ -10,48 +12,6 @@ class Track:
         self.bbox_xyxy = bbox_xyxy
         self.center_xy = center_xy
         self.confidence = float(confidence)
-
-
-class SimpleKalman2D:
-    def __init__(self):
-        self.kf = cv2.KalmanFilter(4, 2)
-        self.kf.measurementMatrix = np.array(
-            [[1, 0, 0, 0],
-             [0, 1, 0, 0]],
-            np.float32,
-        )
-        self.kf.transitionMatrix = np.array(
-            [[1, 0, 1, 0],
-             [0, 1, 0, 1],
-             [0, 0, 1, 0],
-             [0, 0, 0, 1]],
-            np.float32,
-        )
-        self.kf.processNoiseCov = np.eye(4, dtype=np.float32) * 0.01
-        self.kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * 0.12
-        self.kf.errorCovPost = np.eye(4, dtype=np.float32)
-        self.initialized = False
-
-    def reset(self):
-        self.initialized = False
-
-    def init_state(self, x, y):
-        self.kf.statePost = np.array([[x], [y], [0], [0]], np.float32)
-        self.initialized = True
-
-    def predict(self):
-        if not self.initialized:
-            return None
-        pred = self.kf.predict()
-        return float(pred[0, 0]), float(pred[1, 0])
-
-    def correct(self, x, y):
-        if not self.initialized:
-            self.init_state(x, y)
-            return (x, y)
-        m = np.array([[x], [y]], np.float32)
-        est = self.kf.correct(m)
-        return float(est[0, 0]), float(est[1, 0])
 
 
 def clamp_box(x1, y1, x2, y2, w, h):
@@ -70,7 +30,7 @@ def clamp_box(x1, y1, x2, y2, w, h):
     return max(0, int(x1)), max(0, int(y1)), min(w, int(x2)), min(h, int(y2))
 
 
-def crop_to_16_9(frame, center=None, scale=2.5, out_size=(780, 360)):
+def crop_to_16_9(frame, center=None, scale=2.5, out_size=(780, 360), return_meta=False):
     out_w, out_h = out_size
     h, w = frame.shape[:2]
     aspect = out_w / out_h
@@ -98,8 +58,15 @@ def crop_to_16_9(frame, center=None, scale=2.5, out_size=(780, 360)):
 
     crop = frame[y1:y2, x1:x2]
     if crop.size == 0:
-        return cv2.resize(frame, out_size)
-    return cv2.resize(crop, out_size, interpolation=cv2.INTER_LINEAR)
+        resized = cv2.resize(frame, out_size)
+        if return_meta:
+            return resized, (0, 0, w, h)
+        return resized
+
+    resized = cv2.resize(crop, out_size, interpolation=cv2.INTER_LINEAR)
+    if return_meta:
+        return resized, (x1, y1, x2, y2)
+    return resized
 
 
 def crop_group(frame, tracks, out_size=(780, 360)):
@@ -147,6 +114,44 @@ def crop_group(frame, tracks, out_size=(780, 360)):
     return cv2.resize(crop, out_size, interpolation=cv2.INTER_LINEAR)
 
 
+def draw_target_on_narrow(narrow_frame, crop_rect, track, display_no="?"):
+    if track is None:
+        return narrow_frame
+
+    x1, y1, x2, y2 = track.bbox_xyxy
+    cx1, cy1, cx2, cy2 = crop_rect
+
+    crop_w = max(1, cx2 - cx1)
+    crop_h = max(1, cy2 - cy1)
+
+    nh, nw = narrow_frame.shape[:2]
+
+    nx1 = int((x1 - cx1) * nw / crop_w)
+    ny1 = int((y1 - cy1) * nh / crop_h)
+    nx2 = int((x2 - cx1) * nw / crop_w)
+    ny2 = int((y2 - cy1) * nh / crop_h)
+
+    nx1 = max(0, min(nw - 1, nx1))
+    ny1 = max(0, min(nh - 1, ny1))
+    nx2 = max(0, min(nw - 1, nx2))
+    ny2 = max(0, min(nh - 1, ny2))
+
+    if nx2 > nx1 and ny2 > ny1:
+        cv2.rectangle(narrow_frame, (nx1, ny1), (nx2, ny2), (0, 255, 255), 2)
+        cv2.circle(narrow_frame, ((nx1 + nx2) // 2, (ny1 + ny2) // 2), 4, (0, 255, 255), -1)
+        cv2.putText(
+            narrow_frame,
+            f"TRACKED TARGET [{display_no}]",
+            (max(10, nx1), max(28, ny1 - 8)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (0, 255, 255),
+            2,
+        )
+
+    return narrow_frame
+
+
 def add_title(panel, title):
     cv2.rectangle(panel, (0, 0), (440, 56), (0, 0, 0), -1)
     cv2.putText(panel, title, (20, 38), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
@@ -187,7 +192,6 @@ def parse_tracks(result, frame_shape):
 
     for box, conf, tid in zip(xyxy, confs, ids):
         x1, y1, x2, y2 = [float(v) for v in box]
-
         cy = (y1 + y2) / 2.0
         if cy > h * 0.78:
             continue
@@ -198,63 +202,21 @@ def parse_tracks(result, frame_shape):
         if area > (w * h * 0.03):
             continue
 
-        tracks.append(
-            Track(
-                track_id=int(tid),
-                bbox_xyxy=(x1, y1, x2, y2),
-                center_xy=((x1 + x2) / 2.0, (y1 + y2) / 2.0),
-                confidence=float(conf),
-            )
-        )
+        tracks.append(Track(
+            track_id=int(tid),
+            bbox_xyxy=(x1, y1, x2, y2),
+            center_xy=((x1 + x2) / 2.0, (y1 + y2) / 2.0),
+            confidence=float(conf),
+        ))
 
-    tracks.sort(key=lambda t: t.track_id)
+    tracks.sort(key=lambda t: t.center_xy[0])
     return tracks
-
-
-def choose_auto_target(tracks, selected_id, predicted_center, lock_age):
-    if not tracks:
-        return selected_id
-
-    for tr in tracks:
-        if tr.track_id == selected_id:
-            return tr.track_id
-
-    if selected_id is not None and lock_age < 60:
-        return selected_id
-
-    if predicted_center is not None:
-        candidates = []
-        for t in tracks:
-            dist = np.hypot(t.center_xy[0] - predicted_center[0], t.center_xy[1] - predicted_center[1])
-            candidates.append((dist, -t.confidence, t))
-        candidates.sort(key=lambda x: (x[0], x[1]))
-        best_dist, _, best_track = candidates[0]
-        if best_dist <= 85.0:
-            return best_track.track_id
-        return selected_id
-
-    def score(tr):
-        x1, y1, x2, y2 = tr.bbox_xyxy
-        area = max(1.0, (x2 - x1) * (y2 - y1))
-        return (y1, -tr.confidence, -area)
-
-    return min(tracks, key=score).track_id
-
-
-def desired_zoom(frame, track):
-    h, w = frame.shape[:2]
-    x1, y1, x2, y2 = track.bbox_xyxy
-    tw = max(1.0, x2 - x1)
-    th = max(1.0, y2 - y1)
-    rel = max(tw / w, th / h)
-    z = 0.055 / max(rel, 0.012)
-    return float(np.clip(z, 2.0, 3.4))
 
 
 def run_app(config):
     mode = config.get("mode", "video")
     if mode != "video":
-        print("Ta wersja YOLO jest przygotowana do testow wideo.")
+        print("Ta wersja jest przygotowana do testow wideo.")
         return
 
     video_cfg = config.get("video") or {}
@@ -269,26 +231,17 @@ def run_app(config):
     inference_every = int(yolo_cfg.get("inference_every", 1))
 
     model = YOLO(model_name)
-
     cap = cv2.VideoCapture(source)
     if not cap.isOpened():
         print(f"Nie moge otworzyc pliku: {source}")
         return
 
+    target_manager = TargetManager(reacquire_radius_auto=85.0, reacquire_radius_manual=120.0, sticky_frames=60)
+    narrow_tracker = NarrowTracker(hold_frames=120)
+
     window_name = "Drone Tracker Multiview"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(window_name, 1600, 900)
-
-    selected_id = None
-    manual_lock = False
-
-    kalman = SimpleKalman2D()
-    predicted_center = None
-    smooth_center = None
-    smooth_zoom = 2.35
-
-    hold_count = 0
-    lock_age = 9999
 
     frame_id = 0
     tracks = []
@@ -316,96 +269,66 @@ def run_app(config):
             result = results[0]
             tracks = parse_tracks(result, frame.shape)
 
-        predicted_center = kalman.predict()
+        visible_sorted = sorted(tracks, key=lambda t: t.center_xy[0])[:9]
+        display_map = {tr.track_id: i for i, tr in enumerate(visible_sorted, start=1)}
 
-        if not manual_lock:
-            selected_id = choose_auto_target(tracks, selected_id, predicted_center, lock_age)
+        predicted_center = narrow_tracker.kalman.predict()
 
-        active_track = None
-        for tr in tracks:
-            if tr.track_id == selected_id:
-                active_track = tr
-                break
-
-        if active_track is None and predicted_center is not None and tracks:
-            candidates = []
-            for t in tracks:
-                dist = np.hypot(t.center_xy[0] - predicted_center[0], t.center_xy[1] - predicted_center[1])
-                candidates.append((dist, -t.confidence, t))
-            candidates.sort(key=lambda x: (x[0], x[1]))
-            best_dist, _, best_track = candidates[0]
-            if best_dist <= 85.0:
-                active_track = best_track
-                selected_id = best_track.track_id
-
-        if active_track is not None:
-            corrected = kalman.correct(active_track.center_xy[0], active_track.center_xy[1])
-            predicted_center = corrected
-            hold_count = 0
-            lock_age = 0
-
-            if smooth_center is None:
-                smooth_center = corrected
-            else:
-                a = 0.975
-                smooth_center = (
-                    a * smooth_center[0] + (1.0 - a) * corrected[0],
-                    a * smooth_center[1] + (1.0 - a) * corrected[1],
-                )
-
-            dz = desired_zoom(frame, active_track)
-            smooth_zoom = 0.985 * smooth_zoom + 0.015 * dz
+        if not target_manager.manual_lock:
+            target_manager.update(tracks, predicted_center, frame.shape)
         else:
-            hold_count += 1
-            lock_age += 1
+            # w MANUAL próbujemy odzyskać ten sam cel, ale nie przełączamy się samoczynnie na "losowy"
+            target_manager.update(tracks, predicted_center, frame.shape)
 
-            if predicted_center is not None:
-                if smooth_center is None:
-                    smooth_center = predicted_center
-                else:
-                    a_hold = 0.985
-                    smooth_center = (
-                        a_hold * smooth_center[0] + (1.0 - a_hold) * predicted_center[0],
-                        a_hold * smooth_center[1] + (1.0 - a_hold) * predicted_center[1],
-                    )
+        active_track = target_manager.find_active_track(tracks)
 
-            if hold_count > 120:
-                selected_id = None
-                predicted_center = None
-                smooth_center = None
-                smooth_zoom = 2.35
-                hold_count = 0
-                lock_age = 9999
-                kalman.reset()
+        predicted_center, smooth_center, smooth_zoom, hold_count, pan_speed, tilt_speed = narrow_tracker.update(frame, active_track)
 
         wide_program = crop_group(frame, tracks, (780, 360))
-        wide_debug = crop_group(draw_tracks(frame, tracks, selected_id), tracks, (1560, 450))
+
+        debug_frame = draw_tracks(frame, tracks, target_manager.selected_id)
+        for i, tr in enumerate(visible_sorted, start=1):
+            x1, y1, x2, y2 = [int(v) for v in tr.bbox_xyxy]
+            cv2.putText(
+                debug_frame,
+                f"[{i}]",
+                (x1, max(30, y1 - 30)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.9,
+                (255, 255, 0),
+                2,
+            )
+
+        wide_debug = crop_group(debug_frame, tracks, (1560, 450))
 
         if smooth_center is not None:
-            narrow_output = crop_to_16_9(frame, smooth_center, smooth_zoom, (780, 360))
+            narrow_output, narrow_crop_rect = crop_to_16_9(frame, smooth_center, smooth_zoom, (780, 360), return_meta=True)
+
             pan_err = smooth_center[0] - frame.shape[1] / 2.0
             tilt_err = smooth_center[1] - frame.shape[0] / 2.0
 
-            if active_track is not None:
-                label = f"TARGET ID {selected_id}"
-            else:
-                label = f"TRACK HOLD ID {selected_id}"
-
+            label = f"TARGET ID {target_manager.selected_id}" if active_track is not None else f"TRACK HOLD ID {target_manager.selected_id}"
             cv2.putText(narrow_output, label, (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
             cv2.putText(narrow_output, f"PAN ERR {pan_err:.1f}  TILT ERR {tilt_err:.1f}", (20, 108), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
             cv2.putText(narrow_output, f"ZOOM {smooth_zoom:.1f}x", (20, 146), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
             cv2.putText(narrow_output, f"HOLD {hold_count}", (20, 184), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+
+            if active_track is not None:
+                display_no = display_map.get(active_track.track_id, "?")
+                narrow_output = draw_target_on_narrow(narrow_output, narrow_crop_rect, active_track, display_no)
+
             cv2.line(narrow_output, (390, 0), (390, 360), (0, 255, 255), 1)
             cv2.line(narrow_output, (0, 180), (780, 180), (0, 255, 255), 1)
         else:
-            narrow_output = crop_to_16_9(frame, None, 1.7, (780, 360))
+            narrow_output, narrow_crop_rect = crop_to_16_9(frame, None, 1.7, (780, 360), return_meta=True)
             cv2.putText(narrow_output, "BRAK CELU", (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
 
-        lock_mode = "AUTO" if not manual_lock else "MANUAL"
+        lock_mode = "AUTO" if not target_manager.manual_lock else "MANUAL"
         cv2.putText(wide_debug, f"LOCK MODE: {lock_mode}", (20, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-        cv2.putText(wide_debug, f"SELECTED ID: {selected_id}", (20, 136), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+        cv2.putText(wide_debug, f"SELECTED ID: {target_manager.selected_id}", (20, 136), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
         cv2.putText(wide_debug, f"HOLD COUNT: {hold_count}", (20, 172), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-        cv2.putText(wide_debug, f"LOCK AGE: {lock_age}", (20, 208), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+        cv2.putText(wide_debug, f"LOCK AGE: {target_manager.lock_age}", (20, 208), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+        cv2.putText(wide_debug, f"PAN SPD: {pan_speed:.1f}  TILT SPD: {tilt_speed:.1f}", (20, 244), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
 
         wide_program = add_title(wide_program, "WIDE PROGRAM")
         narrow_output = add_title(narrow_output, "NARROW OUTPUT")
@@ -418,27 +341,16 @@ def run_app(config):
         if key in (27, ord("q")):
             break
         elif key == ord("0"):
-            manual_lock = False
-            selected_id = None
-            predicted_center = None
-            smooth_center = None
-            smooth_zoom = 2.35
-            hold_count = 0
-            lock_age = 9999
-            kalman.reset()
-        elif key in (ord("1"), ord("2"), ord("3")):
-            visible = sorted(tracks, key=lambda t: t.center_xy[0])
+            target_manager.set_auto_mode()
+            narrow_tracker.reset()
+        elif key in (ord("1"), ord("2"), ord("3"), ord("4"), ord("5"), ord("6"), ord("7"), ord("8"), ord("9")):
             idx = int(chr(key)) - 1
-            if idx < len(visible):
-                manual_lock = True
-                selected_id = visible[idx].track_id
-                start_xy = visible[idx].center_xy
-                kalman.reset()
-                kalman.init_state(start_xy[0], start_xy[1])
-                predicted_center = start_xy
-                smooth_center = start_xy
-                hold_count = 0
-                lock_age = 0
+            if idx < len(visible_sorted):
+                tr = visible_sorted[idx]
+                target_manager.set_manual_target(tr.track_id)
+                narrow_tracker.reset()
+                narrow_tracker.kalman.init_state(tr.center_xy[0], tr.center_xy[1])
+                narrow_tracker.smooth_center = tr.center_xy
 
     cap.release()
     cv2.destroyAllWindows()

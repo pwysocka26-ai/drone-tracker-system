@@ -1,0 +1,10 @@
+﻿mode: sim
+fps: 30
+
+video:
+  source: video.mp4
+
+simulation:
+  width: 1920
+  height: 1080
+  drones: 3

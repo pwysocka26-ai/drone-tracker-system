@@ -1,19 +1,20 @@
 ﻿from pathlib import Path
 
-file = Path("src/core/app.py")
-code = file.read_text(encoding="utf-8")
+p = Path("src/core/app.py")
+s = p.read_text(encoding="utf-8")
 
-# dodaj wybór głównego drona (najbliżej środka)
+s = s.replace(
+"tracks = filtered",
+"""tracks = filtered
 
-insert = '''
-# === wybór głównego drona ===
-if tracks:
-target = min(tracks, key=lambda t: (t.center[0] - args.program_width/2)**2 + (t.center[1] - args.program_height/2)**2)
-else:
+# 🔥 WYBÓR GŁÓWNEGO CELU
 target = None
-'''
 
-code = code.replace("tracks = result", insert + "\n        tracks = result")
+if tracks:
+    # wybierz największy obiekt (najbliższy)
+    target = max(tracks, key=lambda t: t.area)
+"""
+)
 
-file.write_text(code, encoding="utf-8")
+p.write_text(s, encoding="utf-8")
 print("OK: target selection added")

@@ -4,7 +4,10 @@ fps: 30
 video:
   source: video.mp4
 
-simulation:
-  width: 1920
-  height: 1080
-  drones: 3
+yolo:
+  model: yolov8n.pt
+  tracker: bytetrack.yaml
+  conf: 0.15
+  imgsz: 640
+  classes: [4]
+  inference_every: 1

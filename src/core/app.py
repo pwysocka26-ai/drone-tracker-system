@@ -126,7 +126,12 @@ def draw_tracks(frame, tracks, selected_id):
     for tr in tracks:
         x1, y1, x2, y2 = [int(v) for v in tr.bbox_xyxy]
         cx, cy = [int(v) for v in tr.center_xy]
-        color = (0, 255, 255) if tr.track_id == selected_id else (0, 255, 0)
+        if getattr(tr, "is_active_target", False):
+            color = (0, 255, 0)      # zielony
+        elif getattr(tr, "is_valid_target", False):
+            color = (0, 255, 255)    # żółty
+        else:
+            color = (0, 0, 255)      # czerwony
         cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
         cv2.circle(out, (cx, cy), 4, color, -1)
         cv2.putText(
@@ -283,6 +288,11 @@ def run_app(config):
         predicted_center = narrow_tracker.kalman.predict()
         target_manager.update(tracks, predicted_center, frame.shape)
         active_track = target_manager.find_active_track(tracks)
+        for tr in tracks:
+            tr.is_active_target = False
+            tr.is_valid_target = True
+        if active_track is not None:
+            active_track.is_active_target = True
 
         # baza z kalmana
         predicted_center, smooth_center, smooth_zoom, hold_count, _, _ = narrow_tracker.update(frame, active_track)

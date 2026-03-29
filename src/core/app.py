@@ -4,6 +4,7 @@ from ultralytics import YOLO
 from core.target_manager import TargetManager
 from core.narrow_tracker import NarrowTracker
 from core.stable_registry import StableTargetRegistry
+from core.target_filter import TargetFilter
 from core.head_motion_test import HeadMotionTestMode
 
 
@@ -201,13 +202,14 @@ def parse_tracks(result, frame_shape):
         x1, y1, x2, y2 = [float(v) for v in box]
         cy = (y1 + y2) / 2.0
 
-        if cy > h * 0.78:
+        # lagodniejszy filtr: dopuszczamy obiekty nizej w kadrze
+        if cy > h * 0.92:
             continue
 
         bw = x2 - x1
         bh = y2 - y1
         area = bw * bh
-        if area > (w * h * 0.03):
+        if area > (w * h * 0.08):
             continue
 
         tracks.append(
@@ -249,6 +251,7 @@ def run_app(config):
     stable_registry = StableTargetRegistry(max_missing=25, match_distance=140.0, min_iou=0.01)
     target_manager = TargetManager(reacquire_radius_auto=100.0, reacquire_radius_manual=140.0, sticky_frames=75)
     narrow_tracker = NarrowTracker(hold_frames=140)
+    target_filter = TargetFilter()
     head_motion_test = HeadMotionTestMode()
 
     window_name = "Drone Tracker Multiview"
@@ -265,6 +268,7 @@ def run_app(config):
             stable_registry.reset()
             target_manager.set_auto_mode()
             narrow_tracker.reset()
+            target_filter.reset()
             ret, frame = cap.read()
             if not ret:
                 break
@@ -284,15 +288,54 @@ def run_app(config):
             result = results[0]
             det_tracks = parse_tracks(result, frame.shape)
             tracks = stable_registry.update(det_tracks)
+            tracks = target_filter.update(tracks, frame.shape)
 
         visible_sorted = sorted(tracks, key=lambda t: t.track_id)
 
+        fh, fw = frame.shape[:2]
+        frame_cx = fw / 2.0
+        frame_cy = fh / 2.0
+
+        for tr in tracks:
+            tx, ty = tr.center_xy
+            dist_to_center = ((tx - frame_cx) ** 2 + (ty - frame_cy) ** 2) ** 0.5
+            center_bonus = max(0.0, 1.0 - dist_to_center / max(1.0, (fw * 0.5)))
+
+            valid_score = float(getattr(tr, "target_score", 0.0))
+            conf_score = float(getattr(tr, "confidence", 0.0))
+
+            persistence_bonus = 0.0
+            if target_manager.selected_id is not None and tr.track_id == target_manager.selected_id:
+                persistence_bonus = 0.35
+
+            tr.selection_priority = (
+                valid_score * 0.50
+                + conf_score * 0.20
+                + center_bonus * 0.30
+                + persistence_bonus
+            )
+
         predicted_center = narrow_tracker.kalman.predict()
-        target_manager.update(tracks, predicted_center, frame.shape)
+
+        candidate_tracks = [t for t in tracks if getattr(t, "is_valid_target", False)]
+        if candidate_tracks:
+            candidate_tracks = sorted(candidate_tracks, key=lambda t: getattr(t, "selection_priority", 0.0), reverse=True)
+            ordered_tracks = candidate_tracks + [t for t in tracks if not getattr(t, "is_valid_target", False)]
+        else:
+            ordered_tracks = tracks
+
+        target_manager.update(ordered_tracks, predicted_center, frame.shape)
         active_track = target_manager.find_active_track(tracks)
+
+        # failsafe: jesli target zniknal na dluzej, wyczysc lock i wroc do AUTO
+        if active_track is None and target_manager.selected_id is not None and target_manager.lock_age > 20:
+            target_manager.set_auto_mode()
+            narrow_tracker.reset()
+
         for tr in tracks:
             tr.is_active_target = False
-            tr.is_valid_target = True
+            if not hasattr(tr, "is_valid_target"):
+                tr.is_valid_target = True
         if active_track is not None:
             active_track.is_active_target = True
 
@@ -372,7 +415,7 @@ def run_app(config):
         pan_speed += dx_test
         tilt_speed += dy_test
 
-        wide_program = crop_group(frame, tracks, (780, 360))
+        wide_program = cv2.resize(frame, (780, 360), interpolation=cv2.INTER_LINEAR)
 
         debug_frame = draw_tracks(frame, tracks, target_manager.selected_id)
         for tr in visible_sorted:
@@ -387,7 +430,7 @@ def run_app(config):
                 2,
             )
 
-        wide_debug = crop_group(debug_frame, tracks, (1560, 450))
+        wide_debug = cv2.resize(debug_frame, (1560, 450), interpolation=cv2.INTER_LINEAR)
 
         if smooth_center is not None:
             narrow_output, narrow_crop_rect = crop_to_16_9(frame, smooth_center, smooth_zoom, (780, 360), return_meta=True)

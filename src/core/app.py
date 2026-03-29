@@ -1,7 +1,6 @@
 ﻿import cv2
-import numpy as np
-
 from ultralytics import YOLO
+
 from core.target_manager import TargetManager
 from core.narrow_tracker import NarrowTracker
 from core.stable_registry import StableTargetRegistry
@@ -116,6 +115,32 @@ def crop_group(frame, tracks, out_size=(780, 360)):
     return cv2.resize(crop, out_size, interpolation=cv2.INTER_LINEAR)
 
 
+def add_title(panel, title):
+    cv2.rectangle(panel, (0, 0), (440, 56), (0, 0, 0), -1)
+    cv2.putText(panel, title, (20, 38), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
+    return panel
+
+
+def draw_tracks(frame, tracks, selected_id):
+    out = frame.copy()
+    for tr in tracks:
+        x1, y1, x2, y2 = [int(v) for v in tr.bbox_xyxy]
+        cx, cy = [int(v) for v in tr.center_xy]
+        color = (0, 255, 255) if tr.track_id == selected_id else (0, 255, 0)
+        cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
+        cv2.circle(out, (cx, cy), 4, color, -1)
+        cv2.putText(
+            out,
+            f"ID {tr.track_id} {tr.confidence:.2f}",
+            (x1, max(24, y1 - 8)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            color,
+            2,
+        )
+    return out
+
+
 def draw_target_on_narrow(narrow_frame, crop_rect, track, display_no="?"):
     if track is None:
         return narrow_frame
@@ -154,32 +179,6 @@ def draw_target_on_narrow(narrow_frame, crop_rect, track, display_no="?"):
     return narrow_frame
 
 
-def add_title(panel, title):
-    cv2.rectangle(panel, (0, 0), (440, 56), (0, 0, 0), -1)
-    cv2.putText(panel, title, (20, 38), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
-    return panel
-
-
-def draw_tracks(frame, tracks, selected_id):
-    out = frame.copy()
-    for tr in tracks:
-        x1, y1, x2, y2 = [int(v) for v in tr.bbox_xyxy]
-        cx, cy = [int(v) for v in tr.center_xy]
-        color = (0, 255, 255) if tr.track_id == selected_id else (0, 255, 0)
-        cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
-        cv2.circle(out, (cx, cy), 4, color, -1)
-        cv2.putText(
-            out,
-            f"ID {tr.track_id} {tr.confidence:.2f}",
-            (x1, max(24, y1 - 8)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.65,
-            color,
-            2,
-        )
-    return out
-
-
 def parse_tracks(result, frame_shape):
     h, w = frame_shape[:2]
     tracks = []
@@ -196,15 +195,12 @@ def parse_tracks(result, frame_shape):
         x1, y1, x2, y2 = [float(v) for v in box]
         cy = (y1 + y2) / 2.0
 
-        # odfiltruj śmieci nisko w kadrze
         if cy > h * 0.78:
             continue
 
         bw = x2 - x1
         bh = y2 - y1
         area = bw * bh
-
-        # odfiltruj ewidentnie za duże obiekty
         if area > (w * h * 0.03):
             continue
 
@@ -283,12 +279,38 @@ def run_app(config):
             tracks = stable_registry.update(det_tracks)
 
         visible_sorted = sorted(tracks, key=lambda t: t.track_id)
-        predicted_center = narrow_tracker.kalman.predict()
 
+        predicted_center = narrow_tracker.kalman.predict()
         target_manager.update(tracks, predicted_center, frame.shape)
         active_track = target_manager.find_active_track(tracks)
 
-        predicted_center, smooth_center, smooth_zoom, hold_count, pan_speed, tilt_speed = narrow_tracker.update(frame, active_track)
+        # baza z kalmana
+        predicted_center, smooth_center, smooth_zoom, hold_count, _, _ = narrow_tracker.update(frame, active_track)
+
+        # direct lock na wybrany target
+        if active_track is not None:
+            tx, ty = active_track.center_xy
+
+            if smooth_center is None:
+                smooth_center = (tx, ty)
+
+            pan_err = tx - smooth_center[0]
+            tilt_err = ty - smooth_center[1]
+
+            alpha = 0.28
+            cx = smooth_center[0] + alpha * pan_err
+            cy = smooth_center[1] + alpha * tilt_err
+
+            if abs(pan_err) < 18 and abs(tilt_err) < 18:
+                cx = tx
+                cy = ty
+
+            smooth_center = (cx, cy)
+            pan_speed = pan_err * alpha
+            tilt_speed = tilt_err * alpha
+        else:
+            pan_speed = 0.0
+            tilt_speed = 0.0
 
         wide_program = crop_group(frame, tracks, (780, 360))
 
@@ -310,20 +332,38 @@ def run_app(config):
         if smooth_center is not None:
             narrow_output, narrow_crop_rect = crop_to_16_9(frame, smooth_center, smooth_zoom, (780, 360), return_meta=True)
 
-            pan_err = smooth_center[0] - frame.shape[1] / 2.0
-            tilt_err = smooth_center[1] - frame.shape[0] / 2.0
-
             label = f"TARGET ID {target_manager.selected_id}" if active_track is not None else f"TRACK HOLD ID {target_manager.selected_id}"
+
+            real_pan_err = 0.0
+            real_tilt_err = 0.0
+            center_lock = False
+
+            if active_track is not None:
+                cx1, cy1, cx2, cy2 = narrow_crop_rect
+                crop_w = max(1, cx2 - cx1)
+                crop_h = max(1, cy2 - cy1)
+
+                target_nx = (active_track.center_xy[0] - cx1) * 780.0 / crop_w
+                target_ny = (active_track.center_xy[1] - cy1) * 360.0 / crop_h
+
+                real_pan_err = target_nx - 390.0
+                real_tilt_err = target_ny - 180.0
+                center_lock = (abs(real_pan_err) < 12 and abs(real_tilt_err) < 12)
+
             cv2.putText(narrow_output, label, (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
-            cv2.putText(narrow_output, f"PAN ERR {pan_err:.1f}  TILT ERR {tilt_err:.1f}", (20, 108), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+            cv2.putText(narrow_output, f"PAN ERR {real_pan_err:.1f}  TILT ERR {real_tilt_err:.1f}", (20, 108), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
             cv2.putText(narrow_output, f"ZOOM {smooth_zoom:.1f}x", (20, 146), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
             cv2.putText(narrow_output, f"HOLD {hold_count}", (20, 184), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+
+            center_lock_text = "CENTER LOCK ON" if (center_lock and active_track is not None) else "CENTER LOCK OFF"
+            cv2.putText(narrow_output, center_lock_text, (20, 222), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
 
             if active_track is not None:
                 narrow_output = draw_target_on_narrow(narrow_output, narrow_crop_rect, active_track, active_track.track_id)
 
-            cv2.line(narrow_output, (390, 0), (390, 360), (0, 255, 255), 1)
-            cv2.line(narrow_output, (0, 180), (780, 180), (0, 255, 255), 1)
+            cross_color = (0, 255, 0) if center_lock else (0, 255, 255)
+            cv2.line(narrow_output, (390, 0), (390, 360), cross_color, 1)
+            cv2.line(narrow_output, (0, 180), (780, 180), cross_color, 1)
         else:
             narrow_output, narrow_crop_rect = crop_to_16_9(frame, None, 1.7, (780, 360), return_meta=True)
             cv2.putText(narrow_output, "BRAK CELU", (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
@@ -334,6 +374,8 @@ def run_app(config):
         cv2.putText(wide_debug, f"HOLD COUNT: {hold_count}", (20, 172), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
         cv2.putText(wide_debug, f"LOCK AGE: {target_manager.lock_age}", (20, 208), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
         cv2.putText(wide_debug, f"PAN SPD: {pan_speed:.1f}  TILT SPD: {tilt_speed:.1f}", (20, 244), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+        auto_text = "AUTO PICK ENABLED" if not target_manager.manual_lock else "AUTO PICK DISABLED"
+        cv2.putText(wide_debug, auto_text, (20, 280), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
 
         wide_program = add_title(wide_program, "WIDE PROGRAM")
         narrow_output = add_title(narrow_output, "NARROW OUTPUT")

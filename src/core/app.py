@@ -367,6 +367,8 @@ def run_app(config):
 
         # === HEAD MOTION TEST ===
         dx_test, dy_test = head_motion_test.update()
+        dx_test = max(-3.0, min(3.0, dx_test))
+        dy_test = max(-2.0, min(2.0, dy_test))
         pan_speed += dx_test
         tilt_speed += dy_test
 

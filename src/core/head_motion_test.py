@@ -1,4 +1,4 @@
-﻿import math
+import math
 
 
 class HeadMotionTestMode:
@@ -6,13 +6,12 @@ class HeadMotionTestMode:
         self.enabled = False
         self.frame_idx = 0
 
-        # amplituda sztucznego ruchu "glowicy" w pikselach wide-space
-        self.pan_amplitude = 90.0
-        self.tilt_amplitude = 45.0
+        # delikatniejszy, bardziej realistyczny ruch testowy
+        self.pan_amplitude = 2.5
+        self.tilt_amplitude = 1.5
 
-        # predkosc ruchu
-        self.pan_speed = 0.050
-        self.tilt_speed = 0.035
+        self.pan_speed = 0.08
+        self.tilt_speed = 0.055
 
     def toggle(self):
         self.enabled = not self.enabled

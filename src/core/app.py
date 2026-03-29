@@ -298,6 +298,8 @@ def run_app(config):
         predicted_center, smooth_center, smooth_zoom, hold_count, _, _ = narrow_tracker.update(frame, active_track)
 
         # direct lock na wybrany target
+        edge_limit_active = False
+
         if active_track is not None:
             tx, ty = active_track.center_xy
 
@@ -307,17 +309,56 @@ def run_app(config):
             pan_err = tx - smooth_center[0]
             tilt_err = ty - smooth_center[1]
 
-            alpha = 0.28
-            cx = smooth_center[0] + alpha * pan_err
-            cy = smooth_center[1] + alpha * tilt_err
-
-            if abs(pan_err) < 18 and abs(tilt_err) < 18:
+            if target_manager.manual_lock:
+                # reczny lock: ustaw srodek narrow dokladnie na cel
                 cx = tx
                 cy = ty
+                smooth_center = (cx, cy)
+                pan_speed = pan_err
+                tilt_speed = tilt_err
 
-            smooth_center = (cx, cy)
-            pan_speed = pan_err * alpha
-            tilt_speed = tilt_err * alpha
+                # EDGE-AWARE ZOOM:
+                # jesli cel jest blisko krawedzi obrazu wide, zwieksz zoom,
+                # aby narrow mogl go faktycznie wycentrowac
+                fh, fw = frame.shape[:2]
+                aspect = 780.0 / 360.0
+
+                margin_x = min(tx, fw - tx)
+                margin_y = min(ty, fh - ty)
+
+                max_crop_w = max(80.0, margin_x * 2.0)
+                max_crop_h = max(80.0, margin_y * 2.0)
+
+                if max_crop_w / max_crop_h < aspect:
+                    max_crop_h = max_crop_w / aspect
+                else:
+                    max_crop_w = max_crop_h * aspect
+
+                if (fw / fh) > aspect:
+                    required_zoom = fh / max_crop_h
+                else:
+                    required_zoom = fw / max_crop_w
+
+                required_zoom = max(1.0, min(8.0, required_zoom))
+
+                if required_zoom > smooth_zoom:
+                    smooth_zoom = required_zoom
+                    edge_limit_active = True
+
+            else:
+                alpha = 0.28
+                snap_px = 18
+
+                cx = smooth_center[0] + alpha * pan_err
+                cy = smooth_center[1] + alpha * tilt_err
+
+                if abs(pan_err) < snap_px and abs(tilt_err) < snap_px:
+                    cx = tx
+                    cy = ty
+
+                smooth_center = (cx, cy)
+                pan_speed = pan_err * alpha
+                tilt_speed = tilt_err * alpha
         else:
             pan_speed = 0.0
             tilt_speed = 0.0
@@ -367,6 +408,9 @@ def run_app(config):
 
             center_lock_text = "CENTER LOCK ON" if (center_lock and active_track is not None) else "CENTER LOCK OFF"
             cv2.putText(narrow_output, center_lock_text, (20, 222), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+
+            if edge_limit_active:
+                cv2.putText(narrow_output, "EDGE LIMIT COMP", (20, 258), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
 
             if active_track is not None:
                 narrow_output = draw_target_on_narrow(narrow_output, narrow_crop_rect, active_track, active_track.track_id)

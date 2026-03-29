@@ -4,6 +4,7 @@ from ultralytics import YOLO
 from core.target_manager import TargetManager
 from core.narrow_tracker import NarrowTracker
 from core.stable_registry import StableTargetRegistry
+from core.head_motion_test import HeadMotionTestMode
 
 
 class Track:
@@ -248,6 +249,7 @@ def run_app(config):
     stable_registry = StableTargetRegistry(max_missing=25, match_distance=140.0, min_iou=0.01)
     target_manager = TargetManager(reacquire_radius_auto=100.0, reacquire_radius_manual=140.0, sticky_frames=75)
     narrow_tracker = NarrowTracker(hold_frames=140)
+    head_motion_test = HeadMotionTestMode()
 
     window_name = "Drone Tracker Multiview"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
@@ -363,6 +365,11 @@ def run_app(config):
             pan_speed = 0.0
             tilt_speed = 0.0
 
+        # === HEAD MOTION TEST ===
+        dx_test, dy_test = head_motion_test.update()
+        pan_speed += dx_test
+        tilt_speed += dy_test
+
         wide_program = crop_group(frame, tracks, (780, 360))
 
         debug_frame = draw_tracks(frame, tracks, target_manager.selected_id)
@@ -431,6 +438,15 @@ def run_app(config):
         cv2.putText(wide_debug, f"PAN SPD: {pan_speed:.1f}  TILT SPD: {tilt_speed:.1f}", (20, 244), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
         auto_text = "AUTO PICK ENABLED" if not target_manager.manual_lock else "AUTO PICK DISABLED"
         cv2.putText(wide_debug, auto_text, (20, 280), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+        cv2.putText(
+            wide_debug,
+            f"HEAD TEST: {'ON' if head_motion_test.enabled else 'OFF'}",
+            (20, 316),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (0, 255, 255),
+            2,
+        )
 
         wide_program = add_title(wide_program, "WIDE PROGRAM")
         narrow_output = add_title(narrow_output, "NARROW OUTPUT")
@@ -442,6 +458,9 @@ def run_app(config):
         key = cv2.waitKey(1) & 0xFF
         if key in (27, ord("q")):
             break
+        elif key == ord("m") or key == ord("M"):
+            head_motion_test.toggle()
+            print(f"HEAD TEST MODE: {'ON' if head_motion_test.enabled else 'OFF'}")
         elif key == ord("0"):
             target_manager.set_auto_mode()
             narrow_tracker.reset()

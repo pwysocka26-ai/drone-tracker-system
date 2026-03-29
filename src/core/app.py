@@ -362,6 +362,7 @@ def run_app(config):
                 narrow_output = draw_target_on_narrow(narrow_output, narrow_crop_rect, active_track, active_track.track_id)
 
             cross_color = (0, 255, 0) if center_lock else (0, 255, 255)
+            cross_color = (0, 255, 0) if center_lock else (0, 255, 255)
             cv2.line(narrow_output, (390, 0), (390, 360), cross_color, 1)
             cv2.line(narrow_output, (0, 180), (780, 180), cross_color, 1)
         else:

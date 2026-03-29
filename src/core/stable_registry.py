@@ -34,17 +34,19 @@ def _area(box):
 class StableTargetRegistry:
     def __init__(
         self,
-        max_missing=25,
-        lost_ttl=180,
-        match_distance=140.0,
-        recover_distance=220.0,
+        max_missing=20,
+        lost_ttl=240,
+        match_distance=180.0,
+        recover_distance=320.0,
         min_iou=0.01,
+        area_ratio_min=0.35,
     ):
         self.max_missing = int(max_missing)
         self.lost_ttl = int(lost_ttl)
         self.match_distance = float(match_distance)
         self.recover_distance = float(recover_distance)
         self.min_iou = float(min_iou)
+        self.area_ratio_min = float(area_ratio_min)
 
         self.next_id = 1
         self.active = {}
@@ -62,110 +64,129 @@ class StableTargetRegistry:
 
     def _make_state(self, tr, missing=0):
         return {
-            "bbox_xyxy": tr.bbox_xyxy,
-            "center_xy": tr.center_xy,
-            "confidence": tr.confidence,
-            "raw_id": tr.raw_id,
+            "bbox_xyxy": tuple(tr.bbox_xyxy),
+            "center_xy": tuple(tr.center_xy),
+            "confidence": float(tr.confidence),
+            "raw_id": int(getattr(tr, "raw_id", tr.track_id)),
             "missing": int(missing),
         }
 
-    def _match_pool(self, pool, tracks, used, distance_limit):
-        assignments = {}
+    def _compatible(self, state, tr, distance_limit):
+        d = _dist(state["center_xy"], tr.center_xy)
+        iou = _iou(state["bbox_xyxy"], tr.bbox_xyxy)
+
+        old_area = _area(state["bbox_xyxy"])
+        new_area = _area(tr.bbox_xyxy)
+        area_ratio = min(old_area, new_area) / max(old_area, new_area)
+
+        ok = (d <= distance_limit or iou >= self.min_iou) and area_ratio >= self.area_ratio_min
+        return ok, d, iou, area_ratio
+
+    def _score_match(self, state, tr, d, iou, area_ratio):
+        conf = float(tr.confidence)
+        raw_bonus = 0.0
+        if int(getattr(tr, "raw_id", -1)) == int(state.get("raw_id", -999999)):
+            raw_bonus = 35.0
+
+        # im mniejszy score tym lepiej
+        return (
+            d
+            - 220.0 * iou
+            - 90.0 * area_ratio
+            - 45.0 * conf
+            - raw_bonus
+        )
+
+    def _assign(self, pool, tracks, used, distance_limit):
+        pairs = []
 
         for stable_id, state in pool.items():
-            best_idx = None
-            best_score = None
-
-            for i, tr in enumerate(tracks):
-                if i in used:
+            for idx, tr in enumerate(tracks):
+                if idx in used:
                     continue
 
-                d = _dist(state["center_xy"], tr.center_xy)
-                iou = _iou(state["bbox_xyxy"], tr.bbox_xyxy)
-
-                if d > distance_limit and iou < self.min_iou:
+                ok, d, iou, area_ratio = self._compatible(state, tr, distance_limit)
+                if not ok:
                     continue
 
-                area_old = _area(state["bbox_xyxy"])
-                area_new = _area(tr.bbox_xyxy)
-                area_ratio = min(area_old, area_new) / max(area_old, area_new)
+                score = self._score_match(state, tr, d, iou, area_ratio)
+                pairs.append((score, stable_id, idx))
 
-                score = d - 160.0 * iou - 60.0 * area_ratio - 30.0 * tr.confidence
+        pairs.sort(key=lambda x: x[0])
 
-                if best_score is None or score < best_score:
-                    best_score = score
-                    best_idx = i
+        assigned_ids = set()
+        assigned_idx = set()
+        assignments = {}
 
-            if best_idx is not None:
-                assignments[stable_id] = best_idx
-                used.add(best_idx)
+        for score, stable_id, idx in pairs:
+            if stable_id in assigned_ids or idx in assigned_idx:
+                continue
+            assignments[stable_id] = idx
+            assigned_ids.add(stable_id)
+            assigned_idx.add(idx)
+            used.add(idx)
 
         return assignments
 
     def update(self, tracks):
         used = set()
-        updated_tracks = []
+        output_tracks = []
 
-        # 1. Najpierw dopasuj do aktywnych
-        active_assignments = self._match_pool(
-            self.active, tracks, used, self.match_distance
-        )
+        # 1. Dopasowanie do aktywnych ID
+        active_assignments = self._assign(self.active, tracks, used, self.match_distance)
 
         new_active = {}
-        still_lost = dict(self.lost)
+        new_lost = dict(self.lost)
 
-        # trafione aktywne
         for stable_id, idx in active_assignments.items():
             tr = tracks[idx]
             tr.track_id = stable_id
             new_active[stable_id] = self._make_state(tr, missing=0)
-            updated_tracks.append(tr)
+            output_tracks.append(tr)
 
-        # nietrafione aktywne -> przechodzą do lost
+        # 2. Nietrafione aktywne przechodza do lost
         for stable_id, state in self.active.items():
             if stable_id not in active_assignments:
                 moved = dict(state)
                 moved["missing"] = moved.get("missing", 0) + 1
-                still_lost[stable_id] = moved
+                new_lost[stable_id] = moved
 
-        # 2. Potem próbuj odzyskać stare lost ID
+        # 3. Proba odzyskania ID z lost
         recoverable_lost = {
             sid: state
-            for sid, state in still_lost.items()
+            for sid, state in new_lost.items()
             if state.get("missing", 0) <= self.lost_ttl
         }
 
-        lost_assignments = self._match_pool(
-            recoverable_lost, tracks, used, self.recover_distance
-        )
+        lost_assignments = self._assign(recoverable_lost, tracks, used, self.recover_distance)
 
         for stable_id, idx in lost_assignments.items():
             tr = tracks[idx]
             tr.track_id = stable_id
             new_active[stable_id] = self._make_state(tr, missing=0)
-            updated_tracks.append(tr)
-            if stable_id in still_lost:
-                del still_lost[stable_id]
+            output_tracks.append(tr)
+            if stable_id in new_lost:
+                del new_lost[stable_id]
 
-        # 3. Cała reszta dostaje nowe ID
-        for i, tr in enumerate(tracks):
-            if i in used:
+        # 4. Reszta dostaje nowe stale ID
+        for idx, tr in enumerate(tracks):
+            if idx in used:
                 continue
             stable_id = self._new_id()
             tr.track_id = stable_id
             new_active[stable_id] = self._make_state(tr, missing=0)
-            updated_tracks.append(tr)
+            output_tracks.append(tr)
 
-        # 4. Starzenie lost
+        # 5. Starzenie lost
         cleaned_lost = {}
-        for stable_id, state in still_lost.items():
-            state = dict(state)
-            state["missing"] = state.get("missing", 0) + 1
-            if state["missing"] <= self.lost_ttl:
-                cleaned_lost[stable_id] = state
+        for stable_id, state in new_lost.items():
+            st = dict(state)
+            st["missing"] = st.get("missing", 0) + 1
+            if st["missing"] <= self.lost_ttl:
+                cleaned_lost[stable_id] = st
 
         self.active = new_active
         self.lost = cleaned_lost
 
-        updated_tracks.sort(key=lambda t: t.track_id)
-        return updated_tracks
+        output_tracks.sort(key=lambda t: t.track_id)
+        return output_tracks

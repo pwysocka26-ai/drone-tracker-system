@@ -226,6 +226,9 @@ def parse_tracks(result, frame_shape):
 
 
 def run_app(config):
+    last_target_center = None
+    last_target_size = None
+
     mode = config.get("mode", "video")
     if mode != "video":
         print("Ta wersja jest przygotowana do testow wideo.")
@@ -326,6 +329,67 @@ def run_app(config):
 
         target_manager.update(ordered_tracks, predicted_center, frame.shape)
         active_track = target_manager.find_active_track(tracks)
+
+        # === AUTO REACQUIRE ===
+        if active_track is None and tracks:
+
+            best_track = None
+            best_score = 999999
+
+            frame_cx = frame.shape[1] / 2
+            frame_cy = frame.shape[0] / 2
+
+            for tr in tracks:
+                x1, y1, x2, y2 = tr["bbox"]
+
+                cx = (x1 + x2) / 2
+                cy = (y1 + y2) / 2
+
+                dx = cx - frame_cx
+                dy = cy - frame_cy
+
+                dist = dx*dx + dy*dy
+
+                size = (x2 - x1) * (y2 - y1)
+
+                # filtr śmieci
+                if size < 100:
+                    continue
+
+                score = dist
+
+                if score < best_score:
+                    best_score = score
+                    best_track = tr
+
+            if best_track is not None:
+                target_manager.selected_id = best_track["id"]
+                active_track = best_track
+
+
+        # === REACQUIRE LOGIC ===
+        if active_track is None and last_target_center is not None:
+            best_track = None
+            best_dist = 999999
+
+            for tr in tracks:
+                x1, y1, x2, y2 = tr["bbox"]
+                cx = (x1 + x2) / 2.0
+                cy = (y1 + y2) / 2.0
+
+                dx = cx - last_target_center[0]
+                dy = cy - last_target_center[1]
+                dist = dx*dx + dy*dy
+
+                if dist < best_dist:
+                    best_dist = dist
+                    best_track = tr
+
+            # threshold – żeby nie łapać śmieci
+            if best_track is not None and best_dist < 20000:
+                target_manager.selected_id = best_track["id"]
+                active_track = best_track
+
 
         # failsafe: jesli target zniknal na dluzej, wyczysc lock i wroc do AUTO
         if active_track is None and target_manager.selected_id is not None and target_manager.lock_age > 20:

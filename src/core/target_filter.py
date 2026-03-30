@@ -4,11 +4,11 @@
 class TargetFilter:
     def __init__(
         self,
-        min_age_frames=4,
-        min_area=35.0,
-        max_area_ratio=0.05,
-        max_jump=180.0,
-        min_stability_score=0.28,
+        min_age_frames=2,
+        min_area=12.0,
+        max_area_ratio=0.08,
+        max_jump=260.0,
+        min_stability_score=0.12,
     ):
         self.min_age_frames = int(min_age_frames)
         self.min_area = float(min_area)

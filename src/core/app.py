@@ -228,6 +228,9 @@ def parse_tracks(result, frame_shape):
 def run_app(config):
     last_target_center = None
     last_target_size = None
+    wide_hold_frames = 0
+    WIDE_HOLD_MAX = 45
+
 
     mode = config.get("mode", "video")
     if mode != "video":
@@ -330,6 +333,41 @@ def run_app(config):
         target_manager.update(ordered_tracks, predicted_center, frame.shape)
         active_track = target_manager.find_active_track(tracks)
 
+        # === STICKY WIDE REACQUIRE ===
+        if active_track is None and last_target_center is not None and wide_hold_frames > 0:
+            best_track = None
+            best_score = 1e18
+
+            for tr in tracks:
+                try:
+                    cx, cy = tr.center_xy
+                    x1, y1, x2, y2 = tr.bbox_xyxy
+                    area = max(1.0, (x2 - x1) * (y2 - y1))
+                    conf = float(getattr(tr, "confidence", 0.0))
+                except Exception:
+                    continue
+
+                dx = cx - last_target_center[0]
+                dy = cy - last_target_center[1]
+                dist2 = dx * dx + dy * dy
+
+                # dla dalekiego drona dopuszczamy male bboxy i nizszy conf
+                if area < 8:
+                    continue
+
+                score = dist2 - conf * 4000.0
+
+                if score < best_score:
+                    best_score = score
+                    best_track = tr
+
+            if best_track is not None and best_score < 90000:
+                target_manager.selected_id = best_track.track_id
+                active_track = best_track
+            else:
+                wide_hold_frames -= 1
+
+
         # === AUTO REACQUIRE ===
         if active_track is None and tracks:
 
@@ -392,7 +430,7 @@ def run_app(config):
 
 
         # failsafe: jesli target zniknal na dluzej, wyczysc lock i wroc do AUTO
-        if active_track is None and target_manager.selected_id is not None and target_manager.lock_age > 20:
+        if active_track is None and target_manager.selected_id is not None and target_manager.lock_age > 45:
             target_manager.set_auto_mode()
             narrow_tracker.reset()
 

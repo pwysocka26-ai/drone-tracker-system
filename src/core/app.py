@@ -221,10 +221,20 @@ def _choose_reacquire_track(tracks, ref_center, frame_shape, selected_id=None):
 def run_app(config):
     last_target_center = None
     last_target_size = None
+    last_selected_id = None
+
     wide_hold_frames = 0
     WIDE_HOLD_MAX = 90
+
     narrow_fallback_hold = 0
     NARROW_FALLBACK_MAX = 45
+
+    FLOW_FUSION_ALPHA = 0.35
+    FLOW_MAX_DRIFT_PX = 85.0
+    FLOW_MIN_POINTS = 6
+    FLOW_HOLD_MAX = 45
+    flow_hold_frames = 0
+    track_state = "LOST"
 
     mode = config.get("mode", "video")
     if mode != "video":
@@ -273,8 +283,11 @@ def run_app(config):
             optical_flow_fallback.reset()
             last_target_center = None
             last_target_size = None
+            last_selected_id = None
             wide_hold_frames = 0
             narrow_fallback_hold = 0
+            flow_hold_frames = 0
+            track_state = "LOST"
             ret, frame = cap.read()
             if not ret:
                 break
@@ -330,28 +343,43 @@ def run_app(config):
         target_manager.update(ordered_tracks, predicted_center, frame.shape)
         active_track = target_manager.find_active_track(tracks)
 
+        # sticky wide reacquire around the last good target position
         if active_track is None and last_target_center is not None and wide_hold_frames > 0:
-            reacquired = _choose_reacquire_track(tracks, last_target_center, frame.shape, target_manager.selected_id)
+            reacquired = _choose_reacquire_track(tracks, last_target_center, frame.shape, target_manager.selected_id or last_selected_id)
             if reacquired is not None:
                 target_manager.selected_id = reacquired.track_id
                 active_track = reacquired
             else:
                 wide_hold_frames -= 1
 
-        if active_track is None and target_manager.selected_id is not None and target_manager.lock_age > 120:
+        # do not clear lock aggressively while FLOW_HOLD is still alive
+        if (
+            active_track is None
+            and target_manager.selected_id is not None
+            and flow_hold_frames <= 0
+            and target_manager.lock_age > 120
+        ):
             target_manager.set_auto_mode()
             narrow_tracker.reset()
             optical_flow_fallback.reset()
+            last_selected_id = None
+            track_state = "LOST"
 
         for tr in tracks:
             tr.is_active_target = False
             tr.is_valid_target = getattr(tr, "is_valid_target", True)
+
         if active_track is not None:
             active_track.is_active_target = True
             last_target_center = active_track.center_xy
+            last_selected_id = active_track.track_id
+
             x1, y1, x2, y2 = active_track.bbox_xyxy
             last_target_size = (x2 - x1, y2 - y1)
+
             wide_hold_frames = WIDE_HOLD_MAX
+            flow_hold_frames = FLOW_HOLD_MAX
+            track_state = "DETECTED_LOCK"
 
         predicted_center, smooth_center, smooth_zoom, hold_count, _, _ = narrow_tracker.update(frame, active_track)
 
@@ -462,18 +490,70 @@ def run_app(config):
                 crop_center = fallback_center
             else:
                 flow_ok, flow_center, flow_points_debug, flow_points = optical_flow_fallback.update(frame)
-                if flow_ok and flow_center is not None:
-                    crop_center = flow_center
-                    smooth_center = flow_center
-                    flow_debug_on = True
+
+                if flow_ok and flow_center is not None and flow_points_debug >= FLOW_MIN_POINTS:
+                    bx, by = fallback_center
+                    fx, fy = flow_center
+
+                    drift_dx = fx - bx
+                    drift_dy = fy - by
+                    drift = (drift_dx * drift_dx + drift_dy * drift_dy) ** 0.5
+
+                    if drift <= FLOW_MAX_DRIFT_PX:
+                        fused_x = (1.0 - FLOW_FUSION_ALPHA) * bx + FLOW_FUSION_ALPHA * fx
+                        fused_y = (1.0 - FLOW_FUSION_ALPHA) * by + FLOW_FUSION_ALPHA * fy
+
+                        if last_target_center is not None:
+                            ldx = fused_x - last_target_center[0]
+                            ldy = fused_y - last_target_center[1]
+                            ldist = (ldx * ldx + ldy * ldy) ** 0.5
+                            if ldist > FLOW_MAX_DRIFT_PX and ldist > 1e-6:
+                                scale = FLOW_MAX_DRIFT_PX / ldist
+                                fused_x = last_target_center[0] + ldx * scale
+                                fused_y = last_target_center[1] + ldy * scale
+
+                        crop_center = (fused_x, fused_y)
+                        smooth_center = crop_center
+                        last_target_center = crop_center
+                        flow_debug_on = True
+                        flow_hold_frames = FLOW_HOLD_MAX
+                        track_state = "FLOW_HOLD"
+
+                        if target_manager.selected_id is None and last_selected_id is not None:
+                            target_manager.selected_id = last_selected_id
+                    else:
+                        flow_ok = False
+                        flow_points_debug = 0
+                        flow_points = None
+                        if flow_hold_frames > 0 and last_target_center is not None:
+                            crop_center = last_target_center
+                            smooth_center = crop_center
+                            flow_hold_frames -= 1
+                            track_state = "FLOW_HOLD"
+                            if target_manager.selected_id is None and last_selected_id is not None:
+                                target_manager.selected_id = last_selected_id
+                        else:
+                            crop_center = fallback_center
+                            track_state = "LOST"
                 else:
-                    crop_center = fallback_center
+                    flow_ok = False
+                    if flow_hold_frames > 0 and last_target_center is not None:
+                        crop_center = last_target_center
+                        smooth_center = crop_center
+                        flow_hold_frames -= 1
+                        track_state = "FLOW_HOLD"
+                        if target_manager.selected_id is None and last_selected_id is not None:
+                            target_manager.selected_id = last_selected_id
+                    else:
+                        crop_center = fallback_center
+                        track_state = "LOST"
 
             narrow_output, narrow_crop_rect = crop_to_16_9(
                 frame, crop_center, smooth_zoom, (780, 360), return_meta=True
             )
 
-            label = f"TARGET ID {target_manager.selected_id}" if active_track is not None else f"TRACK HOLD ID {target_manager.selected_id}"
+            display_id = target_manager.selected_id if target_manager.selected_id is not None else last_selected_id
+            label = f"TARGET ID {display_id}" if active_track is not None else f"TRACK HOLD ID {display_id}"
 
             real_pan_err = 0.0
             real_tilt_err = 0.0
@@ -495,9 +575,10 @@ def run_app(config):
             cv2.putText(narrow_output, f"PAN ERR {real_pan_err:.1f}  TILT ERR {real_tilt_err:.1f}", (20, 108), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
             cv2.putText(narrow_output, f"ZOOM {smooth_zoom:.1f}x", (20, 146), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
             cv2.putText(narrow_output, f"HOLD {hold_count}", (20, 184), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+            cv2.putText(narrow_output, f"STATE {track_state}", (20, 206), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
             center_lock_text = "CENTER LOCK ON" if (center_lock and active_track is not None) else "CENTER LOCK OFF"
-            cv2.putText(narrow_output, center_lock_text, (20, 222), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+            cv2.putText(narrow_output, center_lock_text, (20, 232), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
 
             if edge_limit_active:
                 cv2.putText(narrow_output, "EDGE LIMIT COMP", (20, 258), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
@@ -513,7 +594,7 @@ def run_app(config):
             )
 
             if active_track is not None:
-                narrow_output = draw_target_on_narrow(narrow_output, narrow_crop_rect, active_track, active_track.track_id)
+                narrow_output = draw_target_on_narrow(narrow_output, narrow_crop_rect, active_track, display_id)
             elif flow_debug_on and flow_center is not None:
                 cx1, cy1, cx2, cy2 = narrow_crop_rect
                 fx, fy = flow_center
@@ -526,8 +607,15 @@ def run_app(config):
                         py = int(pt[1] - cy1)
                         if 0 <= px < 780 and 0 <= py < 360:
                             cv2.circle(narrow_output, (px, py), 2, (255, 255, 0), -1)
-                cv2.putText(narrow_output, f"FLOW LOCK {flow_points_debug}", (20, 40),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 0), 2)
+                cv2.putText(
+                    narrow_output,
+                    f"FLOW FUSED {flow_points_debug}",
+                    (20, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.9,
+                    (255, 255, 0),
+                    2,
+                )
             else:
                 cv2.putText(narrow_output, "TRACK HOLD", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
 
@@ -535,8 +623,10 @@ def run_app(config):
             cv2.line(narrow_output, (390, 0), (390, 360), cross_color, 1)
             cv2.line(narrow_output, (0, 180), (780, 180), cross_color, 1)
         else:
+            track_state = "LOST"
             narrow_output, narrow_crop_rect = crop_to_16_9(frame, None, 1.7, (780, 360), return_meta=True)
             cv2.putText(narrow_output, "BRAK CELU", (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
+            cv2.putText(narrow_output, f"STATE {track_state}", (20, 206), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
             cv2.putText(
                 narrow_output,
                 "FLOW: OFF  PTS: 0",
@@ -564,6 +654,15 @@ def run_app(config):
             (0, 255, 255),
             2,
         )
+        cv2.putText(
+            wide_debug,
+            f"TRACK STATE: {track_state}",
+            (20, 352),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (255, 255, 255),
+            2,
+        )
 
         wide_program = add_title(wide_program, "WIDE PROGRAM")
         narrow_output = add_title(narrow_output, "NARROW OUTPUT")
@@ -582,6 +681,9 @@ def run_app(config):
             target_manager.set_auto_mode()
             narrow_tracker.reset()
             optical_flow_fallback.reset()
+            flow_hold_frames = 0
+            last_selected_id = None
+            track_state = "LOST"
         elif key in (ord("1"), ord("2"), ord("3"), ord("4"), ord("5"), ord("6"), ord("7"), ord("8"), ord("9")):
             wanted = int(chr(key))
             tr = next((t for t in tracks if t.track_id == wanted), None)
@@ -591,6 +693,9 @@ def run_app(config):
                 optical_flow_fallback.reset()
                 narrow_tracker.kalman.init_state(tr.center_xy[0], tr.center_xy[1])
                 narrow_tracker.smooth_center = tr.center_xy
+                flow_hold_frames = FLOW_HOLD_MAX
+                last_selected_id = tr.track_id
+                track_state = "DETECTED_LOCK"
 
     cap.release()
     cv2.destroyAllWindows()

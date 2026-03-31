@@ -142,6 +142,55 @@ def draw_target_on_narrow(narrow_frame, crop_rect, track, display_no="?"):
     return narrow_frame
 
 
+
+
+def draw_predicted_box_on_narrow(narrow_frame, crop_rect, center_xy, size_wh, label="FLOW HOLD PRED"):
+    if center_xy is None or size_wh is None:
+        return narrow_frame
+
+    cx, cy = center_xy
+    bw, bh = size_wh
+    if bw is None or bh is None or bw <= 1 or bh <= 1:
+        return narrow_frame
+
+    x1 = cx - bw / 2.0
+    y1 = cy - bh / 2.0
+    x2 = cx + bw / 2.0
+    y2 = cy + bh / 2.0
+
+    cx1, cy1, cx2, cy2 = crop_rect
+    crop_w = max(1, cx2 - cx1)
+    crop_h = max(1, cy2 - cy1)
+
+    nh, nw = narrow_frame.shape[:2]
+
+    nx1 = int((x1 - cx1) * nw / crop_w)
+    ny1 = int((y1 - cy1) * nh / crop_h)
+    nx2 = int((x2 - cx1) * nw / crop_w)
+    ny2 = int((y2 - cy1) * nh / crop_h)
+
+    nx1 = max(0, min(nw - 1, nx1))
+    ny1 = max(0, min(nh - 1, ny1))
+    nx2 = max(0, min(nw - 1, nx2))
+    ny2 = max(0, min(nh - 1, ny2))
+
+    if nx2 <= nx1 or ny2 <= ny1:
+        return narrow_frame
+
+    color = (255, 255, 0)
+    cv2.rectangle(narrow_frame, (nx1, ny1), (nx2, ny2), color, 2)
+    cv2.circle(narrow_frame, ((nx1 + nx2) // 2, (ny1 + ny2) // 2), 4, color, -1)
+    cv2.putText(
+        narrow_frame,
+        label,
+        (max(10, nx1), max(28, ny1 - 8)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.72,
+        color,
+        2,
+    )
+    return narrow_frame
+
 def parse_tracks(result, frame_shape):
     h, w = frame_shape[:2]
     tracks = []
@@ -235,6 +284,8 @@ def run_app(config):
     FLOW_HOLD_MAX = 45
     flow_hold_frames = 0
     track_state = "LOST"
+    prev_center = None
+    velocity = (0.0, 0.0)
 
     mode = config.get("mode", "video")
     if mode != "video":
@@ -288,6 +339,8 @@ def run_app(config):
             narrow_fallback_hold = 0
             flow_hold_frames = 0
             track_state = "LOST"
+            prev_center = None
+            velocity = (0.0, 0.0)
             ret, frame = cap.read()
             if not ret:
                 break
@@ -371,7 +424,15 @@ def run_app(config):
 
         if active_track is not None:
             active_track.is_active_target = True
-            last_target_center = active_track.center_xy
+            current_center = active_track.center_xy
+            if prev_center is not None:
+                velocity = (
+                    float(current_center[0] - prev_center[0]),
+                    float(current_center[1] - prev_center[1]),
+                )
+            prev_center = current_center
+
+            last_target_center = current_center
             last_selected_id = active_track.track_id
 
             x1, y1, x2, y2 = active_track.bbox_xyxy
@@ -519,15 +580,33 @@ def run_app(config):
                         flow_hold_frames = FLOW_HOLD_MAX
                         track_state = "FLOW_HOLD"
 
+                        if prev_center is not None:
+                            velocity = (
+                                float(crop_center[0] - prev_center[0]),
+                                float(crop_center[1] - prev_center[1]),
+                            )
+                        prev_center = crop_center
+
                         if target_manager.selected_id is None and last_selected_id is not None:
                             target_manager.selected_id = last_selected_id
                     else:
                         flow_ok = False
                         flow_points_debug = 0
                         flow_points = None
-                        if flow_hold_frames > 0 and last_target_center is not None:
-                            crop_center = last_target_center
+                        flow_center = None
+                        if flow_hold_frames > 0 and prev_center is not None:
+                            px = prev_center[0] + velocity[0]
+                            py = prev_center[1] + velocity[1]
+
+                            if fallback_center is not None:
+                                px = 0.65 * px + 0.35 * fallback_center[0]
+                                py = 0.65 * py + 0.35 * fallback_center[1]
+
+                            crop_center = (float(px), float(py))
                             smooth_center = crop_center
+                            last_target_center = crop_center
+                            prev_center = crop_center
+                            velocity = (velocity[0] * 0.92, velocity[1] * 0.92)
                             flow_hold_frames -= 1
                             track_state = "FLOW_HOLD"
                             if target_manager.selected_id is None and last_selected_id is not None:
@@ -537,9 +616,20 @@ def run_app(config):
                             track_state = "LOST"
                 else:
                     flow_ok = False
-                    if flow_hold_frames > 0 and last_target_center is not None:
-                        crop_center = last_target_center
+                    flow_center = None
+                    if flow_hold_frames > 0 and prev_center is not None:
+                        px = prev_center[0] + velocity[0]
+                        py = prev_center[1] + velocity[1]
+
+                        if fallback_center is not None:
+                            px = 0.65 * px + 0.35 * fallback_center[0]
+                            py = 0.65 * py + 0.35 * fallback_center[1]
+
+                        crop_center = (float(px), float(py))
                         smooth_center = crop_center
+                        last_target_center = crop_center
+                        prev_center = crop_center
+                        velocity = (velocity[0] * 0.92, velocity[1] * 0.92)
                         flow_hold_frames -= 1
                         track_state = "FLOW_HOLD"
                         if target_manager.selected_id is None and last_selected_id is not None:
@@ -595,6 +685,41 @@ def run_app(config):
 
             if active_track is not None:
                 narrow_output = draw_target_on_narrow(narrow_output, narrow_crop_rect, active_track, display_id)
+            elif track_state == "FLOW_HOLD" and last_target_size is not None and hold_count < 30:
+                pred_center = flow_center if (flow_debug_on and flow_center is not None) else crop_center
+                narrow_output = draw_predicted_box_on_narrow(
+                    narrow_output,
+                    narrow_crop_rect,
+                    pred_center,
+                    last_target_size,
+                    label=f"PREDICTED [{display_id}]",
+                )
+
+                cx1, cy1, cx2, cy2 = narrow_crop_rect
+                px, py = pred_center
+                crop_w = max(1, cx2 - cx1)
+                crop_h = max(1, cy2 - cy1)
+                rx = int((px - cx1) * 780.0 / crop_w)
+                ry = int((py - cy1) * 360.0 / crop_h)
+                if 0 <= rx < 780 and 0 <= ry < 360:
+                    cv2.circle(narrow_output, (rx, ry), 6, (255, 255, 0), -1)
+
+                if flow_debug_on and flow_points is not None:
+                    for pt in flow_points:
+                        fx = int((pt[0] - cx1) * 780.0 / crop_w)
+                        fy = int((pt[1] - cy1) * 360.0 / crop_h)
+                        if 0 <= fx < 780 and 0 <= fy < 360:
+                            cv2.circle(narrow_output, (fx, fy), 2, (255, 255, 0), -1)
+
+                cv2.putText(
+                    narrow_output,
+                    f"FLOW HOLD BOX {flow_points_debug}",
+                    (20, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.9,
+                    (255, 255, 0),
+                    2,
+                )
             elif flow_debug_on and flow_center is not None:
                 cx1, cy1, cx2, cy2 = narrow_crop_rect
                 fx, fy = flow_center
@@ -684,6 +809,8 @@ def run_app(config):
             flow_hold_frames = 0
             last_selected_id = None
             track_state = "LOST"
+            prev_center = None
+            velocity = (0.0, 0.0)
         elif key in (ord("1"), ord("2"), ord("3"), ord("4"), ord("5"), ord("6"), ord("7"), ord("8"), ord("9")):
             wanted = int(chr(key))
             tr = next((t for t in tracks if t.track_id == wanted), None)
@@ -696,6 +823,8 @@ def run_app(config):
                 flow_hold_frames = FLOW_HOLD_MAX
                 last_selected_id = tr.track_id
                 track_state = "DETECTED_LOCK"
+                prev_center = tr.center_xy
+                velocity = (0.0, 0.0)
 
     cap.release()
     cv2.destroyAllWindows()

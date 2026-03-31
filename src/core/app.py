@@ -1,4 +1,4 @@
-﻿import cv2
+import cv2
 from ultralytics import YOLO
 
 from core.target_manager import TargetManager
@@ -6,6 +6,7 @@ from core.narrow_tracker import NarrowTracker
 from core.stable_registry import StableTargetRegistry
 from core.target_filter import TargetFilter
 from core.head_motion_test import HeadMotionTestMode
+from core.optical_flow_fallback import NarrowOpticalFlowFallback
 
 
 class Track:
@@ -72,51 +73,6 @@ def crop_to_16_9(frame, center=None, scale=2.5, out_size=(780, 360), return_meta
     return resized
 
 
-def crop_group(frame, tracks, out_size=(780, 360)):
-    if not tracks:
-        return crop_to_16_9(frame, None, 1.0, out_size)
-
-    xs1 = [t.bbox_xyxy[0] for t in tracks]
-    ys1 = [t.bbox_xyxy[1] for t in tracks]
-    xs2 = [t.bbox_xyxy[2] for t in tracks]
-    ys2 = [t.bbox_xyxy[3] for t in tracks]
-
-    gx1 = min(xs1)
-    gy1 = min(ys1)
-    gx2 = max(xs2)
-    gy2 = max(ys2)
-
-    cx = (gx1 + gx2) / 2.0
-    cy = (gy1 + gy2) / 2.0
-    gw = max(60.0, gx2 - gx1)
-    gh = max(60.0, gy2 - gy1)
-
-    h, w = frame.shape[:2]
-    aspect = out_size[0] / out_size[1]
-
-    crop_w = gw * 3.2
-    crop_h = gh * 3.2
-
-    if crop_w / crop_h < aspect:
-        crop_w = crop_h * aspect
-    else:
-        crop_h = crop_w / aspect
-
-    crop_w = min(w, crop_w)
-    crop_h = min(h, crop_h)
-
-    x1 = int(cx - crop_w / 2.0)
-    y1 = int(cy - crop_h / 2.0)
-    x2 = int(cx + crop_w / 2.0)
-    y2 = int(cy + crop_h / 2.0)
-    x1, y1, x2, y2 = clamp_box(x1, y1, x2, y2, w, h)
-
-    crop = frame[y1:y2, x1:x2]
-    if crop.size == 0:
-        return cv2.resize(frame, out_size)
-    return cv2.resize(crop, out_size, interpolation=cv2.INTER_LINEAR)
-
-
 def add_title(panel, title):
     cv2.rectangle(panel, (0, 0), (440, 56), (0, 0, 0), -1)
     cv2.putText(panel, title, (20, 38), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
@@ -129,11 +85,11 @@ def draw_tracks(frame, tracks, selected_id):
         x1, y1, x2, y2 = [int(v) for v in tr.bbox_xyxy]
         cx, cy = [int(v) for v in tr.center_xy]
         if getattr(tr, "is_active_target", False):
-            color = (0, 255, 0)      # zielony
+            color = (0, 255, 0)
         elif getattr(tr, "is_valid_target", False):
-            color = (0, 255, 255)    # żółty
+            color = (0, 255, 255)
         else:
-            color = (0, 0, 255)      # czerwony
+            color = (0, 0, 255)
         cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
         cv2.circle(out, (cx, cy), 4, color, -1)
         cv2.putText(
@@ -202,7 +158,6 @@ def parse_tracks(result, frame_shape):
         x1, y1, x2, y2 = [float(v) for v in box]
         cy = (y1 + y2) / 2.0
 
-        # lagodniejszy filtr: dopuszczamy obiekty nizej w kadrze
         if cy > h * 0.92:
             continue
 
@@ -225,12 +180,51 @@ def parse_tracks(result, frame_shape):
     return tracks
 
 
+def _choose_reacquire_track(tracks, ref_center, frame_shape, selected_id=None):
+    if ref_center is None or not tracks:
+        return None
+
+    fw = frame_shape[1]
+    fh = frame_shape[0]
+    best_track = None
+    best_score = 1e18
+
+    for tr in tracks:
+        if not getattr(tr, "is_valid_target", True):
+            continue
+
+        x1, y1, x2, y2 = tr.bbox_xyxy
+        cx, cy = tr.center_xy
+        area = max(1.0, (x2 - x1) * (y2 - y1))
+        conf = float(getattr(tr, "confidence", 0.0))
+
+        dx = cx - ref_center[0]
+        dy = cy - ref_center[1]
+        dist2 = dx * dx + dy * dy
+
+        if area < 8.0:
+            continue
+
+        persistence_bonus = 4000.0 if selected_id is not None and tr.track_id == selected_id else 0.0
+        score = dist2 - conf * 5000.0 - persistence_bonus
+
+        if score < best_score:
+            best_score = score
+            best_track = tr
+
+    max_dist2 = (0.22 * max(fw, fh)) ** 2
+    if best_track is not None and best_score < max_dist2:
+        return best_track
+    return None
+
+
 def run_app(config):
     last_target_center = None
     last_target_size = None
     wide_hold_frames = 0
-    WIDE_HOLD_MAX = 45
-
+    WIDE_HOLD_MAX = 90
+    narrow_fallback_hold = 0
+    NARROW_FALLBACK_MAX = 45
 
     mode = config.get("mode", "video")
     if mode != "video":
@@ -259,6 +253,7 @@ def run_app(config):
     narrow_tracker = NarrowTracker(hold_frames=140)
     target_filter = TargetFilter()
     head_motion_test = HeadMotionTestMode()
+    optical_flow_fallback = NarrowOpticalFlowFallback()
 
     window_name = "Drone Tracker Multiview"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
@@ -275,6 +270,11 @@ def run_app(config):
             target_manager.set_auto_mode()
             narrow_tracker.reset()
             target_filter.reset()
+            optical_flow_fallback.reset()
+            last_target_center = None
+            last_target_size = None
+            wide_hold_frames = 0
+            narrow_fallback_hold = 0
             ret, frame = cap.read()
             if not ret:
                 break
@@ -305,14 +305,11 @@ def run_app(config):
         for tr in tracks:
             tx, ty = tr.center_xy
             dist_to_center = ((tx - frame_cx) ** 2 + (ty - frame_cy) ** 2) ** 0.5
-            center_bonus = max(0.0, 1.0 - dist_to_center / max(1.0, (fw * 0.5)))
+            center_bonus = max(0.0, 1.0 - dist_to_center / max(1.0, fw * 0.5))
 
             valid_score = float(getattr(tr, "target_score", 0.0))
             conf_score = float(getattr(tr, "confidence", 0.0))
-
-            persistence_bonus = 0.0
-            if target_manager.selected_id is not None and tr.track_id == target_manager.selected_id:
-                persistence_bonus = 0.35
+            persistence_bonus = 0.35 if target_manager.selected_id is not None and tr.track_id == target_manager.selected_id else 0.0
 
             tr.selection_priority = (
                 valid_score * 0.50
@@ -333,118 +330,31 @@ def run_app(config):
         target_manager.update(ordered_tracks, predicted_center, frame.shape)
         active_track = target_manager.find_active_track(tracks)
 
-        # === STICKY WIDE REACQUIRE ===
         if active_track is None and last_target_center is not None and wide_hold_frames > 0:
-            best_track = None
-            best_score = 1e18
-
-            for tr in tracks:
-                try:
-                    cx, cy = tr.center_xy
-                    x1, y1, x2, y2 = tr.bbox_xyxy
-                    area = max(1.0, (x2 - x1) * (y2 - y1))
-                    conf = float(getattr(tr, "confidence", 0.0))
-                except Exception:
-                    continue
-
-                dx = cx - last_target_center[0]
-                dy = cy - last_target_center[1]
-                dist2 = dx * dx + dy * dy
-
-                # dla dalekiego drona dopuszczamy male bboxy i nizszy conf
-                if area < 8:
-                    continue
-
-                score = dist2 - conf * 4000.0
-
-                if score < best_score:
-                    best_score = score
-                    best_track = tr
-
-            if best_track is not None and best_score < 90000:
-                target_manager.selected_id = best_track.track_id
-                active_track = best_track
+            reacquired = _choose_reacquire_track(tracks, last_target_center, frame.shape, target_manager.selected_id)
+            if reacquired is not None:
+                target_manager.selected_id = reacquired.track_id
+                active_track = reacquired
             else:
                 wide_hold_frames -= 1
 
-
-        # === AUTO REACQUIRE ===
-        if active_track is None and tracks:
-
-            best_track = None
-            best_score = 999999
-
-            frame_cx = frame.shape[1] / 2
-            frame_cy = frame.shape[0] / 2
-
-            for tr in tracks:
-                x1, y1, x2, y2 = tr["bbox"]
-
-                cx = (x1 + x2) / 2
-                cy = (y1 + y2) / 2
-
-                dx = cx - frame_cx
-                dy = cy - frame_cy
-
-                dist = dx*dx + dy*dy
-
-                size = (x2 - x1) * (y2 - y1)
-
-                # filtr śmieci
-                if size < 100:
-                    continue
-
-                score = dist
-
-                if score < best_score:
-                    best_score = score
-                    best_track = tr
-
-            if best_track is not None:
-                target_manager.selected_id = best_track["id"]
-                active_track = best_track
-
-
-        # === REACQUIRE LOGIC ===
-        if active_track is None and last_target_center is not None:
-            best_track = None
-            best_dist = 999999
-
-            for tr in tracks:
-                x1, y1, x2, y2 = tr["bbox"]
-                cx = (x1 + x2) / 2.0
-                cy = (y1 + y2) / 2.0
-
-                dx = cx - last_target_center[0]
-                dy = cy - last_target_center[1]
-                dist = dx*dx + dy*dy
-
-                if dist < best_dist:
-                    best_dist = dist
-                    best_track = tr
-
-            # threshold – żeby nie łapać śmieci
-            if best_track is not None and best_dist < 20000:
-                target_manager.selected_id = best_track["id"]
-                active_track = best_track
-
-
-        # failsafe: jesli target zniknal na dluzej, wyczysc lock i wroc do AUTO
-        if active_track is None and target_manager.selected_id is not None and target_manager.lock_age > 45:
+        if active_track is None and target_manager.selected_id is not None and target_manager.lock_age > 120:
             target_manager.set_auto_mode()
             narrow_tracker.reset()
+            optical_flow_fallback.reset()
 
         for tr in tracks:
             tr.is_active_target = False
-            if not hasattr(tr, "is_valid_target"):
-                tr.is_valid_target = True
+            tr.is_valid_target = getattr(tr, "is_valid_target", True)
         if active_track is not None:
             active_track.is_active_target = True
+            last_target_center = active_track.center_xy
+            x1, y1, x2, y2 = active_track.bbox_xyxy
+            last_target_size = (x2 - x1, y2 - y1)
+            wide_hold_frames = WIDE_HOLD_MAX
 
-        # baza z kalmana
         predicted_center, smooth_center, smooth_zoom, hold_count, _, _ = narrow_tracker.update(frame, active_track)
 
-        # direct lock na wybrany target
         edge_limit_active = False
 
         if active_track is not None:
@@ -457,19 +367,13 @@ def run_app(config):
             tilt_err = ty - smooth_center[1]
 
             if target_manager.manual_lock:
-                # reczny lock: ustaw srodek narrow dokladnie na cel
                 cx = tx
                 cy = ty
                 smooth_center = (cx, cy)
                 pan_speed = pan_err
                 tilt_speed = tilt_err
 
-                # EDGE-AWARE ZOOM:
-                # jesli cel jest blisko krawedzi obrazu wide, zwieksz zoom,
-                # aby narrow mogl go faktycznie wycentrowac
-                fh, fw = frame.shape[:2]
                 aspect = 780.0 / 360.0
-
                 margin_x = min(tx, fw - tx)
                 margin_y = min(ty, fh - ty)
 
@@ -510,7 +414,6 @@ def run_app(config):
             pan_speed = 0.0
             tilt_speed = 0.0
 
-        # === HEAD MOTION TEST ===
         dx_test, dy_test = head_motion_test.update()
         dx_test = max(-3.0, min(3.0, dx_test))
         dy_test = max(-2.0, min(2.0, dy_test))
@@ -534,8 +437,41 @@ def run_app(config):
 
         wide_debug = cv2.resize(debug_frame, (1560, 450), interpolation=cv2.INTER_LINEAR)
 
+        flow_debug_on = False
+        flow_points_debug = 0
+        flow_points = None
+        flow_center = None
+
+        fallback_center = None
         if smooth_center is not None:
-            narrow_output, narrow_crop_rect = crop_to_16_9(frame, smooth_center, smooth_zoom, (780, 360), return_meta=True)
+            fallback_center = smooth_center
+            narrow_fallback_hold = NARROW_FALLBACK_MAX
+        elif active_track is not None:
+            fallback_center = active_track.center_xy
+            narrow_fallback_hold = NARROW_FALLBACK_MAX
+        elif narrow_fallback_hold > 0 and last_target_center is not None:
+            narrow_fallback_hold -= 1
+            fallback_center = last_target_center
+
+        if fallback_center is not None:
+            if active_track is not None:
+                try:
+                    optical_flow_fallback.init_from_bbox(frame, active_track.bbox_xyxy)
+                except Exception:
+                    pass
+                crop_center = fallback_center
+            else:
+                flow_ok, flow_center, flow_points_debug, flow_points = optical_flow_fallback.update(frame)
+                if flow_ok and flow_center is not None:
+                    crop_center = flow_center
+                    smooth_center = flow_center
+                    flow_debug_on = True
+                else:
+                    crop_center = fallback_center
+
+            narrow_output, narrow_crop_rect = crop_to_16_9(
+                frame, crop_center, smooth_zoom, (780, 360), return_meta=True
+            )
 
             label = f"TARGET ID {target_manager.selected_id}" if active_track is not None else f"TRACK HOLD ID {target_manager.selected_id}"
 
@@ -566,16 +502,50 @@ def run_app(config):
             if edge_limit_active:
                 cv2.putText(narrow_output, "EDGE LIMIT COMP", (20, 258), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
 
+            cv2.putText(
+                narrow_output,
+                f"FLOW: {'ON' if flow_debug_on else 'OFF'}  PTS: {flow_points_debug}",
+                (20, 294),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (255, 255, 255),
+                2,
+            )
+
             if active_track is not None:
                 narrow_output = draw_target_on_narrow(narrow_output, narrow_crop_rect, active_track, active_track.track_id)
+            elif flow_debug_on and flow_center is not None:
+                cx1, cy1, cx2, cy2 = narrow_crop_rect
+                fx, fy = flow_center
+                rx = int(fx - cx1)
+                ry = int(fy - cy1)
+                cv2.circle(narrow_output, (rx, ry), 6, (255, 255, 0), -1)
+                if flow_points is not None:
+                    for pt in flow_points:
+                        px = int(pt[0] - cx1)
+                        py = int(pt[1] - cy1)
+                        if 0 <= px < 780 and 0 <= py < 360:
+                            cv2.circle(narrow_output, (px, py), 2, (255, 255, 0), -1)
+                cv2.putText(narrow_output, f"FLOW LOCK {flow_points_debug}", (20, 40),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 0), 2)
+            else:
+                cv2.putText(narrow_output, "TRACK HOLD", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
 
-            cross_color = (0, 255, 0) if center_lock else (0, 255, 255)
             cross_color = (0, 255, 0) if center_lock else (0, 255, 255)
             cv2.line(narrow_output, (390, 0), (390, 360), cross_color, 1)
             cv2.line(narrow_output, (0, 180), (780, 180), cross_color, 1)
         else:
             narrow_output, narrow_crop_rect = crop_to_16_9(frame, None, 1.7, (780, 360), return_meta=True)
             cv2.putText(narrow_output, "BRAK CELU", (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
+            cv2.putText(
+                narrow_output,
+                "FLOW: OFF  PTS: 0",
+                (20, 294),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (255, 255, 255),
+                2,
+            )
 
         lock_mode = "AUTO" if not target_manager.manual_lock else "MANUAL"
         cv2.putText(wide_debug, f"LOCK MODE: {lock_mode}", (20, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
@@ -611,12 +581,14 @@ def run_app(config):
         elif key == ord("0"):
             target_manager.set_auto_mode()
             narrow_tracker.reset()
+            optical_flow_fallback.reset()
         elif key in (ord("1"), ord("2"), ord("3"), ord("4"), ord("5"), ord("6"), ord("7"), ord("8"), ord("9")):
             wanted = int(chr(key))
             tr = next((t for t in tracks if t.track_id == wanted), None)
             if tr is not None:
                 target_manager.set_manual_target(tr.track_id)
                 narrow_tracker.reset()
+                optical_flow_fallback.reset()
                 narrow_tracker.kalman.init_state(tr.center_xy[0], tr.center_xy[1])
                 narrow_tracker.smooth_center = tr.center_xy
 

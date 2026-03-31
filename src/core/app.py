@@ -227,7 +227,7 @@ def parse_tracks(result, frame_shape):
     return tracks
 
 
-def _choose_reacquire_track(tracks, ref_center, frame_shape, selected_id=None):
+def _choose_reacquire_track(tracks, ref_center, frame_shape, selected_id=None, ref_size=None):
     if ref_center is None or not tracks:
         return None
 
@@ -235,6 +235,9 @@ def _choose_reacquire_track(tracks, ref_center, frame_shape, selected_id=None):
     fh = frame_shape[0]
     best_track = None
     best_score = 1e18
+    ref_area = None
+    if ref_size is not None:
+        ref_area = max(1.0, float(ref_size[0]) * float(ref_size[1]))
 
     for tr in tracks:
         if not getattr(tr, "is_valid_target", True):
@@ -252,31 +255,44 @@ def _choose_reacquire_track(tracks, ref_center, frame_shape, selected_id=None):
         if area < 8.0:
             continue
 
+        size_penalty = 0.0
+        if ref_area is not None:
+            size_penalty = abs(area - ref_area) / max(ref_area, 1.0) * 2500.0
+
         persistence_bonus = 4000.0 if selected_id is not None and tr.track_id == selected_id else 0.0
-        score = dist2 - conf * 5000.0 - persistence_bonus
+        score = dist2 + size_penalty - conf * 5000.0 - persistence_bonus
 
         if score < best_score:
             best_score = score
             best_track = tr
 
     max_dist2 = (0.22 * max(fw, fh)) ** 2
-    if best_track is not None and best_score < max_dist2:
+    if best_track is not None and best_score < max_dist2 + 2500.0:
         return best_track
     return None
 
 
-def _make_guided_roi(frame_shape, ref_center, ref_size=None, expand=3.4):
+def _make_guided_roi(frame_shape, ref_center, ref_size=None, expand=3.4, velocity=(0.0, 0.0), hold_count=0):
     if ref_center is None:
         return None
 
     h, w = frame_shape[:2]
     cx, cy = ref_center
+    vx, vy = velocity
+    vel_mag = (vx * vx + vy * vy) ** 0.5
+    dynamic_expand = expand + min(2.0, vel_mag * 0.08) + min(1.2, max(0, hold_count) * 0.03)
+
     if ref_size is None:
-        bw = max(160.0, w * 0.18)
-        bh = max(90.0, h * 0.18)
+        bw = max(180.0, w * 0.20)
+        bh = max(100.0, h * 0.20)
     else:
-        bw = max(80.0, float(ref_size[0]) * expand)
-        bh = max(80.0, float(ref_size[1]) * expand)
+        bw = max(90.0, float(ref_size[0]) * dynamic_expand)
+        bh = max(90.0, float(ref_size[1]) * dynamic_expand)
+
+    lookahead = min(40.0, vel_mag * 1.5)
+    if vel_mag > 1e-6:
+        cx += (vx / vel_mag) * lookahead
+        cy += (vy / vel_mag) * lookahead
 
     aspect = 16.0 / 9.0
     if bw / bh < aspect:
@@ -355,6 +371,7 @@ def run_app(config):
     FLOW_HOLD_MAX = 100
     flow_hold_frames = 0
     track_state = "DETECTED_LOCK"
+    roi_search_active = False
 
     mode = config.get("mode", "video")
     if mode != "video":
@@ -415,6 +432,7 @@ def run_app(config):
             narrow_fallback_hold = 0
             flow_hold_frames = 0
             track_state = "DETECTED_LOCK"
+            roi_search_active = False
             ret, frame = cap.read()
             if not ret:
                 break
@@ -427,18 +445,27 @@ def run_app(config):
 
             roi_rect = None
             if target_manager.selected_id is not None and guided_ref_center is not None:
-                roi_rect = _make_guided_roi(frame.shape, guided_ref_center, guided_ref_size, expand=4.0)
+                roi_rect = _make_guided_roi(
+                    frame.shape,
+                    guided_ref_center,
+                    guided_ref_size,
+                    expand=4.0,
+                    velocity=velocity,
+                    hold_count=hold_count,
+                )
 
             roi_tracks = []
             used_roi = False
             roi_debug_rect = None
             roi_debug_on = False
+            roi_search_active = False
 
             if roi_rect is not None:
                 roi_tracks, used_roi, roi_debug_rect = _run_detector(
                     model, frame, tracker_name, conf, imgsz, classes, roi_rect=roi_rect
                 )
                 roi_debug_on = used_roi
+                roi_search_active = used_roi
 
             if roi_tracks:
                 det_tracks = roi_tracks
@@ -466,12 +493,19 @@ def run_app(config):
             valid_score = float(getattr(tr, "target_score", 0.0))
             conf_score = float(getattr(tr, "confidence", 0.0))
             persistence_bonus = 0.35 if target_manager.selected_id is not None and tr.track_id == target_manager.selected_id else 0.0
+            size_bonus = 0.0
+            if last_target_size is not None:
+                ref_area = max(1.0, float(last_target_size[0]) * float(last_target_size[1]))
+                x1, y1, x2, y2 = tr.bbox_xyxy
+                area = max(1.0, (x2 - x1) * (y2 - y1))
+                size_bonus = max(0.0, 1.0 - abs(area - ref_area) / max(ref_area, 1.0)) * 0.25
 
             tr.selection_priority = (
-                valid_score * 0.50
+                valid_score * 0.45
                 + conf_score * 0.20
-                + center_bonus * 0.30
+                + center_bonus * 0.20
                 + persistence_bonus
+                + size_bonus
             )
 
         predicted_center = narrow_tracker.kalman.predict()
@@ -487,7 +521,13 @@ def run_app(config):
         active_track = target_manager.find_active_track(tracks)
 
         if active_track is None and last_target_center is not None and wide_hold_frames > 0:
-            reacquired = _choose_reacquire_track(tracks, last_target_center, frame.shape, target_manager.selected_id)
+            reacquired = _choose_reacquire_track(
+                tracks,
+                last_target_center,
+                frame.shape,
+                target_manager.selected_id,
+                last_target_size,
+            )
             if reacquired is not None:
                 target_manager.selected_id = reacquired.track_id
                 active_track = reacquired

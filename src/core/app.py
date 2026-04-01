@@ -357,12 +357,47 @@ def _run_detector(model, frame, tracker_name, conf, imgsz, classes, roi_rect=Non
     return tracks, True, roi_rect
 
 
+
+def _matches_identity(track, ref_center, ref_size, frame_shape):
+    if track is None or ref_center is None:
+        return False
+
+    fw = frame_shape[1]
+    fh = frame_shape[0]
+    cx, cy = track.center_xy
+    dx = cx - ref_center[0]
+    dy = cy - ref_center[1]
+    dist = (dx * dx + dy * dy) ** 0.5
+
+    max_dist = 0.12 * max(fw, fh)
+    if dist > max_dist:
+        return False
+
+    if ref_size is not None:
+        x1, y1, x2, y2 = track.bbox_xyxy
+        bw = max(1.0, x2 - x1)
+        bh = max(1.0, y2 - y1)
+        ref_w = max(1.0, float(ref_size[0]))
+        ref_h = max(1.0, float(ref_size[1]))
+
+        wr = bw / ref_w
+        hr = bh / ref_h
+
+        if not (0.45 <= wr <= 2.2 and 0.45 <= hr <= 2.2):
+            return False
+
+    return True
+
+
 def run_app(config):
     last_target_center = None
     last_target_size = None
     last_flow_center = None
     prev_center = None
     velocity = (0.0, 0.0)
+    display_target_id = None
+    display_id_hold = 0
+    DISPLAY_ID_HOLD_MAX = 180
 
     wide_hold_frames = 0
     WIDE_HOLD_MAX = 90
@@ -558,6 +593,27 @@ def run_app(config):
             flow_hold_frames = FLOW_HOLD_MAX
             track_state = "DETECTED_LOCK"
 
+            if display_target_id is None:
+                display_target_id = active_track.track_id
+                display_id_hold = DISPLAY_ID_HOLD_MAX
+            else:
+                same_identity = _matches_identity(
+                    active_track,
+                    last_target_center,
+                    last_target_size,
+                    frame.shape,
+                )
+                if same_identity and display_id_hold > 0:
+                    display_id_hold = DISPLAY_ID_HOLD_MAX
+                else:
+                    display_target_id = active_track.track_id
+                    display_id_hold = DISPLAY_ID_HOLD_MAX
+        else:
+            if display_id_hold > 0:
+                display_id_hold -= 1
+            else:
+                display_target_id = None
+
         predicted_center, smooth_center, smooth_zoom, hold_count, _, _ = narrow_tracker.update(frame, active_track)
 
         edge_limit_active = False
@@ -720,7 +776,8 @@ def run_app(config):
                 frame, crop_center, smooth_zoom, (780, 360), return_meta=True
             )
 
-            label = f"TARGET ID {target_manager.selected_id}" if active_track is not None else f"TRACK HOLD ID {target_manager.selected_id}"
+            shown_id = display_target_id if display_target_id is not None else target_manager.selected_id
+            label = f"TARGET ID {shown_id}" if active_track is not None else f"TRACK HOLD ID {shown_id}"
 
             real_pan_err = 0.0
             real_tilt_err = 0.0
@@ -761,7 +818,12 @@ def run_app(config):
             )
 
             if active_track is not None:
-                narrow_output = draw_target_on_narrow(narrow_output, narrow_crop_rect, active_track, active_track.track_id)
+                narrow_output = draw_target_on_narrow(
+                    narrow_output,
+                    narrow_crop_rect,
+                    active_track,
+                    shown_id if shown_id is not None else active_track.track_id,
+                )
             else:
                 if predicted_box_center is not None and predicted_box_size is not None and track_state == "FLOW_HOLD":
                     narrow_output = draw_predicted_box_on_narrow(
@@ -769,7 +831,7 @@ def run_app(config):
                         narrow_crop_rect,
                         predicted_box_center,
                         predicted_box_size,
-                        target_manager.selected_id if target_manager.selected_id is not None else "?",
+                        shown_id if shown_id is not None else "?",
                     )
 
                 if flow_debug_on and flow_center is not None:
@@ -805,7 +867,8 @@ def run_app(config):
 
         lock_mode = "AUTO" if not target_manager.manual_lock else "MANUAL"
         cv2.putText(wide_debug, f"LOCK MODE: {lock_mode}", (20, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-        cv2.putText(wide_debug, f"SELECTED ID: {target_manager.selected_id}", (20, 136), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+        shown_id = display_target_id if display_target_id is not None else target_manager.selected_id
+        cv2.putText(wide_debug, f"SELECTED ID: {shown_id}", (20, 136), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
         cv2.putText(wide_debug, f"HOLD COUNT: {hold_count}", (20, 172), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
         cv2.putText(wide_debug, f"LOCK AGE: {target_manager.lock_age}", (20, 208), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
         cv2.putText(wide_debug, f"PAN SPD: {pan_speed:.1f}  TILT SPD: {tilt_speed:.1f}", (20, 244), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)

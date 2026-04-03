@@ -1,119 +1,88 @@
-﻿import numpy as np
-
-
 class TargetManager:
-    def __init__(self, reacquire_radius_auto=100.0, reacquire_radius_manual=140.0, sticky_frames=75):
+    def __init__(self, reacquire_radius_auto=140.0, reacquire_radius_manual=260.0, sticky_frames=20, switch_margin=0.25, switch_dwell=6):
         self.selected_id = None
         self.manual_lock = False
+        self.last_switch_frame = 0
+        self.frame_id = 0
+        self.sticky_frames = int(sticky_frames)
+        self.switch_margin = float(switch_margin)
+        self.switch_dwell = int(switch_dwell)
         self.reacquire_radius_auto = float(reacquire_radius_auto)
         self.reacquire_radius_manual = float(reacquire_radius_manual)
-        self.sticky_frames = int(sticky_frames)
-        self.lock_age = 9999
-
-    def reset(self):
-        self.selected_id = None
-        self.manual_lock = False
-        self.lock_age = 9999
-
-    def set_manual_target(self, track_id: int):
-        self.selected_id = int(track_id)
-        self.manual_lock = True
         self.lock_age = 0
 
     def set_auto_mode(self):
         self.manual_lock = False
-        self.selected_id = None
-        self.lock_age = 9999
 
-    def find_active_track(self, tracks):
-        if self.selected_id is None:
-            return None
-        for tr in tracks:
-            if tr.track_id == self.selected_id:
-                return tr
-        return None
+    def set_manual_target(self, tid):
+        self.manual_lock = True
+        self.selected_id = tid
+        self.lock_age = 0
+        self.last_switch_frame = self.frame_id
 
-    def _score_auto_target(self, tr, frame_shape):
-        h, w = frame_shape[:2]
-        cx = w / 2.0
-        cy = h / 2.0
-
-        x1, y1, x2, y2 = tr.bbox_xyxy
-        tcx, tcy = tr.center_xy
-
-        area = max(1.0, (x2 - x1) * (y2 - y1))
-        dist = np.hypot(tcx - cx, tcy - cy)
-
-        # Im większy score, tym lepszy target
-        score = 0.0
-        score += tr.confidence * 1000.0
-        score += area * 0.020
-        score -= dist * 0.70
-        score -= tcy * 0.10
-
-        return score
-
-    def _choose_best_auto_target(self, tracks, frame_shape):
+    def update(self, tracks, predicted_center, frame_shape):
+        self.frame_id += 1
+        tracks = list(tracks or [])
         if not tracks:
-            return None
+            self.lock_age += 1
+            return
+        if self.manual_lock:
+            keep = next((t for t in tracks if t.track_id == self.selected_id), None)
+            self.lock_age = 0 if keep is not None else self.lock_age + 1
+            return
 
         best = None
-        best_score = None
-
+        best_score = -1e9
         for tr in tracks:
-            score = self._score_auto_target(tr, frame_shape)
-            if best_score is None or score > best_score:
+            score = self._score(tr, frame_shape, predicted_center)
+            if tr.track_id == self.selected_id:
+                score += 5.0
+            if score > best_score:
                 best_score = score
                 best = tr
 
-        return best
-
-    def update(self, tracks, predicted_center, frame_shape):
-        if not tracks:
+        if best is None:
             self.lock_age += 1
-            return self.selected_id
+            return
 
-        active = self.find_active_track(tracks)
-        if active is not None:
-            self.lock_age = 0
-            return self.selected_id
-
-        # Próba odzyskania targetu blisko przewidywanej pozycji
-        if predicted_center is not None and self.selected_id is not None:
-            radius = self.reacquire_radius_manual if self.manual_lock else self.reacquire_radius_auto
-            candidates = []
-            for t in tracks:
-                dist = np.hypot(
-                    t.center_xy[0] - predicted_center[0],
-                    t.center_xy[1] - predicted_center[1],
-                )
-                candidates.append((dist, -t.confidence, t))
-
-            if candidates:
-                candidates.sort(key=lambda x: (x[0], x[1]))
-                best_dist, _, best_track = candidates[0]
-                if best_dist <= radius:
-                    self.selected_id = best_track.track_id
-                    self.lock_age = 0
-                    return self.selected_id
-
-        # W MANUAL nie przełączamy automatycznie na inny cel
-        if self.manual_lock:
-            self.lock_age += 1
-            return self.selected_id
-
-        # W AUTO trzymamy przez chwilę poprzedni wybór
-        if self.selected_id is not None and self.lock_age < self.sticky_frames:
-            self.lock_age += 1
-            best_current = self._choose_best_auto_target(tracks, frame_shape)
-            if best_current is not None and best_current.track_id == self.selected_id:
-                self.lock_age = 0
-            return self.selected_id
-
-        # Wybór najlepszego celu
-        best = self._choose_best_auto_target(tracks, frame_shape)
-        if best is not None:
+        if self.selected_id is None:
             self.selected_id = best.track_id
             self.lock_age = 0
+            self.last_switch_frame = self.frame_id
+            return
 
-        return self.selected_id
+        current = next((t for t in tracks if t.track_id == self.selected_id), None)
+        if current is None:
+            self.selected_id = best.track_id
+            self.lock_age = 0
+            self.last_switch_frame = self.frame_id
+            return
+
+        current_score = self._score(current, frame_shape, predicted_center)
+        if best.track_id != self.selected_id and best_score > current_score * (1.0 + self.switch_margin) and (self.frame_id - self.last_switch_frame) > self.switch_dwell:
+            self.selected_id = best.track_id
+            self.last_switch_frame = self.frame_id
+            self.lock_age = 0
+        else:
+            self.lock_age += 1
+
+    def _score(self, tr, frame_shape, predicted_center=None):
+        h, w = frame_shape[:2]
+        x, y = tr.center_xy
+        cx = x / max(1.0, w)
+        cy = y / max(1.0, h)
+        center_dist = (cx - 0.5) ** 2 + (cy - 0.5) ** 2
+        center_score = 1.0 - center_dist * 3.0
+        conf = float(getattr(tr, "confidence", 0.0))
+        area = (tr.bbox_xyxy[2] - tr.bbox_xyxy[0]) * (tr.bbox_xyxy[3] - tr.bbox_xyxy[1])
+        area_norm = area / max(1.0, (w * h))
+        score = conf * 5.0 + center_score * 2.0 + min(area_norm * 200.0, 2.0)
+        if getattr(tr, "is_confirmed", False):
+            score += 2.0
+        if predicted_center is not None:
+            px, py = predicted_center
+            dx = x - px
+            dy = y - py
+            dist2 = dx * dx + dy * dy
+            score += max(-2.0, 1.2 - dist2 / 25000.0)
+        return score

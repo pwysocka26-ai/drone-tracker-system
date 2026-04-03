@@ -1,13 +1,33 @@
-﻿mode: video
-fps: 30
+mode: video
 
 video:
   source: video.mp4
 
 yolo:
   model: yolov8n.pt
-  tracker: bytetrack.yaml
-  conf: 0.15
-  imgsz: 640
+  backend: track
+  tracker: config/bytetrack_fast_acquire.yaml
+  conf: 0.12
+  imgsz: 960
   classes: [4]
   inference_every: 1
+  search_fallback: true
+  search_conf: 0.06
+  search_imgsz: 1280
+  search_interval: 2
+
+tracker:
+  max_missed_frames: 24
+  confirm_hits: 2
+  max_center_distance: 180.0
+  min_iou_for_match: 0.01
+  velocity_alpha: 0.65
+  history_size: 12
+  reacquire_radius_auto: 140.0
+  reacquire_radius_manual: 260.0
+  sticky_frames: 20
+  switch_margin: 0.25
+  switch_dwell: 6
+
+narrow:
+  hold_frames: 80

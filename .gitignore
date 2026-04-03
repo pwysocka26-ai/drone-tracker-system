@@ -1,4 +1,30 @@
-tracker_shots_*/
+# cache
+__pycache__/
+*.pyc
+src/**/__pycache__/
+sim/**/__pycache__/
+
+# tmp / eksperymenty
+tmp*.py
+fix_*.py
+patch_*.py
+add_*.py
+
+# backupi
 *.bak
-*.backup
-*_backup
+*.bak2
+
+# dumpy / wyniki pomocnicze
+*_dump.txt
+select_result.txt
+
+# nagrania / shoty
+*.mp4
+tracker_shots_*/
+
+# lokalne testy
+test_env/
+
+# system
+.DS_Store
+Thumbs.db

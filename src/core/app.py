@@ -1,4 +1,21 @@
-﻿import cv2
+﻿
+def tighten_bbox(bbox, scale=0.65, min_size=12):
+    x1, y1, x2, y2 = bbox
+
+    cx = (x1 + x2) / 2.0
+    cy = (y1 + y2) / 2.0
+
+    w = max(float(min_size), (x2 - x1) * float(scale))
+    h = max(float(min_size), (y2 - y1) * float(scale))
+
+    nx1 = int(cx - w / 2.0)
+    ny1 = int(cy - h / 2.0)
+    nx2 = int(cx + w / 2.0)
+    ny2 = int(cy + h / 2.0)
+
+    return nx1, ny1, nx2, ny2
+
+import cv2
 from datetime import datetime
 from pathlib import Path
 from ultralytics import YOLO
@@ -127,7 +144,7 @@ def add_title(panel, title):
 def draw_tracks(frame, tracks, selected_id):
     out = frame.copy()
     for tr in tracks:
-        x1, y1, x2, y2 = [int(v) for v in tr.bbox_xyxy]
+        x1, y1, x2, y2 = tighten_bbox(tr.bbox_xyxy, scale=0.65)
         cx, cy = [int(v) for v in tr.center_xy]
         if getattr(tr, "is_active_target", False):
             color = (0, 255, 0)      # zielony
@@ -153,7 +170,7 @@ def draw_target_on_narrow(narrow_frame, crop_rect, track, display_no="?"):
     if track is None:
         return narrow_frame
 
-    x1, y1, x2, y2 = track.bbox_xyxy
+    x1, y1, x2, y2 = tighten_bbox(track.bbox_xyxy, scale=0.60)
     cx1, cy1, cx2, cy2 = crop_rect
 
     crop_w = max(1, cx2 - cx1)
@@ -227,64 +244,349 @@ def parse_tracks(result, frame_shape):
 
 
 
-def choose_active_target_for_formation(tracks, frame_shape, current_selected_id=None):
-    """
-    Prefer targets that are:
-    1) already selected,
-    2) close to the frame center,
-    3) reasonably large,
-    4) confirmed or at least recently seen.
-    """
-    if not tracks:
+def choose_single_primary_target(tracks, frame_shape=None, current_selected_id=None, prev_id=None, *args, **kwargs):
+    global _last_primary_state
+
+    tracks = list(tracks or [])
+    valid_tracks = [tr for tr in tracks if _bbox_ok(_bbox_of(tr))]
+
+    if not valid_tracks:
+        _last_primary_state["misses"] = int(_last_primary_state.get("misses", 9999)) + 1
         return None
 
-    fh, fw = frame_shape[:2]
-    cx = fw / 2.0
-    cy = fh / 2.0
+    last_id = _last_primary_state.get("id")
+    last_bbox = _last_primary_state.get("bbox")
+    last_center = _last_primary_state.get("center")
+    misses = int(_last_primary_state.get("misses", 9999))
 
-    best = None
-    best_score = -1e18
+    # manual/current_selected_id ma najwyzszy priorytet
+    if current_selected_id is not None:
+        for tr in valid_tracks:
+            if _track_id_of(tr) == current_selected_id:
+                bbox = _bbox_of(tr)
+                _last_primary_state["id"] = _track_id_of(tr)
+                _last_primary_state["bbox"] = bbox
+                _last_primary_state["center"] = _bbox_center_norm(bbox, frame_shape)
+                _last_primary_state["misses"] = 0
+                return tr
 
-    for tr in tracks:
-        tx, ty = tr.center_xy
-        x1, y1, x2, y2 = tr.bbox_xyxy
-        w = max(1.0, x2 - x1)
-        h = max(1.0, y2 - y1)
-        area = w * h
+    # utrzymanie poprzedniego celu z histereza
+    sticky_ids = []
+    if prev_id is not None:
+        sticky_ids.append(prev_id)
+    if last_id is not None and last_id not in sticky_ids:
+        sticky_ids.append(last_id)
 
-        dist2 = (tx - cx) ** 2 + (ty - cy) ** 2
-        dist_score = -dist2 / 20000.0
-        area_score = min(area / 1200.0, 8.0)
-        conf_score = float(getattr(tr, "confidence", 0.0)) * 8.0
-        confirmed_bonus = 8.0 if getattr(tr, "is_confirmed", False) else 2.0
-        alive_bonus = max(0.0, 4.0 - float(getattr(tr, "missed_frames", 0)))
-        sticky_bonus = 30.0 if current_selected_id is not None and tr.track_id == current_selected_id else 0.0
+    for sticky_id in sticky_ids:
+        for tr in valid_tracks:
+            if _track_id_of(tr) != sticky_id:
+                continue
 
-        # mild penalty for boxes that are suspiciously huge / merged
-        giant_penalty = -8.0 if area > 25000.0 else 0.0
+            bbox = _bbox_of(tr)
+            conf = float(getattr(tr, "confidence", 0.0) or 0.0)
+            same_enough = False
 
-        score = dist_score + area_score + conf_score + confirmed_bonus + alive_bonus + sticky_bonus + giant_penalty
-        if score > best_score:
-            best_score = score
-            best = tr
+            if last_bbox is not None:
+                same_enough = _iou(bbox, last_bbox) >= 0.04
+            if last_center is not None:
+                c = _bbox_center_norm(bbox, frame_shape)
+                same_enough = same_enough or (_dist2(c, last_center) <= 0.025)
 
-    return best
+            if conf >= 0.10 or same_enough or misses <= 10:
+                _last_primary_state["id"] = _track_id_of(tr)
+                _last_primary_state["bbox"] = bbox
+                _last_primary_state["center"] = _bbox_center_norm(bbox, frame_shape)
+                _last_primary_state["misses"] = 0
+                return tr
 
+    # reacquire blisko ostatniej pozycji
+    if last_center is not None and misses <= 18:
+        close_candidates = []
+        for tr in valid_tracks:
+            bbox = _bbox_of(tr)
+            c = _bbox_center_norm(bbox, frame_shape)
+            if _dist2(c, last_center) <= 0.06:
+                close_candidates.append(tr)
 
+        if close_candidates:
+            best = max(
+                close_candidates,
+                key=lambda tr: _primary_score(
+                    tr,
+                    frame_shape=frame_shape,
+                    preferred_id=last_id,
+                    last_bbox=last_bbox,
+                    last_center=last_center,
+                ),
+            )
+            bbox = _bbox_of(best)
+            _last_primary_state["id"] = _track_id_of(best)
+            _last_primary_state["bbox"] = bbox
+            _last_primary_state["center"] = _bbox_center_norm(bbox, frame_shape)
+            _last_primary_state["misses"] = 0
+            return best
 
-def choose_primary_target_generic(tracks, frame_shape, current_selected_id=None):
-    """
-    Wybiera jeden glowny target do sterowania narrow:
-    - preferuje potwierdzone tracki,
-    - trzyma poprzedni ID jesli nadal jest sensowny,
-    - nie tworzy group boxa.
-    """
-    return choose_active_target_for_formation(
-        tracks,
-        frame_shape,
-        current_selected_id=current_selected_id,
+    # pelny acquire
+    best = max(
+        valid_tracks,
+        key=lambda tr: _primary_score(
+            tr,
+            frame_shape=frame_shape,
+            preferred_id=current_selected_id,
+            last_bbox=last_bbox,
+            last_center=last_center,
+        ),
     )
 
+    bbox = _bbox_of(best)
+    conf = float(getattr(best, "confidence", 0.0) or 0.0)
+    area = _bbox_area_norm(bbox, frame_shape)
+
+    enough_for_acquire = (
+        conf >= 0.12
+        or area >= 0.00003
+        or misses <= 12
+    )
+
+    if not enough_for_acquire:
+        _last_primary_state["misses"] = misses + 1
+        return None
+
+    _last_primary_state["id"] = _track_id_of(best)
+    _last_primary_state["bbox"] = bbox
+    _last_primary_state["center"] = _bbox_center_norm(bbox, frame_shape)
+    _last_primary_state["misses"] = 0
+    return best
+def _track_id_of(tr):
+    tid = getattr(tr, "track_id", None)
+    if tid is None:
+        tid = getattr(tr, "id", None)
+    if tid is None:
+        tid = getattr(tr, "selected_id", None)
+    return tid
+
+def _bbox_of(tr):
+    bbox = getattr(tr, "bbox_xyxy", None)
+    if bbox is None:
+        bbox = getattr(tr, "bbox", None)
+    return bbox
+
+def _bbox_ok(b):
+    if b is None:
+        return False
+    if len(b) != 4:
+        return False
+    x1, y1, x2, y2 = b
+    return (x2 > x1) and (y2 > y1)
+
+def _bbox_center_norm(b, frame_shape=None):
+    if not _bbox_ok(b):
+        return (0.5, 0.5)
+    x1, y1, x2, y2 = b
+    cx = 0.5 * (x1 + x2)
+    cy = 0.5 * (y1 + y2)
+
+    if frame_shape is not None and len(frame_shape) >= 2:
+        h, w = frame_shape[:2]
+        if w and h:
+            return (cx / float(w), cy / float(h))
+
+    return (cx, cy)
+
+def _bbox_area_norm(b, frame_shape=None):
+    if not _bbox_ok(b):
+        return 0.0
+    x1, y1, x2, y2 = b
+    area = max(0.0, (x2 - x1)) * max(0.0, (y2 - y1))
+    if frame_shape is not None and len(frame_shape) >= 2:
+        h, w = frame_shape[:2]
+        denom = max(1.0, float(w) * float(h))
+        return area / denom
+    return area
+
+def _iou(a, b):
+    if not _bbox_ok(a) or not _bbox_ok(b):
+        return 0.0
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+
+    ix1 = max(ax1, bx1)
+    iy1 = max(ay1, by1)
+    ix2 = min(ax2, bx2)
+    iy2 = min(ay2, by2)
+
+    iw = max(0.0, ix2 - ix1)
+    ih = max(0.0, iy2 - iy1)
+    inter = iw * ih
+    if inter <= 0.0:
+        return 0.0
+
+    a_area = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    b_area = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+    union = a_area + b_area - inter
+    if union <= 0.0:
+        return 0.0
+    return inter / union
+
+def _dist2(a, b):
+    ax, ay = a
+    bx, by = b
+    dx = ax - bx
+    dy = ay - by
+    return dx * dx + dy * dy
+
+def _primary_score(tr, frame_shape=None, preferred_id=None, last_bbox=None, last_center=None):
+    bbox = _bbox_of(tr)
+    if not _bbox_ok(bbox):
+        return -1e9
+
+    conf = float(getattr(tr, "confidence", 0.0) or 0.0)
+    tid = _track_id_of(tr)
+    area = _bbox_area_norm(bbox, frame_shape)
+    cx, cy = _bbox_center_norm(bbox, frame_shape)
+
+    score = conf * 8.0
+    score += min(area * 250.0, 2.5)
+
+    center_dist2 = (cx - 0.5) * (cx - 0.5) + (cy - 0.5) * (cy - 0.5)
+    score += max(0.0, 1.0 - center_dist2 * 3.0)
+
+    if last_center is not None:
+        move_penalty = _dist2((cx, cy), last_center)
+        score += max(-3.0, 1.2 - move_penalty * 18.0)
+
+    if last_bbox is not None:
+        score += _iou(bbox, last_bbox) * 4.0
+
+    if preferred_id is not None and tid == preferred_id:
+        score += 12.0
+
+    return score
+
+
+# ===== HOTFIX: primary target state =====
+_last_primary_state = {
+    "id": None,
+    "bbox": None,
+    "center": None,
+    "misses": 9999,
+}
+
+def _track_id_of(tr):
+    tid = getattr(tr, "track_id", None)
+    if tid is None:
+        tid = getattr(tr, "id", None)
+    if tid is None:
+        tid = getattr(tr, "selected_id", None)
+    return tid
+
+def _bbox_of(tr):
+    bbox = getattr(tr, "bbox_xyxy", None)
+    if bbox is None:
+        bbox = getattr(tr, "bbox", None)
+    return bbox
+
+def _bbox_ok(b):
+    if b is None:
+        return False
+    if len(b) != 4:
+        return False
+    x1, y1, x2, y2 = b
+    return (x2 > x1) and (y2 > y1)
+
+def _bbox_center_norm(b, frame_shape=None):
+    if not _bbox_ok(b):
+        return (0.5, 0.5)
+    x1, y1, x2, y2 = b
+    cx = 0.5 * (x1 + x2)
+    cy = 0.5 * (y1 + y2)
+
+    if frame_shape is not None and len(frame_shape) >= 2:
+        h, w = frame_shape[:2]
+        if w and h:
+            return (cx / float(w), cy / float(h))
+
+    return (cx, cy)
+
+def _bbox_area_norm(b, frame_shape=None):
+    if not _bbox_ok(b):
+        return 0.0
+    x1, y1, x2, y2 = b
+    area = max(0.0, (x2 - x1)) * max(0.0, (y2 - y1))
+    if frame_shape is not None and len(frame_shape) >= 2:
+        h, w = frame_shape[:2]
+        denom = max(1.0, float(w) * float(h))
+        return area / denom
+    return area
+
+def _iou(a, b):
+    if not _bbox_ok(a) or not _bbox_ok(b):
+        return 0.0
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+
+    ix1 = max(ax1, bx1)
+    iy1 = max(ay1, by1)
+    ix2 = min(ax2, bx2)
+    iy2 = min(ay2, by2)
+
+    iw = max(0.0, ix2 - ix1)
+    ih = max(0.0, iy2 - iy1)
+    inter = iw * ih
+    if inter <= 0.0:
+        return 0.0
+
+    a_area = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    b_area = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+    union = a_area + b_area - inter
+    if union <= 0.0:
+        return 0.0
+    return inter / union
+
+def _dist2(a, b):
+    ax, ay = a
+    bx, by = b
+    dx = ax - bx
+    dy = ay - by
+    return dx * dx + dy * dy
+
+def _primary_score(tr, frame_shape=None, preferred_id=None, last_bbox=None, last_center=None):
+    bbox = _bbox_of(tr)
+    if not _bbox_ok(bbox):
+        return -1e9
+
+    conf = float(getattr(tr, "confidence", 0.0) or 0.0)
+    tid = _track_id_of(tr)
+    area = _bbox_area_norm(bbox, frame_shape)
+    cx, cy = _bbox_center_norm(bbox, frame_shape)
+
+    score = conf * 8.0
+    score += min(area * 250.0, 2.5)
+
+    center_dist2 = (cx - 0.5) * (cx - 0.5) + (cy - 0.5) * (cy - 0.5)
+    score += max(0.0, 1.0 - center_dist2 * 3.0)
+
+    if last_center is not None:
+        move_penalty = _dist2((cx, cy), last_center)
+        score += max(-3.0, 1.2 - move_penalty * 18.0)
+
+    if last_bbox is not None:
+        score += _iou(bbox, last_bbox) * 4.0
+
+    if preferred_id is not None and tid == preferred_id:
+        score += 12.0
+
+    return score
+
+def choose_primary_target_generic(tracks, frame_shape=None, current_selected_id=None, prev_id=None, *args, **kwargs):
+    return choose_single_primary_target(
+        tracks,
+        frame_shape=frame_shape,
+        current_selected_id=current_selected_id,
+        prev_id=prev_id,
+        *args,
+        **kwargs,
+    )
 def run_app(config):
     mode = config.get("mode", "video")
     if mode != "video":
@@ -310,14 +612,14 @@ def run_app(config):
 
     multi_tracker = MultiTargetTracker(
         max_missed_frames=28,
-        confirm_hits=2,
+        confirm_hits=1,
         max_center_distance=180.0,
         min_iou_for_match=0.01,
         velocity_alpha=0.65,
         history_size=12,
     )
-    target_manager = TargetManager(reacquire_radius_auto=100.0, reacquire_radius_manual=140.0, sticky_frames=75)
-    narrow_tracker = NarrowTracker(hold_frames=140)
+    target_manager = TargetManager(reacquire_radius_auto=120.0, reacquire_radius_manual=220.0, sticky_frames=24)
+    narrow_tracker = NarrowTracker(hold_frames=80)
 
     window_name = "Drone Tracker Multiview"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
@@ -384,6 +686,9 @@ def run_app(config):
     frame_id = 0
     tracks = []
 
+    manual_switch_boost_id = None
+    manual_switch_boost_frames = 0
+
     while True:
         ret, frame = cap.read()
         if not ret:
@@ -418,12 +723,25 @@ def run_app(config):
         confirmed_tracks = [t for t in tracks if getattr(t, "is_confirmed", False)]
         selection_tracks = confirmed_tracks if confirmed_tracks else tracks
 
+        if manual_switch_boost_frames > 0:
+            boosted = next((t for t in selection_tracks if t.track_id == manual_switch_boost_id), None)
+            if boosted is not None:
+                selection_tracks = [boosted] + [t for t in selection_tracks if t.track_id != manual_switch_boost_id]
+            manual_switch_boost_frames -= 1
+        else:
+            manual_switch_boost_id = None
+
         target_manager.update(selection_tracks, predicted_center, frame.shape)
         active_track = choose_primary_target_generic(
             selection_tracks,
             frame.shape,
             current_selected_id=target_manager.selected_id,
         )
+
+        if manual_switch_boost_id is not None:
+            forced = next((t for t in selection_tracks if t.track_id == manual_switch_boost_id), None)
+            if forced is not None:
+                active_track = forced
 
         if active_track is not None:
             target_manager.selected_id = active_track.track_id
@@ -494,7 +812,7 @@ def run_app(config):
             else:
                 required_zoom = fw / max_crop_w
 
-            required_zoom = max(1.0, min(8.0, required_zoom))
+            required_zoom = max(1.0, min(2.4, required_zoom))
 
             if required_zoom > smooth_zoom:
                 smooth_zoom = required_zoom
@@ -513,7 +831,7 @@ def run_app(config):
 
         debug_frame = draw_tracks(frame, tracks, target_manager.selected_id)
         for tr in visible_sorted:
-            x1, y1, x2, y2 = [int(v) for v in tr.bbox_xyxy]
+            x1, y1, x2, y2 = tighten_bbox(tr.bbox_xyxy, scale=0.65)
             label = f"[{tr.track_id}]" if getattr(tr, "is_confirmed", False) else f"[{tr.track_id}?]"
             cv2.putText(
                 debug_frame,
@@ -616,9 +934,173 @@ def run_app(config):
             tr = next((t for t in tracks if t.track_id == wanted), None)
             if tr is not None:
                 target_manager.set_manual_target(tr.track_id)
+                manual_switch_boost_id = tr.track_id
+                manual_switch_boost_frames = 36
                 narrow_tracker.reset()
                 narrow_tracker.kalman.init_state(tr.center_xy[0], tr.center_xy[1])
                 narrow_tracker.smooth_center = tr.center_xy
+                smooth_center = tr.center_xy
+                smooth_zoom = 1.8
 
     cap.release()
     cv2.destroyAllWindows()
+
+
+
+# === SINGLE PRIMARY TARGET MODE ===
+_STICKY_TARGET_STATE = {
+    "last_id": None,
+    "last_center": None,
+    "last_area": None,
+}
+
+def _safe_track_id(tr):
+    return getattr(tr, "track_id", getattr(tr, "id", None))
+
+def _safe_conf(tr):
+    v = getattr(tr, "confidence", getattr(tr, "conf", 0.0))
+    try:
+        return float(v)
+    except Exception:
+        return 0.0
+
+def _safe_bbox(tr):
+    bb = getattr(tr, "bbox_xyxy", None)
+    if bb is None:
+        bb = getattr(tr, "bbox", None)
+    if bb is None:
+        return None
+    if len(bb) != 4:
+        return None
+    try:
+        x1, y1, x2, y2 = [float(v) for v in bb]
+    except Exception:
+        return None
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return (x1, y1, x2, y2)
+
+def _bbox_center_area(bb):
+    x1, y1, x2, y2 = bb
+    cx = (x1 + x2) * 0.5
+    cy = (y1 + y2) * 0.5
+    area = max(0.0, (x2 - x1) * (y2 - y1))
+    return cx, cy, area
+
+def choose_single_primary_target(tracks, frame_shape=None, current_selected_id=None, prev_id=None, *args, **kwargs):
+    global _last_primary_state
+
+    tracks = list(tracks or [])
+    valid_tracks = [tr for tr in tracks if _bbox_ok(_bbox_of(tr))]
+
+    if not valid_tracks:
+        _last_primary_state["misses"] = int(_last_primary_state.get("misses", 9999)) + 1
+        return None
+
+    last_id = _last_primary_state.get("id")
+    last_bbox = _last_primary_state.get("bbox")
+    last_center = _last_primary_state.get("center")
+    misses = int(_last_primary_state.get("misses", 9999))
+
+    # manual/current_selected_id ma najwyzszy priorytet
+    if current_selected_id is not None:
+        for tr in valid_tracks:
+            if _track_id_of(tr) == current_selected_id:
+                bbox = _bbox_of(tr)
+                _last_primary_state["id"] = _track_id_of(tr)
+                _last_primary_state["bbox"] = bbox
+                _last_primary_state["center"] = _bbox_center_norm(bbox, frame_shape)
+                _last_primary_state["misses"] = 0
+                return tr
+
+    # utrzymanie poprzedniego celu z histereza
+    sticky_ids = []
+    if prev_id is not None:
+        sticky_ids.append(prev_id)
+    if last_id is not None and last_id not in sticky_ids:
+        sticky_ids.append(last_id)
+
+    for sticky_id in sticky_ids:
+        for tr in valid_tracks:
+            if _track_id_of(tr) != sticky_id:
+                continue
+
+            bbox = _bbox_of(tr)
+            conf = float(getattr(tr, "confidence", 0.0) or 0.0)
+            same_enough = False
+
+            if last_bbox is not None:
+                same_enough = _iou(bbox, last_bbox) >= 0.04
+            if last_center is not None:
+                c = _bbox_center_norm(bbox, frame_shape)
+                same_enough = same_enough or (_dist2(c, last_center) <= 0.025)
+
+            if conf >= 0.10 or same_enough or misses <= 10:
+                _last_primary_state["id"] = _track_id_of(tr)
+                _last_primary_state["bbox"] = bbox
+                _last_primary_state["center"] = _bbox_center_norm(bbox, frame_shape)
+                _last_primary_state["misses"] = 0
+                return tr
+
+    # reacquire blisko ostatniej pozycji
+    if last_center is not None and misses <= 18:
+        close_candidates = []
+        for tr in valid_tracks:
+            bbox = _bbox_of(tr)
+            c = _bbox_center_norm(bbox, frame_shape)
+            if _dist2(c, last_center) <= 0.06:
+                close_candidates.append(tr)
+
+        if close_candidates:
+            best = max(
+                close_candidates,
+                key=lambda tr: _primary_score(
+                    tr,
+                    frame_shape=frame_shape,
+                    preferred_id=last_id,
+                    last_bbox=last_bbox,
+                    last_center=last_center,
+                ),
+            )
+            bbox = _bbox_of(best)
+            _last_primary_state["id"] = _track_id_of(best)
+            _last_primary_state["bbox"] = bbox
+            _last_primary_state["center"] = _bbox_center_norm(bbox, frame_shape)
+            _last_primary_state["misses"] = 0
+            return best
+
+    # pelny acquire
+    best = max(
+        valid_tracks,
+        key=lambda tr: _primary_score(
+            tr,
+            frame_shape=frame_shape,
+            preferred_id=current_selected_id,
+            last_bbox=last_bbox,
+            last_center=last_center,
+        ),
+    )
+
+    bbox = _bbox_of(best)
+    conf = float(getattr(best, "confidence", 0.0) or 0.0)
+    area = _bbox_area_norm(bbox, frame_shape)
+
+    enough_for_acquire = (
+        conf >= 0.12
+        or area >= 0.00003
+        or misses <= 12
+    )
+
+    if not enough_for_acquire:
+        _last_primary_state["misses"] = misses + 1
+        return None
+
+    _last_primary_state["id"] = _track_id_of(best)
+    _last_primary_state["bbox"] = bbox
+    _last_primary_state["center"] = _bbox_center_norm(bbox, frame_shape)
+    _last_primary_state["misses"] = 0
+    return best
+
+
+
+

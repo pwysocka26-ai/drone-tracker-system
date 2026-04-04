@@ -284,6 +284,7 @@ def run_app(config):
         switch_dwell=int(tracker_cfg.get('switch_dwell', 4)),
         switch_cooldown=int(tracker_cfg.get('switch_cooldown', 6)),
         max_select_missed=int(tracker_cfg.get('max_select_missed', 1)),
+        min_start_conf=float(tracker_cfg.get('min_start_conf', 0.10)),
     )
     narrow_tracker = NarrowTracker(hold_frames=int(narrow_cfg.get('hold_frames', 80)))
 
@@ -381,7 +382,7 @@ def run_app(config):
             last_yolo_boxes = int(len(boxes)) if (boxes is not None and getattr(boxes, 'xyxy', None) is not None) else 0
             det_tracks = parse_tracks(result, frame.shape)
 
-            need_search = search_fallback and (not det_tracks or drop_streak >= 2) and (frame_id % max(1, search_interval) == 0)
+            need_search = search_fallback and (not det_tracks) and (frame_id % max(1, search_interval) == 0)
             if need_search:
                 search_results = model.predict(
                     source=frame,
@@ -479,10 +480,10 @@ def run_app(config):
 
         wide_program = crop_group(frame, tracks, (780, 360))
         debug_frame = draw_tracks(frame, tracks, target_manager.selected_id)
-        for tr in visible_sorted:
+        for idx, tr in enumerate(visible_sorted[:9], start=1):
             x1, y1, x2, y2 = tighten_bbox(tr.bbox_xyxy, scale=0.65)
-            label = f'[{tr.track_id}]' if getattr(tr, 'is_confirmed', False) else f'[{tr.track_id}?]'
-            cv2.putText(debug_frame, label, (x1, max(30, y1 - 30)), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 0), 2)
+            label = f'[{idx}] ID {tr.track_id}' if getattr(tr, 'is_confirmed', False) else f'[{idx}] ID {tr.track_id}?'
+            cv2.putText(debug_frame, label, (x1, max(30, y1 - 30)), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 0), 2)
         wide_debug = crop_group(debug_frame, tracks, (1560, 450))
 
         if smooth_center is not None:
@@ -552,7 +553,7 @@ def run_app(config):
             if video_writer is not None:
                 video_writer.write(dashboard)
 
-        cv2.putText(dashboard, 'R=REC  S=SHOT', (1260, 800), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        cv2.putText(dashboard, 'R=REC  S=SHOT  0=AUTO  1-9=SLOT  ,/.=PREV/NEXT', (980, 800), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
         cv2.imshow(window_name, dashboard)
 
         key = cv2.waitKey(1) & 0xFF
@@ -566,9 +567,24 @@ def run_app(config):
             target_manager.set_auto_mode()
             narrow_tracker.reset()
         elif key in (ord('1'), ord('2'), ord('3'), ord('4'), ord('5'), ord('6'), ord('7'), ord('8'), ord('9')):
-            wanted = int(chr(key))
-            tr = next((t for t in tracks if t.track_id == wanted), None)
-            if tr is not None:
+            idx = int(chr(key)) - 1
+            cand = visible_sorted
+            if 0 <= idx < len(cand):
+                tr = cand[idx]
+                target_manager.set_manual_target(tr.track_id)
+                narrow_tracker.reset()
+                narrow_tracker.kalman.init_state(tr.center_xy[0], tr.center_xy[1])
+        elif key in (ord(','), ord('.')):
+            cand = visible_sorted
+            if cand:
+                cur_idx = 0
+                if target_manager.selected_id is not None:
+                    for i, t in enumerate(cand):
+                        if t.track_id == target_manager.selected_id:
+                            cur_idx = i
+                            break
+                step = -1 if key == ord(',') else 1
+                tr = cand[(cur_idx + step) % len(cand)]
                 target_manager.set_manual_target(tr.track_id)
                 narrow_tracker.reset()
                 narrow_tracker.kalman.init_state(tr.center_xy[0], tr.center_xy[1])

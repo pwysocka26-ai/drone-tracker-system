@@ -11,6 +11,7 @@ class TargetManager:
         switch_dwell=4,
         switch_cooldown=6,
         max_select_missed=1,
+        min_start_conf=0.10,
     ):
         self.selected_id = None
         self.manual_lock = False
@@ -21,6 +22,7 @@ class TargetManager:
         self.switch_dwell = int(switch_dwell)
         self.switch_cooldown = int(switch_cooldown)
         self.max_select_missed = int(max_select_missed)
+        self.min_start_conf = float(min_start_conf)
 
         self.lock_age = 9999
         self.frame_id = 0
@@ -64,8 +66,21 @@ class TargetManager:
         out = []
         for tr in tracks or []:
             missed = int(getattr(tr, 'missed_frames', 0) or 0)
-            if missed <= self.max_select_missed:
-                out.append(tr)
+            if missed > self.max_select_missed:
+                continue
+
+            conf = float(getattr(tr, 'confidence', 0.0) or 0.0)
+            confirmed = bool(getattr(tr, 'is_confirmed', False))
+            is_current = self.selected_id is not None and int(getattr(tr, 'track_id', -1)) == int(self.selected_id)
+
+            if self.selected_id is None:
+                if (not confirmed) and (conf < self.min_start_conf):
+                    continue
+            else:
+                if (not confirmed) and (not is_current):
+                    continue
+
+            out.append(tr)
         return out
 
     def _score(self, tr, frame_shape, predicted_center=None):
@@ -117,7 +132,6 @@ class TargetManager:
             self.lock_age += 1
             return self.selected_id
 
-        # reacquire close to prediction when current target disappeared
         if self.selected_id is not None and active is None and predicted_center is not None:
             close = []
             for tr in candidates:
@@ -156,7 +170,6 @@ class TargetManager:
         current_missed = int(getattr(active, 'missed_frames', 0) or 0)
         best_confirmed = bool(getattr(best, 'is_confirmed', False))
 
-        # immediate switch if current is stale and new candidate looks trustworthy
         if best.track_id != self.selected_id and current_missed > 0 and best_confirmed:
             self.selected_id = best.track_id
             self.lock_age = 0

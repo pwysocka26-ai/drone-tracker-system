@@ -4,17 +4,17 @@ video:
   source: video.mp4
 
 yolo:
-  model: yolov8n.pt
+  model: yolov8s.pt
   backend: track
   tracker: config/bytetrack_fast_acquire.yaml
-  conf: 0.12
-  imgsz: 960
+  conf: 0.10
+  imgsz: 1280
   classes: [4]
   inference_every: 1
   search_fallback: true
-  search_conf: 0.06
-  search_imgsz: 1280
-  search_interval: 1
+  search_conf: 0.08
+  search_imgsz: 1536
+  search_interval: 2
 
 tracker:
   max_missed_frames: 24
@@ -30,6 +30,7 @@ tracker:
   switch_dwell: 4
   switch_cooldown: 6
   max_select_missed: 1
+  min_start_conf: 0.10
 
 narrow:
   hold_frames: 80

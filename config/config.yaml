@@ -14,7 +14,7 @@ yolo:
   search_fallback: true
   search_conf: 0.06
   search_imgsz: 1280
-  search_interval: 2
+  search_interval: 1
 
 tracker:
   max_missed_frames: 24
@@ -23,11 +23,13 @@ tracker:
   min_iou_for_match: 0.01
   velocity_alpha: 0.65
   history_size: 12
-  reacquire_radius_auto: 140.0
+  reacquire_radius_auto: 160.0
   reacquire_radius_manual: 260.0
-  sticky_frames: 20
-  switch_margin: 0.25
-  switch_dwell: 6
+  sticky_frames: 22
+  switch_margin: 0.18
+  switch_dwell: 4
+  switch_cooldown: 6
+  max_select_missed: 1
 
 narrow:
   hold_frames: 80

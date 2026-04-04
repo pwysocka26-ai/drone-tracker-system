@@ -28,3 +28,4 @@ test_env/
 # system
 .DS_Store
 Thumbs.db
+*.pt

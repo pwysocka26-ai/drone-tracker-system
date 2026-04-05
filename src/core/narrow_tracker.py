@@ -1,4 +1,4 @@
-﻿import cv2
+import cv2
 import numpy as np
 
 
@@ -48,7 +48,7 @@ class NarrowTracker:
     def __init__(self, hold_frames=120):
         self.kalman = SimpleKalman2D()
         self.smooth_center = None
-        self.smooth_zoom = 2.2
+        self.smooth_zoom = 2.6
         self.hold_count = 0
         self.hold_frames = int(hold_frames)
         self.last_pan_speed = 0.0
@@ -57,7 +57,7 @@ class NarrowTracker:
     def reset(self):
         self.kalman.reset()
         self.smooth_center = None
-        self.smooth_zoom = 2.2
+        self.smooth_zoom = 2.6
         self.hold_count = 0
         self.last_pan_speed = 0.0
         self.last_tilt_speed = 0.0
@@ -69,9 +69,8 @@ class NarrowTracker:
         th = max(1.0, y2 - y1)
         rel = max(tw / w, th / h)
 
-        # mały obiekt -> zoom in, duży -> zoom out
-        z = 0.082 / max(rel, 0.009)
-        return float(np.clip(z, 2.2, 5.0))
+        z = 0.110 / max(rel, 0.008)
+        return float(np.clip(z, 2.6, 5.2))
 
     def _step_towards(self, desired, active):
         if desired is None:
@@ -88,21 +87,19 @@ class NarrowTracker:
         ex = desired[0] - self.smooth_center[0]
         ey = desired[1] - self.smooth_center[1]
 
-        # dead zone: blisko środka -> nie szarp
-        if abs(ex) < 3:
+        if abs(ex) < 2.0:
             ex = 0.0
-        if abs(ey) < 3:
+        if abs(ey) < 2.0:
             ey = 0.0
 
-        kp = 0.36 if active else 0.20
-        max_step = 82.0 if active else 34.0
+        kp = 0.44 if active else 0.22
+        max_step = 96.0 if active else 36.0
 
         pan_speed = float(np.clip(ex * kp, -max_step, max_step))
         tilt_speed = float(np.clip(ey * kp, -max_step, max_step))
 
-        # lekkie wygładzenie prędkości
-        pan_speed = 0.58 * self.last_pan_speed + 0.42 * pan_speed
-        tilt_speed = 0.58 * self.last_tilt_speed + 0.42 * tilt_speed
+        pan_speed = 0.46 * self.last_pan_speed + 0.54 * pan_speed
+        tilt_speed = 0.46 * self.last_tilt_speed + 0.54 * tilt_speed
 
         self.last_pan_speed = pan_speed
         self.last_tilt_speed = tilt_speed
@@ -124,7 +121,11 @@ class NarrowTracker:
             self.hold_count = 0
 
             desired_zoom = self.desired_zoom(frame, active_track)
-            self.smooth_zoom = 0.90 * self.smooth_zoom + 0.10 * desired_zoom
+            if desired_zoom > self.smooth_zoom:
+                alpha = 0.28
+            else:
+                alpha = 0.10
+            self.smooth_zoom = (1.0 - alpha) * self.smooth_zoom + alpha * desired_zoom
         else:
             self.hold_count += 1
             desired_center = predicted_center
@@ -133,8 +134,7 @@ class NarrowTracker:
                 self.reset()
                 return None, None, self.smooth_zoom, self.hold_count, 0.0, 0.0
 
-            # podczas HOLD zoom nie powinien skakać
-            self.smooth_zoom = 0.97 * self.smooth_zoom + 0.03 * self.smooth_zoom
+            self.smooth_zoom = 0.995 * self.smooth_zoom + 0.005 * self.smooth_zoom
 
         smooth_center = self._step_towards(desired_center, active_track is not None)
 

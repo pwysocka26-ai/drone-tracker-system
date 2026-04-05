@@ -7,6 +7,7 @@ from core.target_manager import TargetManager
 from core.narrow_tracker import NarrowTracker
 from core.multi_target_tracker import MultiTargetTracker
 from core.telemetry import TelemetryLogger
+from core.lock_pipeline import LockPipeline
 
 
 class Track:
@@ -337,155 +338,6 @@ def parse_tracks(result, frame_shape):
     return tracks
 
 
-class NarrowHandoffState:
-    def __init__(self):
-        self.track = None
-        self.center = None
-        self.bbox = None
-        self.zoom = 2.8
-        self.missed = 9999
-        self.age = 9999
-        self.last_good_center = None
-        self.last_good_bbox = None
-        self.last_good_zoom = 2.8
-        self.gap_len = 0
-        self.max_gap_len = 0
-        self.ready_streak = 0
-
-    def reset(self):
-        self.track = None
-        self.center = None
-        self.bbox = None
-        self.zoom = 2.8
-        self.missed = 9999
-        self.age = 9999
-        self.last_good_center = None
-        self.last_good_bbox = None
-        self.last_good_zoom = 2.8
-        self.gap_len = 0
-        self.max_gap_len = 0
-        self.ready_streak = 0
-
-    def update_from_track(self, tr, zoom=None):
-        self.track = tr
-        self.center = tuple(float(v) for v in tr.center_xy)
-        self.bbox = tuple(float(v) for v in tr.bbox_xyxy)
-        if zoom is not None:
-            self.zoom = float(zoom)
-            self.last_good_zoom = float(zoom)
-        self.last_good_center = self.center
-        self.last_good_bbox = self.bbox
-        self.missed = 0
-        self.age = 0
-        self.gap_len = 0
-
-    def mark_missed(self):
-        self.missed += 1
-        self.age += 1
-        self.gap_len += 1
-        self.max_gap_len = max(self.max_gap_len, self.gap_len)
-
-
-def _bbox_size(bbox):
-    x1, y1, x2, y2 = bbox
-    return (max(1.0, x2 - x1), max(1.0, y2 - y1))
-
-
-def _distance(a, b):
-    if a is None or b is None:
-        return float('inf')
-    dx = float(a[0]) - float(b[0])
-    dy = float(a[1]) - float(b[1])
-    return (dx * dx + dy * dy) ** 0.5
-
-
-def _bbox_similarity(a, b):
-    if a is None or b is None:
-        return 0.0
-    aw, ah = _bbox_size(a)
-    bw, bh = _bbox_size(b)
-    dw = abs(aw - bw) / max(aw, bw)
-    dh = abs(ah - bh) / max(ah, bh)
-    return max(0.0, 1.0 - 0.5 * (dw + dh))
-
-
-def _handoff_ready(track, prev_center, frame_shape):
-    if track is None:
-        return False
-    conf = float(getattr(track, 'confidence', 0.0) or 0.0)
-    hits = int(getattr(track, 'hits', 0) or 0)
-    missed = int(getattr(track, 'missed_frames', 0) or 0)
-    if missed > 0:
-        return False
-    if conf < 0.10:
-        return False
-    if hits < 3 and not getattr(track, 'is_confirmed', False):
-        return False
-    if prev_center is not None:
-        if _distance(tuple(track.center_xy), prev_center) > 32.0:
-            return False
-    h, w = frame_shape[:2]
-    x, y = track.center_xy
-    if x < 10 or y < 10 or x > w - 10 or y > h - 10:
-        return False
-    return True
-
-
-def _choose_soft_handoff_track(tracks, selected_id, handoff_state, radius_px=140.0):
-    if not tracks:
-        return None
-
-    if selected_id is not None:
-        for tr in tracks:
-            if int(getattr(tr, 'track_id', -1)) == int(selected_id):
-                return tr
-
-    anchor = handoff_state.last_good_center or handoff_state.center
-    if anchor is None:
-        return None
-
-    best = None
-    best_score = -1e9
-    for tr in tracks:
-        dist = _distance(tuple(tr.center_xy), anchor)
-        if dist > radius_px:
-            continue
-
-        conf = float(getattr(tr, 'confidence', 0.0) or 0.0)
-        sim = _bbox_similarity(getattr(tr, 'bbox_xyxy', None), handoff_state.last_good_bbox or handoff_state.bbox)
-        score = conf * 8.0 + sim * 4.0 - dist / max(1.0, radius_px)
-        if best is None or score > best_score:
-            best = tr
-            best_score = score
-    return best
-
-
-def _blend_track_with_handoff(tr, handoff_state, center_alpha=0.76, size_alpha=0.84):
-    if tr is None:
-        return None
-    ref_center = handoff_state.last_good_center or handoff_state.center
-    ref_bbox = handoff_state.last_good_bbox or handoff_state.bbox
-    if ref_center is None or ref_bbox is None:
-        return tr
-
-    hx, hy = ref_center
-    hb = ref_bbox
-    tx, ty = tr.center_xy
-    tb = tr.bbox_xyxy
-
-    bw, bh = _bbox_size(tb)
-    hw, hh = _bbox_size(hb)
-
-    smx = center_alpha * hx + (1.0 - center_alpha) * tx
-    smy = center_alpha * hy + (1.0 - center_alpha) * ty
-    smw = size_alpha * hw + (1.0 - size_alpha) * bw
-    smh = size_alpha * hh + (1.0 - size_alpha) * bh
-
-    tr.center_xy = (smx, smy)
-    tr.bbox_xyxy = (smx - smw * 0.5, smy - smh * 0.5, smx + smw * 0.5, smy + smh * 0.5)
-    return tr
-
-
 def run_app(config):
     mode = config.get('mode', 'video')
     if mode != 'video':
@@ -496,7 +348,6 @@ def run_app(config):
     yolo_cfg = config.get('yolo') or {}
     tracker_cfg = config.get('tracker') or {}
     narrow_cfg = config.get('narrow') or {}
-    handoff_cfg = config.get('handoff') or {}
     control_cfg = config.get('narrow_control') or {}
 
     source = video_cfg.get('source', 'video.mp4')
@@ -512,11 +363,6 @@ def run_app(config):
     search_conf = float(yolo_cfg.get('search_conf', max(0.05, conf * 0.5)))
     search_imgsz = int(yolo_cfg.get('search_imgsz', max(imgsz, 1280)))
     search_interval = int(yolo_cfg.get('search_interval', 1))
-
-    soft_active_max_missed = int(handoff_cfg.get('soft_active_max_missed', 4))
-    handoff_reacquire_radius = float(handoff_cfg.get('handoff_reacquire_radius', 165.0))
-    handoff_hold_frames = int(handoff_cfg.get('handoff_hold_frames', 10))
-    handoff_ready_frames = int(handoff_cfg.get('handoff_ready_frames', 5))
 
     model = YOLO(model_name)
     cap = cv2.VideoCapture(source)
@@ -550,7 +396,7 @@ def run_app(config):
         current_target_bonus=float(tracker_cfg.get('current_target_bonus', 2.6)),
     )
     narrow_tracker = NarrowTracker(hold_frames=int(narrow_cfg.get('hold_frames', 80)))
-    handoff_state = NarrowHandoffState()
+    lock_pipeline = LockPipeline(config)
     display_box_smoother = DisplayBoxSmoother(
         center_alpha=float(control_cfg.get('display_center_alpha', 0.70)),
         size_alpha=float(control_cfg.get('display_size_alpha', 0.74)),
@@ -635,7 +481,6 @@ def run_app(config):
     last_det_tracks = 0
     last_backend = '-'
     drop_streak = 0
-    last_selected_center = None
 
     try:
         while True:
@@ -645,7 +490,7 @@ def run_app(config):
                 multi_tracker.reset()
                 target_manager.set_auto_mode()
                 narrow_tracker.reset()
-                handoff_state.reset()
+                lock_pipeline.reset()
                 display_box_smoother.reset()
                 ret, frame = cap.read()
                 if not ret:
@@ -706,44 +551,26 @@ def run_app(config):
             target_manager.update(selection_tracks, predicted_center, frame.shape)
             selected_track = target_manager.find_active_track(tracks)
 
-            active_track = None
-            handoff_ready = _handoff_ready(selected_track, last_selected_center, frame.shape)
-            if handoff_ready:
-                handoff_state.ready_streak += 1
-            else:
-                handoff_state.ready_streak = 0
+            pipeline_out = lock_pipeline.update(
+                frame_shape=frame.shape,
+                selected_track=selected_track,
+                tracks=tracks,
+                selected_id=target_manager.selected_id,
+            )
 
-            if selected_track is not None:
-                last_selected_center = tuple(selected_track.center_xy)
-
-            if selected_track is not None and handoff_state.ready_streak >= handoff_ready_frames:
-                active_track = selected_track
-                handoff_state.update_from_track(selected_track, zoom=handoff_state.zoom)
-            else:
-                handoff_state.mark_missed()
-
-            soft_track = active_track
-            reused_last_good = False
-
-            if soft_track is None and handoff_state.missed <= handoff_hold_frames:
-                reacquired = _choose_soft_handoff_track(
-                    tracks,
-                    target_manager.selected_id,
-                    handoff_state,
-                    handoff_reacquire_radius,
-                )
-                if reacquired is not None:
-                    soft_track = _blend_track_with_handoff(reacquired, handoff_state)
-                    handoff_state.update_from_track(soft_track, zoom=handoff_state.zoom)
-                elif handoff_state.last_good_center is not None and handoff_state.last_good_bbox is not None:
-                    soft_track = Track(
-                        track_id=int(target_manager.selected_id if target_manager.selected_id is not None else -1),
-                        raw_id=int(target_manager.selected_id if target_manager.selected_id is not None else -1),
-                        bbox_xyxy=handoff_state.last_good_bbox,
-                        center_xy=handoff_state.last_good_center,
-                        confidence=0.0,
-                    )
-                    reused_last_good = True
+            soft_track = pipeline_out['soft_track']
+            refined_center = pipeline_out['refined_center']
+            refined_bbox = pipeline_out['refined_bbox']
+            pipeline_state = pipeline_out['state']
+            local_lock_score = pipeline_out['local_lock_score']
+            lock_confidence = pipeline_out['lock_confidence']
+            jump_rejected = pipeline_out['jump_rejected']
+            anchor_jump_px = pipeline_out['anchor_jump_px']
+            handoff_ready_score = pipeline_out['handoff_ready_score']
+            handoff_ready_streak = pipeline_out['handoff_ready_streak']
+            wide_center_jitter = pipeline_out['wide_center_jitter']
+            wide_bbox_jitter = pipeline_out['wide_bbox_jitter']
+            lock_loss_reason = pipeline_out['lock_loss_reason']
 
             for tr in tracks:
                 tr.is_active_target = False
@@ -754,26 +581,24 @@ def run_app(config):
             if soft_track is not None:
                 soft_track.is_active_target = True
 
-            predicted_center, smooth_center, smooth_zoom, hold_count, pan_speed, tilt_speed, narrow_state, jump_limited = narrow_tracker.update(frame, soft_track)
+            steering_track = soft_track
+            if refined_center is not None and steering_track is not None:
+                steering_track = Track(
+                    track_id=int(getattr(soft_track, 'track_id', -1)),
+                    raw_id=int(getattr(soft_track, 'raw_id', -1)),
+                    bbox_xyxy=refined_bbox if refined_bbox is not None else soft_track.bbox_xyxy,
+                    center_xy=refined_center,
+                    confidence=float(getattr(soft_track, 'confidence', 0.0) or 0.0),
+                )
+
+            predicted_center, smooth_center, smooth_zoom, hold_count, pan_speed, tilt_speed, narrow_state, jump_limited = narrow_tracker.update(frame, steering_track)
 
             display_center = None
             display_bbox = None
             if soft_track is not None:
                 display_center, display_bbox = display_box_smoother.update(soft_track)
-                if reused_last_good:
-                    smooth_center = handoff_state.last_good_center
-                    smooth_zoom = handoff_state.last_good_zoom
-                    display_center = handoff_state.last_good_center
-                    display_bbox = handoff_state.last_good_bbox
-                else:
-                    handoff_state.last_good_zoom = smooth_zoom
             else:
                 display_box_smoother.reset()
-                if handoff_state.missed <= handoff_hold_frames and handoff_state.last_good_center is not None:
-                    smooth_center = handoff_state.last_good_center
-                    smooth_zoom = handoff_state.last_good_zoom
-                    display_center = handoff_state.last_good_center
-                    display_bbox = handoff_state.last_good_bbox
 
             wide_program = crop_group(frame, tracks, (780, 360))
             debug_frame = draw_tracks(frame, tracks, target_manager.selected_id)
@@ -790,25 +615,27 @@ def run_app(config):
                 real_tilt_err = 0.0
                 center_lock = False
 
-                if soft_track is not None:
+                if steering_track is not None:
                     cx1, cy1, cx2, cy2 = narrow_crop_rect
                     crop_w = max(1, cx2 - cx1)
                     crop_h = max(1, cy2 - cy1)
-                    target_nx = (soft_track.center_xy[0] - cx1) * 780.0 / crop_w
-                    target_ny = (soft_track.center_xy[1] - cy1) * 360.0 / crop_h
+                    target_nx = (steering_track.center_xy[0] - cx1) * 780.0 / crop_w
+                    target_ny = (steering_track.center_xy[1] - cy1) * 360.0 / crop_h
                     real_pan_err = target_nx - 390.0
                     real_tilt_err = target_ny - 180.0
                     center_lock = abs(real_pan_err) < 14 and abs(real_tilt_err) < 14
+                radial_error = float((real_pan_err * real_pan_err + real_tilt_err * real_tilt_err) ** 0.5)
 
                 cv2.putText(narrow_output, label, (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
                 cv2.putText(narrow_output, f'PAN ERR {real_pan_err:.1f}  TILT ERR {real_tilt_err:.1f}', (20, 108), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
                 cv2.putText(narrow_output, f'ZOOM {smooth_zoom:.1f}x', (20, 146), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
                 cv2.putText(narrow_output, f'HOLD {hold_count}', (20, 184), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-                cv2.putText(narrow_output, f'STATE {narrow_state}', (20, 222), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
-                if jump_limited:
-                    cv2.putText(narrow_output, 'JUMP LIMIT', (20, 258), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
-                center_lock_text = 'CENTER LOCK ON' if (center_lock and soft_track is not None) else 'CENTER LOCK OFF'
-                cv2.putText(narrow_output, center_lock_text, (20, 294), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+                cv2.putText(narrow_output, f'NARROW {narrow_state} / PIPE {pipeline_state}', (20, 222), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (0, 255, 255), 2)
+                cv2.putText(narrow_output, f'LOCK SCORE {local_lock_score:.2f}  CONF {lock_confidence:.2f}', (20, 258), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (0, 255, 255), 2)
+                if jump_limited or jump_rejected:
+                    cv2.putText(narrow_output, f'JUMP LIMIT {anchor_jump_px:.1f}px', (20, 294), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
+                center_lock_text = 'CENTER LOCK ON' if (center_lock and steering_track is not None) else 'CENTER LOCK OFF'
+                cv2.putText(narrow_output, center_lock_text, (20, 330), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 255), 2)
 
                 if display_bbox is not None and display_center is not None:
                     disp_id = soft_track.track_id if soft_track is not None else (target_manager.selected_id or '?')
@@ -819,7 +646,9 @@ def run_app(config):
                 cv2.line(narrow_output, (0, 180), (780, 180), cross_color, 1)
             else:
                 center_lock = False
-                narrow_state = NarrowTracker.STATE_LOST
+                real_pan_err = None
+                real_tilt_err = None
+                radial_error = None
                 narrow_output, narrow_crop_rect = crop_to_16_9(frame, None, 1.8, (780, 360), return_meta=True)
                 cv2.putText(narrow_output, 'BRAK CELU', (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
 
@@ -840,10 +669,9 @@ def run_app(config):
                 (255, 255, 255),
                 2,
             )
-            cv2.putText(wide_debug, f'HANDOFF READY: {handoff_state.ready_streak}/{handoff_ready_frames}', (20, 352), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-            cv2.putText(wide_debug, f'HANDOFF MISS: {handoff_state.missed}  MAX GAP: {handoff_state.max_gap_len}', (20, 388), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2)
-            auto_text = 'AUTO PICK ENABLED' if not target_manager.manual_lock else 'AUTO PICK DISABLED'
-            cv2.putText(wide_debug, auto_text, (20, 424), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+            cv2.putText(wide_debug, f'HANDOFF SCORE: {handoff_ready_score:.2f}  STREAK: {handoff_ready_streak}', (20, 352), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2)
+            cv2.putText(wide_debug, f'WIDE JITTER: center {wide_center_jitter:.1f} px  bbox {wide_bbox_jitter:.3f}', (20, 388), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255, 255, 255), 2)
+            cv2.putText(wide_debug, f'PIPE STATE: {pipeline_state}  LOSS: {lock_loss_reason or "-"}', (20, 424), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (0, 255, 255), 2)
 
             wide_program = add_title(wide_program, 'WIDE PROGRAM')
             narrow_output = add_title(narrow_output, 'NARROW OUTPUT')
@@ -880,6 +708,34 @@ def run_app(config):
                     narrow_center=smooth_center,
                     center_lock=center_lock,
                     drift_gate_open=(soft_track is None and smooth_center is not None),
+                    steering_target_id=pipeline_out['steering_target_id'],
+                    lock_state=pipeline_state,
+                    pan_error_px=real_pan_err,
+                    tilt_error_px=real_tilt_err,
+                    radial_error_px=radial_error,
+                    zoom=smooth_zoom,
+                    jump_limited=(jump_limited or jump_rejected),
+                    handoff_ready_score=handoff_ready_score,
+                    handoff_ready_streak=handoff_ready_streak,
+                    wide_center_jitter=wide_center_jitter,
+                    wide_bbox_jitter=wide_bbox_jitter,
+                    local_lock_score=local_lock_score,
+                    lock_confidence=lock_confidence,
+                    anchor_jump_px=anchor_jump_px,
+                    jump_rejected=jump_rejected,
+                    lock_loss_reason=lock_loss_reason,
+                    pipeline_state=pipeline_state,
+                    owner_track_id=pipeline_out.get('owner_track_id'),
+                    owner_raw_id=pipeline_out.get('owner_raw_id'),
+                    owner_strength=pipeline_out.get('owner_strength'),
+                    ownership_confidence=pipeline_out.get('ownership_confidence'),
+                    identity_consistency_score=pipeline_out.get('identity_consistency_score'),
+                    ownership_score=pipeline_out.get('ownership_score'),
+                    pending_track_id=pipeline_out.get('pending_track_id'),
+                    pending_frames=pipeline_out.get('pending_frames'),
+                    transfer_reason=pipeline_out.get('transfer_reason'),
+                    ownership_reject_reason=pipeline_out.get('ownership_reject_reason'),
+                    jump_risk=pipeline_out.get('jump_risk'),
                 )
 
             cv2.imshow(window_name, dashboard)
@@ -896,7 +752,7 @@ def run_app(config):
             elif key == ord('0'):
                 target_manager.set_auto_mode()
                 narrow_tracker.reset()
-                handoff_state.reset()
+                lock_pipeline.reset()
             elif key in (ord('1'), ord('2'), ord('3'), ord('4'), ord('5'), ord('6'), ord('7'), ord('8'), ord('9')):
                 idx = int(chr(key)) - 1
                 cand = visible_sorted
@@ -904,10 +760,9 @@ def run_app(config):
                     tr = cand[idx]
                     target_manager.set_manual_target(tr.track_id)
                     narrow_tracker.reset()
-                    handoff_state.reset()
+                    lock_pipeline.reset()
                     display_box_smoother.reset()
                     narrow_tracker.kalman.init_state(tr.center_xy[0], tr.center_xy[1])
-                    handoff_state.update_from_track(tr, zoom=handoff_state.zoom)
             elif key in (ord(','), ord('.')):
                 cand = visible_sorted
                 if cand:
@@ -921,9 +776,8 @@ def run_app(config):
                     tr = cand[(cur_idx + step) % len(cand)]
                     target_manager.set_manual_target(tr.track_id)
                     narrow_tracker.reset()
-                    handoff_state.reset()
+                    lock_pipeline.reset()
                     narrow_tracker.kalman.init_state(tr.center_xy[0], tr.center_xy[1])
-                    handoff_state.update_from_track(tr, zoom=handoff_state.zoom)
     finally:
         if telemetry is not None:
             telemetry.close()

@@ -41,17 +41,19 @@ tracker:
   current_target_bonus: 2.6
 
 handoff:
-  soft_active_max_missed: 4
-  handoff_reacquire_radius: 165.0
-  handoff_hold_frames: 10
+  handoff_ready_frames: 5
+  readiness_min_score: 0.62
+  center_jitter_reject_px: 28.0
+  bbox_jitter_reject_ratio: 0.22
+  soft_reacquire_radius: 165.0
+  hold_frames: 10
+  reacquire_min_score: 0.35
 
 narrow:
   hold_frames: 80
 
 narrow_control:
-  crop_max_step_px: 28.0
-  crop_snap_deadband_px: 12.0
-  display_center_alpha: 0.74
-  display_size_alpha: 0.78
-  display_max_center_step: 36.0
-  display_max_size_step: 20.0
+  display_center_alpha: 0.70
+  display_size_alpha: 0.74
+  display_max_center_step: 44.0
+  display_max_size_step: 26.0

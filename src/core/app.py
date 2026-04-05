@@ -27,7 +27,7 @@ class Track:
 
 
 class DisplayBoxSmoother:
-    def __init__(self, center_alpha=0.72, size_alpha=0.76, max_center_step=46.0, max_size_step=28.0):
+    def __init__(self, center_alpha=0.70, size_alpha=0.74, max_center_step=44.0, max_size_step=26.0):
         self.center_alpha = float(center_alpha)
         self.size_alpha = float(size_alpha)
         self.max_center_step = float(max_center_step)
@@ -93,11 +93,11 @@ def tighten_bbox(bbox, frame_shape=None, min_size=12):
     area = bw * bh
 
     if area < 180.0:
-        scale = 0.62
+        scale = 0.60
     elif area < 700.0:
-        scale = 0.58
-    else:
         scale = 0.56
+    else:
+        scale = 0.54
 
     cx = (x1 + x2) / 2.0
     cy = (y1 + y2) / 2.0
@@ -342,27 +342,29 @@ class NarrowHandoffState:
         self.track = None
         self.center = None
         self.bbox = None
-        self.zoom = 2.6
+        self.zoom = 2.8
         self.missed = 9999
         self.age = 9999
         self.last_good_center = None
         self.last_good_bbox = None
-        self.last_good_zoom = 2.6
+        self.last_good_zoom = 2.8
         self.gap_len = 0
         self.max_gap_len = 0
+        self.ready_streak = 0
 
     def reset(self):
         self.track = None
         self.center = None
         self.bbox = None
-        self.zoom = 2.6
+        self.zoom = 2.8
         self.missed = 9999
         self.age = 9999
         self.last_good_center = None
         self.last_good_bbox = None
-        self.last_good_zoom = 2.6
+        self.last_good_zoom = 2.8
         self.gap_len = 0
         self.max_gap_len = 0
+        self.ready_streak = 0
 
     def update_from_track(self, tr, zoom=None):
         self.track = tr
@@ -405,6 +407,28 @@ def _bbox_similarity(a, b):
     dw = abs(aw - bw) / max(aw, bw)
     dh = abs(ah - bh) / max(ah, bh)
     return max(0.0, 1.0 - 0.5 * (dw + dh))
+
+
+def _handoff_ready(track, prev_center, frame_shape):
+    if track is None:
+        return False
+    conf = float(getattr(track, 'confidence', 0.0) or 0.0)
+    hits = int(getattr(track, 'hits', 0) or 0)
+    missed = int(getattr(track, 'missed_frames', 0) or 0)
+    if missed > 0:
+        return False
+    if conf < 0.10:
+        return False
+    if hits < 3 and not getattr(track, 'is_confirmed', False):
+        return False
+    if prev_center is not None:
+        if _distance(tuple(track.center_xy), prev_center) > 32.0:
+            return False
+    h, w = frame_shape[:2]
+    x, y = track.center_xy
+    if x < 10 or y < 10 or x > w - 10 or y > h - 10:
+        return False
+    return True
 
 
 def _choose_soft_handoff_track(tracks, selected_id, handoff_state, radius_px=140.0):
@@ -492,6 +516,7 @@ def run_app(config):
     soft_active_max_missed = int(handoff_cfg.get('soft_active_max_missed', 4))
     handoff_reacquire_radius = float(handoff_cfg.get('handoff_reacquire_radius', 165.0))
     handoff_hold_frames = int(handoff_cfg.get('handoff_hold_frames', 10))
+    handoff_ready_frames = int(handoff_cfg.get('handoff_ready_frames', 5))
 
     model = YOLO(model_name)
     cap = cv2.VideoCapture(source)
@@ -527,10 +552,10 @@ def run_app(config):
     narrow_tracker = NarrowTracker(hold_frames=int(narrow_cfg.get('hold_frames', 80)))
     handoff_state = NarrowHandoffState()
     display_box_smoother = DisplayBoxSmoother(
-        center_alpha=float(control_cfg.get('display_center_alpha', 0.72)),
-        size_alpha=float(control_cfg.get('display_size_alpha', 0.76)),
-        max_center_step=float(control_cfg.get('display_max_center_step', 46.0)),
-        max_size_step=float(control_cfg.get('display_max_size_step', 28.0)),
+        center_alpha=float(control_cfg.get('display_center_alpha', 0.70)),
+        size_alpha=float(control_cfg.get('display_size_alpha', 0.74)),
+        max_center_step=float(control_cfg.get('display_max_center_step', 44.0)),
+        max_size_step=float(control_cfg.get('display_max_size_step', 26.0)),
     )
 
     window_name = 'Drone Tracker Multiview'
@@ -610,6 +635,7 @@ def run_app(config):
     last_det_tracks = 0
     last_backend = '-'
     drop_streak = 0
+    last_selected_center = None
 
     try:
         while True:
@@ -680,11 +706,18 @@ def run_app(config):
             target_manager.update(selection_tracks, predicted_center, frame.shape)
             selected_track = target_manager.find_active_track(tracks)
 
-            active_track = selected_track
-            if active_track is not None and int(getattr(active_track, 'missed_frames', 0) or 0) > soft_active_max_missed:
-                active_track = None
+            active_track = None
+            handoff_ready = _handoff_ready(selected_track, last_selected_center, frame.shape)
+            if handoff_ready:
+                handoff_state.ready_streak += 1
+            else:
+                handoff_state.ready_streak = 0
 
-            if selected_track is not None and int(getattr(selected_track, 'missed_frames', 0) or 0) <= soft_active_max_missed:
+            if selected_track is not None:
+                last_selected_center = tuple(selected_track.center_xy)
+
+            if selected_track is not None and handoff_state.ready_streak >= handoff_ready_frames:
+                active_track = selected_track
                 handoff_state.update_from_track(selected_track, zoom=handoff_state.zoom)
             else:
                 handoff_state.mark_missed()
@@ -721,13 +754,12 @@ def run_app(config):
             if soft_track is not None:
                 soft_track.is_active_target = True
 
-            predicted_center, smooth_center, smooth_zoom, hold_count, pan_speed, tilt_speed = narrow_tracker.update(frame, soft_track)
+            predicted_center, smooth_center, smooth_zoom, hold_count, pan_speed, tilt_speed, narrow_state, jump_limited = narrow_tracker.update(frame, soft_track)
 
             display_center = None
             display_bbox = None
             if soft_track is not None:
                 display_center, display_bbox = display_box_smoother.update(soft_track)
-
                 if reused_last_good:
                     smooth_center = handoff_state.last_good_center
                     smooth_zoom = handoff_state.last_good_zoom
@@ -772,8 +804,11 @@ def run_app(config):
                 cv2.putText(narrow_output, f'PAN ERR {real_pan_err:.1f}  TILT ERR {real_tilt_err:.1f}', (20, 108), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
                 cv2.putText(narrow_output, f'ZOOM {smooth_zoom:.1f}x', (20, 146), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
                 cv2.putText(narrow_output, f'HOLD {hold_count}', (20, 184), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+                cv2.putText(narrow_output, f'STATE {narrow_state}', (20, 222), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+                if jump_limited:
+                    cv2.putText(narrow_output, 'JUMP LIMIT', (20, 258), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
                 center_lock_text = 'CENTER LOCK ON' if (center_lock and soft_track is not None) else 'CENTER LOCK OFF'
-                cv2.putText(narrow_output, center_lock_text, (20, 222), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+                cv2.putText(narrow_output, center_lock_text, (20, 294), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
 
                 if display_bbox is not None and display_center is not None:
                     disp_id = soft_track.track_id if soft_track is not None else (target_manager.selected_id or '?')
@@ -784,6 +819,7 @@ def run_app(config):
                 cv2.line(narrow_output, (0, 180), (780, 180), cross_color, 1)
             else:
                 center_lock = False
+                narrow_state = NarrowTracker.STATE_LOST
                 narrow_output, narrow_crop_rect = crop_to_16_9(frame, None, 1.8, (780, 360), return_meta=True)
                 cv2.putText(narrow_output, 'BRAK CELU', (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
 
@@ -804,11 +840,10 @@ def run_app(config):
                 (255, 255, 255),
                 2,
             )
-            cv2.putText(wide_debug, 'CORE MODE: PRIMARY TARGET', (20, 352), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-            cv2.putText(wide_debug, 'SUPPORT TRACKS: DEBUG ONLY', (20, 388), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+            cv2.putText(wide_debug, f'HANDOFF READY: {handoff_state.ready_streak}/{handoff_ready_frames}', (20, 352), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+            cv2.putText(wide_debug, f'HANDOFF MISS: {handoff_state.missed}  MAX GAP: {handoff_state.max_gap_len}', (20, 388), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2)
             auto_text = 'AUTO PICK ENABLED' if not target_manager.manual_lock else 'AUTO PICK DISABLED'
             cv2.putText(wide_debug, auto_text, (20, 424), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
-            cv2.putText(wide_debug, f'HANDOFF MISS: {handoff_state.missed}  MAX GAP: {handoff_state.max_gap_len}', (20, 460), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2)
 
             wide_program = add_title(wide_program, 'WIDE PROGRAM')
             narrow_output = add_title(narrow_output, 'NARROW OUTPUT')

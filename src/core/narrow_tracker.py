@@ -45,34 +45,93 @@ class SimpleKalman2D:
 
 
 class NarrowTracker:
+    STATE_LOST = 'LOST'
+    STATE_ACQUIRE = 'ACQUIRE'
+    STATE_STABILIZE = 'STABILIZE'
+    STATE_LOCKED = 'LOCKED'
+    STATE_HOLD = 'HOLD'
+
     def __init__(self, hold_frames=120):
         self.kalman = SimpleKalman2D()
         self.smooth_center = None
-        self.smooth_zoom = 2.6
+        self.smooth_zoom = 2.8
         self.hold_count = 0
         self.hold_frames = int(hold_frames)
         self.last_pan_speed = 0.0
         self.last_tilt_speed = 0.0
+        self.state = self.STATE_LOST
+        self.acquire_count = 0
+        self.stable_count = 0
+        self.last_error_norm = None
+        self.jump_limited = False
 
     def reset(self):
         self.kalman.reset()
         self.smooth_center = None
-        self.smooth_zoom = 2.6
+        self.smooth_zoom = 2.8
         self.hold_count = 0
         self.last_pan_speed = 0.0
         self.last_tilt_speed = 0.0
+        self.state = self.STATE_LOST
+        self.acquire_count = 0
+        self.stable_count = 0
+        self.last_error_norm = None
+        self.jump_limited = False
 
-    def desired_zoom(self, frame, track):
+    def desired_zoom(self, frame, track, state):
         h, w = frame.shape[:2]
         x1, y1, x2, y2 = track.bbox_xyxy
         tw = max(1.0, x2 - x1)
         th = max(1.0, y2 - y1)
         rel = max(tw / w, th / h)
 
-        z = 0.110 / max(rel, 0.008)
-        return float(np.clip(z, 2.6, 5.2))
+        base = 0.125 / max(rel, 0.0075)
+        if state == self.STATE_ACQUIRE:
+            base *= 0.92
+        elif state == self.STATE_STABILIZE:
+            base *= 1.00
+        elif state == self.STATE_LOCKED:
+            base *= 1.08
+        return float(np.clip(base, 2.4, 5.8))
 
-    def _step_towards(self, desired, active):
+    def _choose_state(self, active_track, error_norm):
+        if active_track is None:
+            if self.hold_count > 0:
+                return self.STATE_HOLD
+            return self.STATE_LOST
+
+        if self.state in (self.STATE_LOST, self.STATE_HOLD):
+            self.acquire_count += 1
+            self.stable_count = 0
+            if self.acquire_count < 4:
+                return self.STATE_ACQUIRE
+            return self.STATE_STABILIZE
+
+        if error_norm is None:
+            return self.STATE_STABILIZE
+
+        if error_norm < 18.0:
+            self.stable_count += 1
+        else:
+            self.stable_count = 0
+
+        if self.stable_count >= 6:
+            return self.STATE_LOCKED
+        return self.STATE_STABILIZE
+
+    def _step_params(self, state):
+        if state == self.STATE_ACQUIRE:
+            return 0.52, 118.0, 2.0, 0.38
+        if state == self.STATE_STABILIZE:
+            return 0.42, 92.0, 2.0, 0.46
+        if state == self.STATE_LOCKED:
+            return 0.36, 74.0, 1.5, 0.54
+        if state == self.STATE_HOLD:
+            return 0.20, 30.0, 3.0, 0.62
+        return 0.0, 0.0, 3.0, 0.70
+
+    def _step_towards(self, desired, active, state):
+        self.jump_limited = False
         if desired is None:
             self.last_pan_speed = 0.0
             self.last_tilt_speed = 0.0
@@ -86,20 +145,23 @@ class NarrowTracker:
 
         ex = desired[0] - self.smooth_center[0]
         ey = desired[1] - self.smooth_center[1]
+        self.last_error_norm = float((ex * ex + ey * ey) ** 0.5)
 
-        if abs(ex) < 2.0:
+        kp, max_step, dead_zone, inertia = self._step_params(state)
+
+        if abs(ex) < dead_zone:
             ex = 0.0
-        if abs(ey) < 2.0:
+        if abs(ey) < dead_zone:
             ey = 0.0
 
-        kp = 0.44 if active else 0.22
-        max_step = 96.0 if active else 36.0
+        raw_pan = float(np.clip(ex * kp, -max_step, max_step))
+        raw_tilt = float(np.clip(ey * kp, -max_step, max_step))
 
-        pan_speed = float(np.clip(ex * kp, -max_step, max_step))
-        tilt_speed = float(np.clip(ey * kp, -max_step, max_step))
+        if abs(ex) > max_step * 2.0 or abs(ey) > max_step * 2.0:
+            self.jump_limited = True
 
-        pan_speed = 0.46 * self.last_pan_speed + 0.54 * pan_speed
-        tilt_speed = 0.46 * self.last_tilt_speed + 0.54 * tilt_speed
+        pan_speed = inertia * self.last_pan_speed + (1.0 - inertia) * raw_pan
+        tilt_speed = inertia * self.last_tilt_speed + (1.0 - inertia) * raw_tilt
 
         self.last_pan_speed = pan_speed
         self.last_tilt_speed = tilt_speed
@@ -119,24 +181,34 @@ class NarrowTracker:
             desired_center = corrected
             predicted_center = corrected
             self.hold_count = 0
-
-            desired_zoom = self.desired_zoom(frame, active_track)
-            if desired_zoom > self.smooth_zoom:
-                alpha = 0.28
-            else:
-                alpha = 0.10
-            self.smooth_zoom = (1.0 - alpha) * self.smooth_zoom + alpha * desired_zoom
         else:
             self.hold_count += 1
             desired_center = predicted_center
 
-            if self.hold_count > self.hold_frames:
-                self.reset()
-                return None, None, self.smooth_zoom, self.hold_count, 0.0, 0.0
+        error_norm = None
+        if desired_center is not None and self.smooth_center is not None:
+            dx = desired_center[0] - self.smooth_center[0]
+            dy = desired_center[1] - self.smooth_center[1]
+            error_norm = float((dx * dx + dy * dy) ** 0.5)
 
-            self.smooth_zoom = 0.995 * self.smooth_zoom + 0.005 * self.smooth_zoom
+        self.state = self._choose_state(active_track, error_norm)
 
-        smooth_center = self._step_towards(desired_center, active_track is not None)
+        if active_track is None and self.hold_count > self.hold_frames:
+            self.reset()
+            return None, None, self.smooth_zoom, self.hold_count, 0.0, 0.0, self.state, self.jump_limited
+
+        if active_track is not None:
+            desired_zoom = self.desired_zoom(frame, active_track, self.state)
+            if desired_zoom > self.smooth_zoom:
+                alpha = 0.34 if self.state == self.STATE_ACQUIRE else 0.24
+            else:
+                alpha = 0.08
+            self.smooth_zoom = (1.0 - alpha) * self.smooth_zoom + alpha * desired_zoom
+        else:
+            # hold zoom almost fixed for short losses
+            self.smooth_zoom = 0.998 * self.smooth_zoom + 0.002 * self.smooth_zoom
+
+        smooth_center = self._step_towards(desired_center, active_track is not None, self.state)
 
         return (
             predicted_center,
@@ -145,4 +217,6 @@ class NarrowTracker:
             self.hold_count,
             self.last_pan_speed,
             self.last_tilt_speed,
+            self.state,
+            self.jump_limited,
         )

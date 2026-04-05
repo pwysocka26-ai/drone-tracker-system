@@ -47,3 +47,11 @@ handoff:
 
 narrow:
   hold_frames: 80
+
+narrow_control:
+  crop_max_step_px: 24.0
+  crop_snap_deadband_px: 14.0
+  display_center_alpha: 0.78
+  display_size_alpha: 0.82
+  display_max_center_step: 42.0
+  display_max_size_step: 24.0

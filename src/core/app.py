@@ -26,6 +26,67 @@ class Track:
         self.is_active_target = False
 
 
+
+class DisplayBoxSmoother:
+    def __init__(self, center_alpha=0.78, size_alpha=0.82, max_center_step=42.0, max_size_step=24.0):
+        self.center_alpha = float(center_alpha)
+        self.size_alpha = float(size_alpha)
+        self.max_center_step = float(max_center_step)
+        self.max_size_step = float(max_size_step)
+        self.center = None
+        self.size = None
+        self.track_id = None
+
+    def reset(self):
+        self.center = None
+        self.size = None
+        self.track_id = None
+
+    def update(self, track):
+        if track is None:
+            return None, None
+
+        x1, y1, x2, y2 = track.bbox_xyxy
+        cx = 0.5 * (x1 + x2)
+        cy = 0.5 * (y1 + y2)
+        w = max(1.0, x2 - x1)
+        h = max(1.0, y2 - y1)
+
+        if self.track_id != int(track.track_id):
+            self.center = (cx, cy)
+            self.size = (w, h)
+            self.track_id = int(track.track_id)
+        else:
+            pcx, pcy = self.center
+            pw, ph = self.size
+
+            dx = cx - pcx
+            dy = cy - pcy
+            if abs(dx) > self.max_center_step:
+                cx = pcx + self.max_center_step * (1 if dx > 0 else -1)
+            if abs(dy) > self.max_center_step:
+                cy = pcy + self.max_center_step * (1 if dy > 0 else -1)
+
+            dw = w - pw
+            dh = h - ph
+            if abs(dw) > self.max_size_step:
+                w = pw + self.max_size_step * (1 if dw > 0 else -1)
+            if abs(dh) > self.max_size_step:
+                h = ph + self.max_size_step * (1 if dh > 0 else -1)
+
+            scx = self.center_alpha * pcx + (1.0 - self.center_alpha) * cx
+            scy = self.center_alpha * pcy + (1.0 - self.center_alpha) * cy
+            sw = self.size_alpha * pw + (1.0 - self.size_alpha) * w
+            sh = self.size_alpha * ph + (1.0 - self.size_alpha) * h
+
+            self.center = (scx, scy)
+            self.size = (sw, sh)
+
+        scx, scy = self.center
+        sw, sh = self.size
+        return (scx, scy), (scx - 0.5 * sw, scy - 0.5 * sh, scx + 0.5 * sw, scy + 0.5 * sh)
+
+
 def tighten_bbox(bbox, frame_shape=None, min_size=12):
     x1, y1, x2, y2 = bbox
     bw = max(1.0, x2 - x1)
@@ -193,9 +254,44 @@ def draw_tracks(frame, tracks, selected_id):
     return out
 
 
-def draw_target_on_narrow(narrow_frame, crop_rect, track, display_no='?'):
-    if track is None:
+def draw_target_on_narrow(narrow_frame, crop_rect, display_bbox, display_center, display_no='?'):
+    if display_bbox is None or display_center is None:
         return narrow_frame
+
+    x1, y1, x2, y2 = tighten_bbox(display_bbox, min_size=14)
+    cx1, cy1, cx2, cy2 = crop_rect
+    crop_w = max(1, cx2 - cx1)
+    crop_h = max(1, cy2 - cy1)
+    nh, nw = narrow_frame.shape[:2]
+
+    nx1 = int((x1 - cx1) * nw / crop_w)
+    ny1 = int((y1 - cy1) * nh / crop_h)
+    nx2 = int((x2 - cx1) * nw / crop_w)
+    ny2 = int((y2 - cy1) * nh / crop_h)
+
+    nx1 = max(0, min(nw - 1, nx1))
+    ny1 = max(0, min(nh - 1, ny1))
+    nx2 = max(0, min(nw - 1, nx2))
+    ny2 = max(0, min(nh - 1, ny2))
+
+    dcx = int((display_center[0] - cx1) * nw / crop_w)
+    dcy = int((display_center[1] - cy1) * nh / crop_h)
+    dcx = max(0, min(nw - 1, dcx))
+    dcy = max(0, min(nh - 1, dcy))
+
+    if nx2 > nx1 and ny2 > ny1:
+        cv2.rectangle(narrow_frame, (nx1, ny1), (nx2, ny2), (0, 255, 255), 2)
+        cv2.circle(narrow_frame, (dcx, dcy), 4, (0, 255, 255), -1)
+        cv2.putText(
+            narrow_frame,
+            f'TRACKED TARGET [{display_no}]',
+            (max(10, nx1), max(28, ny1 - 8)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (0, 255, 255),
+            2,
+        )
+    return narrow_frame
 
     x1, y1, x2, y2 = tighten_bbox(track.bbox_xyxy, min_size=14)
     cx1, cy1, cx2, cy2 = crop_rect
@@ -451,6 +547,20 @@ def _estimate_zoom_for_track(frame_shape, track, current_zoom, max_zoom=2.4):
     return req_zoom
 
 
+def _apply_center_slew_limit(prev_center, next_center, max_step=24.0):
+    if prev_center is None or next_center is None:
+        return next_center
+    px, py = prev_center
+    nx, ny = next_center
+    dx = nx - px
+    dy = ny - py
+    if abs(dx) > max_step:
+        nx = px + max_step * (1 if dx > 0 else -1)
+    if abs(dy) > max_step:
+        ny = py + max_step * (1 if dy > 0 else -1)
+    return (nx, ny)
+
+
 def run_app(config):
     mode = config.get('mode', 'video')
     if mode != 'video':
@@ -462,6 +572,7 @@ def run_app(config):
     tracker_cfg = config.get('tracker') or {}
     narrow_cfg = config.get('narrow') or {}
     handoff_cfg = config.get('handoff') or {}
+    control_cfg = config.get('narrow_control') or {}
 
     source = video_cfg.get('source', 'video.mp4')
     model_name = yolo_cfg.get('model', 'yolov8n.pt')
@@ -480,6 +591,9 @@ def run_app(config):
     soft_active_max_missed = int(handoff_cfg.get('soft_active_max_missed', 4))
     handoff_reacquire_radius = float(handoff_cfg.get('handoff_reacquire_radius', 165.0))
     handoff_hold_frames = int(handoff_cfg.get('handoff_hold_frames', 10))
+
+    crop_max_step_px = float(control_cfg.get('crop_max_step_px', 24.0))
+    crop_snap_deadband_px = float(control_cfg.get('crop_snap_deadband_px', 14.0))
 
     model = YOLO(model_name)
     cap = cv2.VideoCapture(source)
@@ -514,6 +628,12 @@ def run_app(config):
     )
     narrow_tracker = NarrowTracker(hold_frames=int(narrow_cfg.get('hold_frames', 80)))
     handoff_state = NarrowHandoffState()
+    display_box_smoother = DisplayBoxSmoother(
+        center_alpha=float(control_cfg.get('display_center_alpha', 0.78)),
+        size_alpha=float(control_cfg.get('display_size_alpha', 0.82)),
+        max_center_step=float(control_cfg.get('display_max_center_step', 42.0)),
+        max_size_step=float(control_cfg.get('display_max_size_step', 24.0)),
+    )
 
     window_name = 'Drone Tracker Multiview'
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
@@ -602,6 +722,8 @@ def run_app(config):
                 target_manager.set_auto_mode()
                 narrow_tracker.reset()
                 handoff_state.reset()
+                display_box_smoother.reset()
+                display_box_smoother.reset()
                 ret, frame = cap.read()
                 if not ret:
                     break
@@ -705,27 +827,28 @@ def run_app(config):
 
             predicted_center, smooth_center, smooth_zoom, hold_count, _, _ = narrow_tracker.update(frame, soft_track)
 
+            display_center = None
+            display_bbox = None
             edge_limit_active = False
             if soft_track is not None:
-                tx, ty = soft_track.center_xy
+                display_center, display_bbox = display_box_smoother.update(soft_track)
+                tx, ty = display_center if display_center is not None else soft_track.center_xy
                 if smooth_center is None:
                     smooth_center = (tx, ty)
                 pan_err = tx - smooth_center[0]
                 tilt_err = ty - smooth_center[1]
 
                 if target_manager.manual_lock:
-                    cx, cy = tx, ty
-                    smooth_center = (cx, cy)
+                    smooth_center = (tx, ty)
                     pan_speed = pan_err
                     tilt_speed = tilt_err
                 else:
-                    alpha = 0.24
-                    snap_px = 18
+                    alpha = 0.18
                     cx = smooth_center[0] + alpha * pan_err
                     cy = smooth_center[1] + alpha * tilt_err
-                    if abs(pan_err) < snap_px and abs(tilt_err) < snap_px:
+                    if abs(pan_err) < crop_snap_deadband_px and abs(tilt_err) < crop_snap_deadband_px:
                         cx, cy = tx, ty
-                    smooth_center = (cx, cy)
+                    smooth_center = _apply_center_slew_limit(smooth_center, (cx, cy), max_step=crop_max_step_px)
                     pan_speed = pan_err * alpha
                     tilt_speed = tilt_err * alpha
 
@@ -736,6 +859,8 @@ def run_app(config):
                 if reused_last_good:
                     smooth_center = handoff_state.last_good_center
                     smooth_zoom = handoff_state.last_good_zoom
+                    display_center = handoff_state.last_good_center
+                    display_bbox = handoff_state.last_good_bbox
                 else:
                     handoff_state.last_good_zoom = smooth_zoom
 
@@ -743,14 +868,12 @@ def run_app(config):
             else:
                 pan_speed = 0.0
                 tilt_speed = 0.0
+                display_box_smoother.reset()
                 if handoff_state.missed <= handoff_hold_frames and handoff_state.last_good_center is not None:
                     smooth_center = handoff_state.last_good_center
                     smooth_zoom = handoff_state.last_good_zoom
-
-            if soft_track is not None and smooth_center is not None:
-                tx, ty = soft_track.center_xy
-                if target_manager.manual_lock or (abs(tx - smooth_center[0]) < 140 and abs(ty - smooth_center[1]) < 140):
-                    smooth_center = (tx, ty)
+                    display_center = handoff_state.last_good_center
+                    display_bbox = handoff_state.last_good_bbox
 
             wide_program = crop_group(frame, tracks, (780, 360))
             debug_frame = draw_tracks(frame, tracks, target_manager.selected_id)
@@ -767,26 +890,27 @@ def run_app(config):
                 real_tilt_err = 0.0
                 center_lock = False
 
-                if soft_track is not None:
+                if display_center is not None:
                     cx1, cy1, cx2, cy2 = narrow_crop_rect
                     crop_w = max(1, cx2 - cx1)
                     crop_h = max(1, cy2 - cy1)
-                    target_nx = (soft_track.center_xy[0] - cx1) * 780.0 / crop_w
-                    target_ny = (soft_track.center_xy[1] - cy1) * 360.0 / crop_h
+                    target_nx = (display_center[0] - cx1) * 780.0 / crop_w
+                    target_ny = (display_center[1] - cy1) * 360.0 / crop_h
                     real_pan_err = target_nx - 390.0
                     real_tilt_err = target_ny - 180.0
-                    center_lock = abs(real_pan_err) < 14 and abs(real_tilt_err) < 14
+                    center_lock = abs(real_pan_err) < 16 and abs(real_tilt_err) < 16
 
                 cv2.putText(narrow_output, label, (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
                 cv2.putText(narrow_output, f'PAN ERR {real_pan_err:.1f}  TILT ERR {real_tilt_err:.1f}', (20, 108), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
                 cv2.putText(narrow_output, f'ZOOM {smooth_zoom:.1f}x', (20, 146), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
                 cv2.putText(narrow_output, f'HOLD {hold_count}', (20, 184), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-                center_lock_text = 'CENTER LOCK ON' if (center_lock and soft_track is not None) else 'CENTER LOCK OFF'
+                center_lock_text = 'CENTER LOCK ON' if (center_lock and display_center is not None) else 'CENTER LOCK OFF'
                 cv2.putText(narrow_output, center_lock_text, (20, 222), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
                 if edge_limit_active:
                     cv2.putText(narrow_output, 'EDGE LIMIT COMP', (20, 258), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
-                if soft_track is not None:
-                    narrow_output = draw_target_on_narrow(narrow_output, narrow_crop_rect, soft_track, soft_track.track_id)
+                if display_bbox is not None and display_center is not None:
+                    disp_id = soft_track.track_id if soft_track is not None else (target_manager.selected_id or '?')
+                    narrow_output = draw_target_on_narrow(narrow_output, narrow_crop_rect, display_bbox, display_center, disp_id)
                 cross_color = (0, 255, 0) if center_lock else (0, 255, 255)
                 cv2.line(narrow_output, (390, 0), (390, 360), cross_color, 1)
                 cv2.line(narrow_output, (0, 180), (780, 180), cross_color, 1)
@@ -878,6 +1002,8 @@ def run_app(config):
                     target_manager.set_manual_target(tr.track_id)
                     narrow_tracker.reset()
                     handoff_state.reset()
+                    display_box_smoother.reset()
+                    display_box_smoother.reset()
                     narrow_tracker.kalman.init_state(tr.center_xy[0], tr.center_xy[1])
                     handoff_state.update_from_track(tr, zoom=handoff_state.zoom)
             elif key in (ord(','), ord('.')):

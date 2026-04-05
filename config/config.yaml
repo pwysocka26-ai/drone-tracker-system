@@ -41,9 +41,9 @@ tracker:
   current_target_bonus: 2.6
 
 handoff:
-  soft_active_max_missed: 3
-  handoff_reacquire_radius: 140.0
-  handoff_hold_frames: 6
+  soft_active_max_missed: 4
+  handoff_reacquire_radius: 165.0
+  handoff_hold_frames: 10
 
 narrow:
   hold_frames: 80

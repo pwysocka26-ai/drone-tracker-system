@@ -24,20 +24,26 @@ tracker:
   velocity_alpha: 0.65
   history_size: 12
 
-  reacquire_radius_auto: 145.0
+  reacquire_radius_auto: 135.0
   reacquire_radius_manual: 220.0
   sticky_frames: 22
-  switch_margin: 0.38
-  switch_dwell: 7
-  switch_cooldown: 8
-  switch_persist: 3
-  max_select_missed: 1
+  switch_margin: 0.36
+  switch_dwell: 6
+  switch_cooldown: 7
+  switch_persist: 2
+  max_select_missed: 2
   min_start_conf: 0.10
   min_start_hits: 2
   min_confirmed_conf: 0.10
-  min_hold_frames: 6
-  predicted_dist_px: 90.0
-  raw_id_bonus: 2.0
+  min_hold_frames: 5
+  predicted_dist_px: 95.0
+  raw_id_bonus: 1.8
+  current_target_bonus: 2.6
+
+handoff:
+  soft_active_max_missed: 3
+  handoff_reacquire_radius: 140.0
+  handoff_hold_frames: 6
 
 narrow:
   hold_frames: 80

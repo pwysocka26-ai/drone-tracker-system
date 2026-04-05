@@ -8,31 +8,23 @@ Point = Tuple[float, float]
 
 
 class TargetManager:
-    """
-    V3:
-    - mniej agresywny niż v2
-    - stabilny selected_id
-    - łatwiejszy reacquire w AUTO
-    - przełączenie tylko gdy kandydat jest lokalny i wyraźnie lepszy
-    """
-
     def __init__(
         self,
-        reacquire_radius_auto=145.0,
+        reacquire_radius_auto=135.0,
         reacquire_radius_manual=220.0,
         sticky_frames=22,
-        switch_margin=0.38,
-        switch_dwell=7,
-        switch_cooldown=8,
-        switch_persist=3,
-        max_select_missed=1,
+        switch_margin=0.36,
+        switch_dwell=6,
+        switch_cooldown=7,
+        switch_persist=2,
+        max_select_missed=2,
         min_start_conf=0.10,
         min_start_hits=2,
         min_confirmed_conf=0.10,
-        min_hold_frames=6,
-        predicted_dist_px=90.0,
-        raw_id_bonus=2.0,
-        current_target_bonus=2.8,
+        min_hold_frames=5,
+        predicted_dist_px=95.0,
+        raw_id_bonus=1.8,
+        current_target_bonus=2.6,
     ):
         self.selected_id = None
         self.manual_lock = False
@@ -149,7 +141,7 @@ class TargetManager:
         score += min(1.4, hits * 0.22)
         if confirmed:
             score += 1.8
-        score -= missed * 2.0
+        score -= missed * 1.8
 
         if is_current:
             score += self.current_target_bonus
@@ -157,7 +149,7 @@ class TargetManager:
         anchor = predicted_center or self.last_selected_center
         if anchor is not None:
             dist = self._distance(tuple(tr.center_xy), anchor)
-            score += max(-2.5, 1.25 - dist / max(1.0, self.predicted_dist_px))
+            score += max(-2.3, 1.2 - dist / max(1.0, self.predicted_dist_px))
 
         if self.last_selected_raw_id is not None and raw_id is not None:
             if int(raw_id) == int(self.last_selected_raw_id):
@@ -190,7 +182,6 @@ class TargetManager:
 
         anchor = predicted_center or self.last_selected_center
 
-        # initial acquire: small dwell, not instant
         if self.selected_id is None:
             best = max(candidates, key=lambda tr: self._score(tr, frame_shape, predicted_center))
             if self.pending_id == int(best.track_id):
@@ -211,7 +202,6 @@ class TargetManager:
                     self.last_selected_raw_id = int(rid)
             return self.selected_id
 
-        # reacquire locally
         if active is None and anchor is not None:
             close = []
             for tr in candidates:
@@ -262,7 +252,7 @@ class TargetManager:
         need_switch = (
             near_anchor
             and best_score > (current_score + self.switch_margin)
-            and best_score > (current_score * 1.12)
+            and best_score > (current_score * 1.10)
             and self.lock_age >= self.min_hold_frames
             and (self.frame_id - self.last_switch_frame) >= self.switch_cooldown
         )

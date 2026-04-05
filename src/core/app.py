@@ -6,6 +6,7 @@ from ultralytics import YOLO
 from core.target_manager import TargetManager
 from core.narrow_tracker import NarrowTracker
 from core.multi_target_tracker import MultiTargetTracker
+from core.telemetry import TelemetryLogger
 
 
 class Track:
@@ -297,6 +298,9 @@ def run_app(config):
     record_fps = 30.0
     record_frame_size = (1560, 810)
 
+    telemetry_enabled = False
+    telemetry = None
+
     def start_recording():
         nonlocal recording, video_writer
         stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -317,6 +321,22 @@ def run_app(config):
             video_writer.release()
             video_writer = None
         print('REC STOP')
+
+    def start_telemetry():
+        nonlocal telemetry_enabled, telemetry
+        stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        run_name = f'run_{stamp}'
+        telemetry = TelemetryLogger(run_name=run_name, fps=record_fps)
+        telemetry_enabled = True
+        print(f'METRICS START: {telemetry.path}')
+
+    def stop_telemetry():
+        nonlocal telemetry_enabled, telemetry
+        telemetry_enabled = False
+        if telemetry is not None:
+            print(f'METRICS STOP: {telemetry.path}')
+            telemetry.close()
+            telemetry = None
 
     screenshot_dir = None
 
@@ -347,247 +367,280 @@ def run_app(config):
     last_backend = '-'
     drop_streak = 0
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-            multi_tracker.reset()
-            target_manager.set_auto_mode()
-            narrow_tracker.reset()
+    try:
+        while True:
             ret, frame = cap.read()
             if not ret:
-                break
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                multi_tracker.reset()
+                target_manager.set_auto_mode()
+                narrow_tracker.reset()
+                ret, frame = cap.read()
+                if not ret:
+                    break
 
-        frame_id += 1
-        predicted_center = narrow_tracker.kalman.predict()
+            frame_id += 1
+            predicted_center = narrow_tracker.kalman.predict()
 
-        if frame_id % max(1, inference_every) == 0 or not tracks:
-            if backend == 'predict':
-                results = model.predict(source=frame, conf=conf, imgsz=imgsz, classes=classes, verbose=False)
-                last_backend = 'predict'
-            else:
-                results = model.track(
-                    source=frame,
-                    persist=True,
-                    tracker=tracker_name,
-                    conf=conf,
-                    imgsz=imgsz,
-                    classes=classes,
-                    verbose=False,
-                )
-                last_backend = 'track'
-
-            result = results[0]
-            boxes = getattr(result, 'boxes', None)
-            last_yolo_boxes = int(len(boxes)) if (boxes is not None and getattr(boxes, 'xyxy', None) is not None) else 0
-            det_tracks = parse_tracks(result, frame.shape)
-
-            need_search = search_fallback and (not det_tracks) and (frame_id % max(1, search_interval) == 0)
-            if need_search:
-                search_results = model.predict(
-                    source=frame,
-                    conf=search_conf,
-                    imgsz=search_imgsz,
-                    classes=classes,
-                    verbose=False,
-                )
-                search_result = search_results[0]
-                search_boxes = getattr(search_result, 'boxes', None)
-                search_box_count = int(len(search_boxes)) if (search_boxes is not None and getattr(search_boxes, 'xyxy', None) is not None) else 0
-                search_tracks = parse_tracks(search_result, frame.shape)
-                if search_tracks:
-                    det_tracks = search_tracks
-                    last_backend = 'predict-search'
-                    last_yolo_boxes = search_box_count
+            if frame_id % max(1, inference_every) == 0 or not tracks:
+                if backend == 'predict':
+                    results = model.predict(source=frame, conf=conf, imgsz=imgsz, classes=classes, verbose=False)
+                    last_backend = 'predict'
                 else:
-                    last_yolo_boxes = max(last_yolo_boxes, search_box_count)
+                    results = model.track(
+                        source=frame,
+                        persist=True,
+                        tracker=tracker_name,
+                        conf=conf,
+                        imgsz=imgsz,
+                        classes=classes,
+                        verbose=False,
+                    )
+                    last_backend = 'track'
 
-            last_det_tracks = int(len(det_tracks))
-            drop_streak = (drop_streak + 1) if last_det_tracks == 0 else 0
-            tracks = multi_tracker.update(det_tracks, frame.shape)
+                result = results[0]
+                boxes = getattr(result, 'boxes', None)
+                last_yolo_boxes = int(len(boxes)) if (boxes is not None and getattr(boxes, 'xyxy', None) is not None) else 0
+                det_tracks = parse_tracks(result, frame.shape)
 
-        visible_sorted = sorted(tracks, key=lambda t: t.track_id)
-        confirmed_tracks = [t for t in tracks if getattr(t, 'is_confirmed', False)]
-        selection_tracks = confirmed_tracks if confirmed_tracks else tracks
+                need_search = search_fallback and (not det_tracks) and (frame_id % max(1, search_interval) == 0)
+                if need_search:
+                    search_results = model.predict(
+                        source=frame,
+                        conf=search_conf,
+                        imgsz=search_imgsz,
+                        classes=classes,
+                        verbose=False,
+                    )
+                    search_result = search_results[0]
+                    search_boxes = getattr(search_result, 'boxes', None)
+                    search_box_count = int(len(search_boxes)) if (search_boxes is not None and getattr(search_boxes, 'xyxy', None) is not None) else 0
+                    search_tracks = parse_tracks(search_result, frame.shape)
+                    if search_tracks:
+                        det_tracks = search_tracks
+                        last_backend = 'predict-search'
+                        last_yolo_boxes = search_box_count
+                    else:
+                        last_yolo_boxes = max(last_yolo_boxes, search_box_count)
 
-        target_manager.update(selection_tracks, predicted_center, frame.shape)
-        active_track = target_manager.find_active_track(tracks)
-        if active_track is not None and int(getattr(active_track, 'missed_frames', 0) or 0) > 1:
-            active_track = None
+                last_det_tracks = int(len(det_tracks))
+                drop_streak = (drop_streak + 1) if last_det_tracks == 0 else 0
+                tracks = multi_tracker.update(det_tracks, frame.shape)
 
-        for tr in tracks:
-            tr.is_active_target = False
-            tr.is_valid_target = bool(
-                getattr(tr, 'is_confirmed', False)
-                or getattr(tr, 'hits', 0) >= 2
-            )
-        if active_track is not None:
-            active_track.is_active_target = True
+            visible_sorted = sorted(tracks, key=lambda t: t.track_id)
+            confirmed_tracks = [t for t in tracks if getattr(t, 'is_confirmed', False)]
+            selection_tracks = confirmed_tracks if confirmed_tracks else tracks
 
-        predicted_center, smooth_center, smooth_zoom, hold_count, _, _ = narrow_tracker.update(frame, active_track)
+            target_manager.update(selection_tracks, predicted_center, frame.shape)
+            active_track = target_manager.find_active_track(tracks)
+            if active_track is not None and int(getattr(active_track, 'missed_frames', 0) or 0) > 1:
+                active_track = None
 
-        edge_limit_active = False
-        if active_track is not None:
-            tx, ty = active_track.center_xy
-            if smooth_center is None:
-                smooth_center = (tx, ty)
-            pan_err = tx - smooth_center[0]
-            tilt_err = ty - smooth_center[1]
+            for tr in tracks:
+                tr.is_active_target = False
+                tr.is_valid_target = bool(
+                    getattr(tr, 'is_confirmed', False)
+                    or getattr(tr, 'hits', 0) >= 2
+                )
+            if active_track is not None:
+                active_track.is_active_target = True
 
-            if target_manager.manual_lock:
-                cx, cy = tx, ty
-                smooth_center = (cx, cy)
-                pan_speed = pan_err
-                tilt_speed = tilt_err
-            else:
-                alpha = 0.24
-                snap_px = 18
-                cx = smooth_center[0] + alpha * pan_err
-                cy = smooth_center[1] + alpha * tilt_err
-                if abs(pan_err) < snap_px and abs(tilt_err) < snap_px:
+            predicted_center, smooth_center, smooth_zoom, hold_count, _, _ = narrow_tracker.update(frame, active_track)
+
+            edge_limit_active = False
+            if active_track is not None:
+                tx, ty = active_track.center_xy
+                if smooth_center is None:
+                    smooth_center = (tx, ty)
+                pan_err = tx - smooth_center[0]
+                tilt_err = ty - smooth_center[1]
+
+                if target_manager.manual_lock:
                     cx, cy = tx, ty
-                smooth_center = (cx, cy)
-                pan_speed = pan_err * alpha
-                tilt_speed = tilt_err * alpha
+                    smooth_center = (cx, cy)
+                    pan_speed = pan_err
+                    tilt_speed = tilt_err
+                else:
+                    alpha = 0.24
+                    snap_px = 18
+                    cx = smooth_center[0] + alpha * pan_err
+                    cy = smooth_center[1] + alpha * tilt_err
+                    if abs(pan_err) < snap_px and abs(tilt_err) < snap_px:
+                        cx, cy = tx, ty
+                    smooth_center = (cx, cy)
+                    pan_speed = pan_err * alpha
+                    tilt_speed = tilt_err * alpha
 
-            fh, fw = frame.shape[:2]
-            aspect = 780.0 / 360.0
-            margin_x = min(tx, fw - tx)
-            margin_y = min(ty, fh - ty)
-            max_crop_w = max(80.0, margin_x * 2.0)
-            max_crop_h = max(80.0, margin_y * 2.0)
-            if max_crop_w / max_crop_h < aspect:
-                max_crop_h = max_crop_w / aspect
+                fh, fw = frame.shape[:2]
+                aspect = 780.0 / 360.0
+                margin_x = min(tx, fw - tx)
+                margin_y = min(ty, fh - ty)
+                max_crop_w = max(80.0, margin_x * 2.0)
+                max_crop_h = max(80.0, margin_y * 2.0)
+                if max_crop_w / max_crop_h < aspect:
+                    max_crop_h = max_crop_w / aspect
+                else:
+                    max_crop_w = max_crop_h * aspect
+
+                if (fw / fh) > aspect:
+                    required_zoom = fh / max_crop_h
+                else:
+                    required_zoom = fw / max_crop_w
+                required_zoom = max(1.0, min(2.4, required_zoom))
+                if required_zoom > smooth_zoom:
+                    smooth_zoom = required_zoom
+                    edge_limit_active = True
             else:
-                max_crop_w = max_crop_h * aspect
+                pan_speed = 0.0
+                tilt_speed = 0.0
 
-            if (fw / fh) > aspect:
-                required_zoom = fh / max_crop_h
+            if active_track is not None and smooth_center is not None:
+                tx, ty = active_track.center_xy
+                if target_manager.manual_lock or (abs(tx - smooth_center[0]) < 120 and abs(ty - smooth_center[1]) < 120):
+                    smooth_center = (tx, ty)
+
+            wide_program = crop_group(frame, tracks, (780, 360))
+            debug_frame = draw_tracks(frame, tracks, target_manager.selected_id)
+            for idx, tr in enumerate(visible_sorted[:9], start=1):
+                x1, y1, x2, y2 = tighten_bbox(tr.bbox_xyxy, scale=0.65)
+                label = f'[{idx}] ID {tr.track_id}' if getattr(tr, 'is_confirmed', False) else f'[{idx}] ID {tr.track_id}?'
+                cv2.putText(debug_frame, label, (x1, max(30, y1 - 30)), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 0), 2)
+            wide_debug = crop_group(debug_frame, tracks, (1560, 450))
+
+            if smooth_center is not None:
+                narrow_output, narrow_crop_rect = crop_to_16_9(frame, smooth_center, smooth_zoom, (780, 360), return_meta=True)
+                label = f'TARGET ID {target_manager.selected_id}' if active_track is not None else f'TRACK HOLD ID {target_manager.selected_id}'
+                real_pan_err = 0.0
+                real_tilt_err = 0.0
+                center_lock = False
+
+                if active_track is not None:
+                    cx1, cy1, cx2, cy2 = narrow_crop_rect
+                    crop_w = max(1, cx2 - cx1)
+                    crop_h = max(1, cy2 - cy1)
+                    target_nx = (active_track.center_xy[0] - cx1) * 780.0 / crop_w
+                    target_ny = (active_track.center_xy[1] - cy1) * 360.0 / crop_h
+                    real_pan_err = target_nx - 390.0
+                    real_tilt_err = target_ny - 180.0
+                    center_lock = abs(real_pan_err) < 12 and abs(real_tilt_err) < 12
+
+                cv2.putText(narrow_output, label, (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
+                cv2.putText(narrow_output, f'PAN ERR {real_pan_err:.1f}  TILT ERR {real_tilt_err:.1f}', (20, 108), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+                cv2.putText(narrow_output, f'ZOOM {smooth_zoom:.1f}x', (20, 146), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+                cv2.putText(narrow_output, f'HOLD {hold_count}', (20, 184), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+                center_lock_text = 'CENTER LOCK ON' if (center_lock and active_track is not None) else 'CENTER LOCK OFF'
+                cv2.putText(narrow_output, center_lock_text, (20, 222), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+                if edge_limit_active:
+                    cv2.putText(narrow_output, 'EDGE LIMIT COMP', (20, 258), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
+                if active_track is not None:
+                    narrow_output = draw_target_on_narrow(narrow_output, narrow_crop_rect, active_track, active_track.track_id)
+                cross_color = (0, 255, 0) if center_lock else (0, 255, 255)
+                cv2.line(narrow_output, (390, 0), (390, 360), cross_color, 1)
+                cv2.line(narrow_output, (0, 180), (780, 180), cross_color, 1)
             else:
-                required_zoom = fw / max_crop_w
-            required_zoom = max(1.0, min(2.4, required_zoom))
-            if required_zoom > smooth_zoom:
-                smooth_zoom = required_zoom
-                edge_limit_active = True
-        else:
-            pan_speed = 0.0
-            tilt_speed = 0.0
+                center_lock = False
+                narrow_output, narrow_crop_rect = crop_to_16_9(frame, None, 1.7, (780, 360), return_meta=True)
+                cv2.putText(narrow_output, 'BRAK CELU', (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
 
-        if active_track is not None and smooth_center is not None:
-            tx, ty = active_track.center_xy
-            if target_manager.manual_lock or (abs(tx - smooth_center[0]) < 120 and abs(ty - smooth_center[1]) < 120):
-                smooth_center = (tx, ty)
+            lock_mode = 'AUTO' if not target_manager.manual_lock else 'MANUAL'
+            cv2.putText(wide_debug, f'LOCK MODE: {lock_mode}', (20, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+            cv2.putText(wide_debug, f'SELECTED ID: {target_manager.selected_id}', (20, 136), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+            cv2.putText(wide_debug, f'HOLD COUNT: {hold_count}', (20, 172), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+            cv2.putText(wide_debug, f'LOCK AGE: {target_manager.lock_age}', (20, 208), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+            cv2.putText(wide_debug, f'PAN SPD: {pan_speed:.1f}  TILT SPD: {tilt_speed:.1f}', (20, 244), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+            confirmed_count = sum(1 for t in tracks if getattr(t, 'is_confirmed', False))
+            cv2.putText(wide_debug, f'MULTI TRACKS: {len(tracks)}  CONFIRMED: {confirmed_count}', (20, 280), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+            cv2.putText(
+                wide_debug,
+                f'YOLO [{last_backend}]  conf={conf:.2f} imgsz={imgsz}  BOXES: {last_yolo_boxes}  DETS: {last_det_tracks}  DROP: {drop_streak}',
+                (20, 316),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.62,
+                (255, 255, 255),
+                2,
+            )
+            cv2.putText(wide_debug, 'CORE MODE: PRIMARY TARGET', (20, 352), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+            cv2.putText(wide_debug, 'SUPPORT TRACKS: DEBUG ONLY', (20, 388), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+            auto_text = 'AUTO PICK ENABLED' if not target_manager.manual_lock else 'AUTO PICK DISABLED'
+            cv2.putText(wide_debug, auto_text, (20, 424), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
 
-        wide_program = crop_group(frame, tracks, (780, 360))
-        debug_frame = draw_tracks(frame, tracks, target_manager.selected_id)
-        for idx, tr in enumerate(visible_sorted[:9], start=1):
-            x1, y1, x2, y2 = tighten_bbox(tr.bbox_xyxy, scale=0.65)
-            label = f'[{idx}] ID {tr.track_id}' if getattr(tr, 'is_confirmed', False) else f'[{idx}] ID {tr.track_id}?'
-            cv2.putText(debug_frame, label, (x1, max(30, y1 - 30)), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 0), 2)
-        wide_debug = crop_group(debug_frame, tracks, (1560, 450))
+            wide_program = add_title(wide_program, 'WIDE PROGRAM')
+            narrow_output = add_title(narrow_output, 'NARROW OUTPUT')
+            wide_debug = add_title(wide_debug, 'WIDE DEBUG')
+            dashboard = cv2.vconcat([cv2.hconcat([wide_program, narrow_output]), wide_debug])
 
-        if smooth_center is not None:
-            narrow_output, narrow_crop_rect = crop_to_16_9(frame, smooth_center, smooth_zoom, (780, 360), return_meta=True)
-            label = f'TARGET ID {target_manager.selected_id}' if active_track is not None else f'TRACK HOLD ID {target_manager.selected_id}'
-            real_pan_err = 0.0
-            real_tilt_err = 0.0
-            center_lock = False
+            if recording:
+                cv2.circle(dashboard, (1510, 30), 8, (0, 0, 255), -1)
+                cv2.putText(dashboard, 'REC', (1450, 38), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+                if video_writer is not None:
+                    video_writer.write(dashboard)
 
-            if active_track is not None:
-                cx1, cy1, cx2, cy2 = narrow_crop_rect
-                crop_w = max(1, cx2 - cx1)
-                crop_h = max(1, cy2 - cy1)
-                target_nx = (active_track.center_xy[0] - cx1) * 780.0 / crop_w
-                target_ny = (active_track.center_xy[1] - cy1) * 360.0 / crop_h
-                real_pan_err = target_nx - 390.0
-                real_tilt_err = target_ny - 180.0
-                center_lock = abs(real_pan_err) < 12 and abs(real_tilt_err) < 12
+            if telemetry_enabled:
+                cv2.circle(dashboard, (1510, 58), 8, (255, 255, 0), -1)
+                cv2.putText(dashboard, 'METRICS', (1350, 66), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
 
-            cv2.putText(narrow_output, label, (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
-            cv2.putText(narrow_output, f'PAN ERR {real_pan_err:.1f}  TILT ERR {real_tilt_err:.1f}', (20, 108), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-            cv2.putText(narrow_output, f'ZOOM {smooth_zoom:.1f}x', (20, 146), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-            cv2.putText(narrow_output, f'HOLD {hold_count}', (20, 184), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-            center_lock_text = 'CENTER LOCK ON' if (center_lock and active_track is not None) else 'CENTER LOCK OFF'
-            cv2.putText(narrow_output, center_lock_text, (20, 222), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
-            if edge_limit_active:
-                cv2.putText(narrow_output, 'EDGE LIMIT COMP', (20, 258), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
-            if active_track is not None:
-                narrow_output = draw_target_on_narrow(narrow_output, narrow_crop_rect, active_track, active_track.track_id)
-            cross_color = (0, 255, 0) if center_lock else (0, 255, 255)
-            cv2.line(narrow_output, (390, 0), (390, 360), cross_color, 1)
-            cv2.line(narrow_output, (0, 180), (780, 180), cross_color, 1)
-        else:
-            narrow_output, narrow_crop_rect = crop_to_16_9(frame, None, 1.7, (780, 360), return_meta=True)
-            cv2.putText(narrow_output, 'BRAK CELU', (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
+            cv2.putText(
+                dashboard,
+                'R=REC  T=METRICS  S=SHOT  0=AUTO  1-9=SLOT  ,/.=PREV/NEXT',
+                (860, 800),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (255, 255, 255),
+                2,
+            )
 
-        lock_mode = 'AUTO' if not target_manager.manual_lock else 'MANUAL'
-        cv2.putText(wide_debug, f'LOCK MODE: {lock_mode}', (20, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-        cv2.putText(wide_debug, f'SELECTED ID: {target_manager.selected_id}', (20, 136), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-        cv2.putText(wide_debug, f'HOLD COUNT: {hold_count}', (20, 172), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-        cv2.putText(wide_debug, f'LOCK AGE: {target_manager.lock_age}', (20, 208), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-        cv2.putText(wide_debug, f'PAN SPD: {pan_speed:.1f}  TILT SPD: {tilt_speed:.1f}', (20, 244), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-        confirmed_count = sum(1 for t in tracks if getattr(t, 'is_confirmed', False))
-        cv2.putText(wide_debug, f'MULTI TRACKS: {len(tracks)}  CONFIRMED: {confirmed_count}', (20, 280), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-        cv2.putText(
-            wide_debug,
-            f'YOLO [{last_backend}]  conf={conf:.2f} imgsz={imgsz}  BOXES: {last_yolo_boxes}  DETS: {last_det_tracks}  DROP: {drop_streak}',
-            (20, 316),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.62,
-            (255, 255, 255),
-            2,
-        )
-        cv2.putText(wide_debug, 'CORE MODE: PRIMARY TARGET', (20, 352), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-        cv2.putText(wide_debug, 'SUPPORT TRACKS: DEBUG ONLY', (20, 388), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-        auto_text = 'AUTO PICK ENABLED' if not target_manager.manual_lock else 'AUTO PICK DISABLED'
-        cv2.putText(wide_debug, auto_text, (20, 424), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+            if telemetry_enabled and telemetry is not None:
+                telemetry.log_frame(
+                    frame_idx=frame_id,
+                    mode=('MANUAL' if target_manager.manual_lock else 'AUTO'),
+                    selected_id=target_manager.selected_id,
+                    active_track=active_track,
+                    tracks=tracks,
+                    narrow_center=smooth_center,
+                    center_lock=center_lock,
+                    drift_gate_open=(active_track is None and smooth_center is not None),
+                )
 
-        wide_program = add_title(wide_program, 'WIDE PROGRAM')
-        narrow_output = add_title(narrow_output, 'NARROW OUTPUT')
-        wide_debug = add_title(wide_debug, 'WIDE DEBUG')
-        dashboard = cv2.vconcat([cv2.hconcat([wide_program, narrow_output]), wide_debug])
+            cv2.imshow(window_name, dashboard)
 
-        if recording:
-            cv2.circle(dashboard, (1510, 30), 8, (0, 0, 255), -1)
-            cv2.putText(dashboard, 'REC', (1450, 38), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-            if video_writer is not None:
-                video_writer.write(dashboard)
-
-        cv2.putText(dashboard, 'R=REC  S=SHOT  0=AUTO  1-9=SLOT  ,/.=PREV/NEXT', (980, 800), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-        cv2.imshow(window_name, dashboard)
-
-        key = cv2.waitKey(1) & 0xFF
-        if key in (27, ord('q')):
-            break
-        elif key in (ord('r'), ord('R')):
-            stop_recording() if recording else start_recording()
-        elif key in (ord('s'), ord('S')):
-            save_screenshot(dashboard, wide_debug, narrow_output)
-        elif key == ord('0'):
-            target_manager.set_auto_mode()
-            narrow_tracker.reset()
-        elif key in (ord('1'), ord('2'), ord('3'), ord('4'), ord('5'), ord('6'), ord('7'), ord('8'), ord('9')):
-            idx = int(chr(key)) - 1
-            cand = visible_sorted
-            if 0 <= idx < len(cand):
-                tr = cand[idx]
-                target_manager.set_manual_target(tr.track_id)
+            key = cv2.waitKey(1) & 0xFF
+            if key in (27, ord('q')):
+                break
+            elif key in (ord('r'), ord('R')):
+                stop_recording() if recording else start_recording()
+            elif key in (ord('t'), ord('T')):
+                stop_telemetry() if telemetry_enabled else start_telemetry()
+            elif key in (ord('s'), ord('S')):
+                save_screenshot(dashboard, wide_debug, narrow_output)
+            elif key == ord('0'):
+                target_manager.set_auto_mode()
                 narrow_tracker.reset()
-                narrow_tracker.kalman.init_state(tr.center_xy[0], tr.center_xy[1])
-        elif key in (ord(','), ord('.')):
-            cand = visible_sorted
-            if cand:
-                cur_idx = 0
-                if target_manager.selected_id is not None:
-                    for i, t in enumerate(cand):
-                        if t.track_id == target_manager.selected_id:
-                            cur_idx = i
-                            break
-                step = -1 if key == ord(',') else 1
-                tr = cand[(cur_idx + step) % len(cand)]
-                target_manager.set_manual_target(tr.track_id)
-                narrow_tracker.reset()
-                narrow_tracker.kalman.init_state(tr.center_xy[0], tr.center_xy[1])
-
-    cap.release()
-    cv2.destroyAllWindows()
+            elif key in (ord('1'), ord('2'), ord('3'), ord('4'), ord('5'), ord('6'), ord('7'), ord('8'), ord('9')):
+                idx = int(chr(key)) - 1
+                cand = visible_sorted
+                if 0 <= idx < len(cand):
+                    tr = cand[idx]
+                    target_manager.set_manual_target(tr.track_id)
+                    narrow_tracker.reset()
+                    narrow_tracker.kalman.init_state(tr.center_xy[0], tr.center_xy[1])
+            elif key in (ord(','), ord('.')):
+                cand = visible_sorted
+                if cand:
+                    cur_idx = 0
+                    if target_manager.selected_id is not None:
+                        for i, t in enumerate(cand):
+                            if t.track_id == target_manager.selected_id:
+                                cur_idx = i
+                                break
+                    step = -1 if key == ord(',') else 1
+                    tr = cand[(cur_idx + step) % len(cand)]
+                    target_manager.set_manual_target(tr.track_id)
+                    narrow_tracker.reset()
+                    narrow_tracker.kalman.init_state(tr.center_xy[0], tr.center_xy[1])
+    finally:
+        if telemetry is not None:
+            telemetry.close()
+        if video_writer is not None:
+            video_writer.release()
+        cap.release()
+        cv2.destroyAllWindows()

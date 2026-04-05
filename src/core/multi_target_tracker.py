@@ -8,27 +8,14 @@ import math
 BBox = Tuple[float, float, float, float]
 Point = Tuple[float, float]
 
+RAW_ID_BONUS = 0.60
+BBOX_ALPHA = 0.72
+CENTER_ALPHA = 0.70
+SIZE_JUMP_LIMIT = 1.35
+
 
 @dataclass
 class MultiTrackState:
-    """
-    Stabilny stan pojedynczego tracka w warstwie multi-target.
-
-    Pola są celowo podobne do obecnej klasy Track z app.py, żeby integracja
-    była prosta:
-    - track_id
-    - raw_id
-    - bbox_xyxy
-    - center_xy
-    - confidence
-
-    Dodatkowo:
-    - velocity_xy
-    - age
-    - hits
-    - missed_frames
-    - is_confirmed
-    """
     track_id: int
     raw_id: int
     bbox_xyxy: BBox
@@ -41,7 +28,6 @@ class MultiTrackState:
     missed_frames: int = 0
     is_confirmed: bool = False
 
-    # pola kompatybilne z istniejącym pipeline
     is_valid_target: bool = True
     is_active_target: bool = False
     selection_priority: float = 0.0
@@ -70,22 +56,6 @@ class MultiTrackState:
 
 
 class MultiTargetTracker:
-    """
-    Lekki tracker wielu obiektów do podpięcia pod obecny projekt.
-
-    Założenie:
-    - dostaje listę detekcji z jednej klatki
-    - każda detekcja ma pola kompatybilne z obecną klasą Track:
-        track_id / raw_id / bbox_xyxy / center_xy / confidence
-    - utrzymuje stabilne tracki niezależnie od chwilowych zaników detekcji
-    - zwraca listę MultiTrackState
-
-    Strategia dopasowania:
-    1. przewidywanie pozycji tracka z velocity
-    2. scoring: distance + size similarity + IoU
-    3. greedy assignment
-    """
-
     def __init__(
         self,
         max_missed_frames: int = 20,
@@ -117,11 +87,7 @@ class MultiTargetTracker:
         detections: Iterable[object],
         frame_shape: Optional[Sequence[int]] = None,
     ) -> List[MultiTrackState]:
-        """
-        Aktualizuje stan trackerów na podstawie detekcji z bieżącej klatki.
-        """
         dets = [self._normalize_detection(det) for det in detections]
-
         predicted_centers = [self._predict_center(tr) for tr in self._tracks]
         matches, unmatched_tracks, unmatched_dets = self._greedy_match(
             self._tracks, predicted_centers, dets
@@ -209,10 +175,16 @@ class MultiTargetTracker:
     def _size_penalty(self, bbox_a: BBox, bbox_b: BBox) -> float:
         wa, ha = self._bbox_size(bbox_a)
         wb, hb = self._bbox_size(bbox_b)
-
         dw = abs(wa - wb) / max(wa, wb)
         dh = abs(ha - hb) / max(ha, hb)
         return 0.5 * (dw + dh)
+
+    def _motion_penalty(self, tr: MultiTrackState, det: MultiTrackState) -> float:
+        implied_vx = det.center_xy[0] - tr.center_xy[0]
+        implied_vy = det.center_xy[1] - tr.center_xy[1]
+        dvx = implied_vx - tr.velocity_xy[0]
+        dvy = implied_vy - tr.velocity_xy[1]
+        return min(2.0, math.hypot(dvx, dvy) / 45.0)
 
     def _match_score(
         self,
@@ -226,11 +198,15 @@ class MultiTargetTracker:
 
         iou = self._iou(tr.bbox_xyxy, det.bbox_xyxy)
         size_penalty = self._size_penalty(tr.bbox_xyxy, det.bbox_xyxy)
+        motion_penalty = self._motion_penalty(tr, det)
 
         if iou < self.min_iou_for_match and size_penalty > 0.75:
             return None
 
-        return dist + 60.0 * size_penalty - 25.0 * iou - 10.0 * det.confidence
+        score = dist + 60.0 * size_penalty + 30.0 * motion_penalty - 25.0 * iou - 10.0 * det.confidence
+        if det.raw_id is not None and tr.raw_id is not None and int(det.raw_id) == int(tr.raw_id):
+            score -= RAW_ID_BONUS
+        return score
 
     def _greedy_match(
         self,
@@ -265,9 +241,36 @@ class MultiTargetTracker:
 
         return matches, unmatched_tracks, unmatched_dets
 
+    def _smooth_bbox(self, old_bbox: BBox, new_bbox: BBox) -> BBox:
+        ox1, oy1, ox2, oy2 = old_bbox
+        nx1, ny1, nx2, ny2 = new_bbox
+
+        ow, oh = self._bbox_size(old_bbox)
+        nw, nh = self._bbox_size(new_bbox)
+
+        # clamp abrupt size jumps for small targets
+        nw = min(nw, ow * SIZE_JUMP_LIMIT)
+        nh = min(nh, oh * SIZE_JUMP_LIMIT)
+
+        ocx, ocy = self._bbox_center(old_bbox)
+        ncx, ncy = self._bbox_center((nx1, ny1, nx1 + nw, ny1 + nh))
+
+        scx = CENTER_ALPHA * ocx + (1.0 - CENTER_ALPHA) * ncx
+        scy = CENTER_ALPHA * ocy + (1.0 - CENTER_ALPHA) * ncy
+        sw = BBOX_ALPHA * ow + (1.0 - BBOX_ALPHA) * nw
+        sh = BBOX_ALPHA * oh + (1.0 - BBOX_ALPHA) * nh
+
+        return (
+            scx - 0.5 * sw,
+            scy - 0.5 * sh,
+            scx + 0.5 * sw,
+            scy + 0.5 * sh,
+        )
+
     def _apply_detection_to_track(self, tr: MultiTrackState, det: MultiTrackState) -> None:
         old_center = tr.center_xy
-        new_center = det.center_xy
+        smoothed_bbox = self._smooth_bbox(tr.bbox_xyxy, det.bbox_xyxy)
+        new_center = self._bbox_center(smoothed_bbox)
 
         measured_vx = new_center[0] - old_center[0]
         measured_vy = new_center[1] - old_center[1]
@@ -281,8 +284,8 @@ class MultiTargetTracker:
             + (1.0 - self.velocity_alpha) * measured_vy
         )
 
-        tr.bbox_xyxy = det.bbox_xyxy
-        tr.center_xy = det.center_xy
+        tr.bbox_xyxy = smoothed_bbox
+        tr.center_xy = new_center
         tr.confidence = det.confidence
         tr.raw_id = det.raw_id
 

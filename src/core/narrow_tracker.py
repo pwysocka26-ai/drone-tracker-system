@@ -70,8 +70,8 @@ class NarrowTracker:
         rel = max(tw / w, th / h)
 
         # mały obiekt -> zoom in, duży -> zoom out
-        z = 0.060 / max(rel, 0.010)
-        return float(np.clip(z, 1.8, 4.2))
+        z = 0.082 / max(rel, 0.009)
+        return float(np.clip(z, 2.2, 5.0))
 
     def _step_towards(self, desired, active):
         if desired is None:
@@ -89,20 +89,20 @@ class NarrowTracker:
         ey = desired[1] - self.smooth_center[1]
 
         # dead zone: blisko środka -> nie szarp
-        if abs(ex) < 4:
+        if abs(ex) < 3:
             ex = 0.0
-        if abs(ey) < 4:
+        if abs(ey) < 3:
             ey = 0.0
 
-        kp = 0.28 if active else 0.18
-        max_step = 65.0 if active else 32.0
+        kp = 0.36 if active else 0.20
+        max_step = 82.0 if active else 34.0
 
         pan_speed = float(np.clip(ex * kp, -max_step, max_step))
         tilt_speed = float(np.clip(ey * kp, -max_step, max_step))
 
         # lekkie wygładzenie prędkości
-        pan_speed = 0.70 * self.last_pan_speed + 0.30 * pan_speed
-        tilt_speed = 0.70 * self.last_tilt_speed + 0.30 * tilt_speed
+        pan_speed = 0.58 * self.last_pan_speed + 0.42 * pan_speed
+        tilt_speed = 0.58 * self.last_tilt_speed + 0.42 * tilt_speed
 
         self.last_pan_speed = pan_speed
         self.last_tilt_speed = tilt_speed

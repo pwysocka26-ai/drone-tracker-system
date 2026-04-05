@@ -94,12 +94,12 @@ def tighten_bbox(bbox, frame_shape=None, min_size=12):
     area = bw * bh
 
     # adaptive tighten: small targets keep more of the box, large targets shrink more
-    if area < 250.0:
-        scale = 0.88
-    elif area < 900.0:
-        scale = 0.78
+    if area < 180.0:
+        scale = 0.72
+    elif area < 700.0:
+        scale = 0.66
     else:
-        scale = 0.65
+        scale = 0.60
 
     cx = (x1 + x2) / 2.0
     cy = (y1 + y2) / 2.0
@@ -500,14 +500,14 @@ def _blend_track_with_handoff(tr, handoff_state, center_alpha=0.76, size_alpha=0
     return tr
 
 
-def _estimate_zoom_for_track(frame_shape, track, current_zoom, max_zoom=2.4):
+def _estimate_zoom_for_track(frame_shape, track, current_zoom, max_zoom=3.2):
     fh, fw = frame_shape[:2]
     tx, ty = track.center_xy
     bw, bh = _bbox_size(track.bbox_xyxy)
 
     # bbox-driven minimum crop to keep object readable and reduce zoom spikes
-    desired_crop_w = max(bw * 9.0, 180.0)
-    desired_crop_h = max(bh * 9.0, 110.0)
+    desired_crop_w = max(bw * 7.0, 140.0)
+    desired_crop_h = max(bh * 7.0, 90.0)
 
     aspect = 780.0 / 360.0
     if desired_crop_w / desired_crop_h < aspect:
@@ -537,8 +537,8 @@ def _estimate_zoom_for_track(frame_shape, track, current_zoom, max_zoom=2.4):
     req_zoom = max(1.0, min(max_zoom, req_zoom))
 
     # zoom slew-rate limit
-    max_step_up = 0.12
-    max_step_down = 0.08
+    max_step_up = 0.22
+    max_step_down = 0.10
     if req_zoom > current_zoom:
         req_zoom = min(req_zoom, current_zoom + max_step_up)
     else:
@@ -843,16 +843,17 @@ def run_app(config):
                     pan_speed = pan_err
                     tilt_speed = tilt_err
                 else:
-                    alpha = 0.18
+                    alpha = 0.28 if abs(pan_err) < 48 and abs(tilt_err) < 48 else 0.22
+                    local_max_step = crop_max_step_px + (8.0 if abs(pan_err) < 64 and abs(tilt_err) < 64 else 0.0)
                     cx = smooth_center[0] + alpha * pan_err
                     cy = smooth_center[1] + alpha * tilt_err
                     if abs(pan_err) < crop_snap_deadband_px and abs(tilt_err) < crop_snap_deadband_px:
                         cx, cy = tx, ty
-                    smooth_center = _apply_center_slew_limit(smooth_center, (cx, cy), max_step=crop_max_step_px)
+                    smooth_center = _apply_center_slew_limit(smooth_center, (cx, cy), max_step=local_max_step)
                     pan_speed = pan_err * alpha
                     tilt_speed = tilt_err * alpha
 
-                target_zoom = _estimate_zoom_for_track(frame.shape, soft_track, handoff_state.zoom, max_zoom=2.4)
+                target_zoom = _estimate_zoom_for_track(frame.shape, soft_track, handoff_state.zoom, max_zoom=3.2)
                 handoff_state.zoom = target_zoom
                 smooth_zoom = target_zoom
 

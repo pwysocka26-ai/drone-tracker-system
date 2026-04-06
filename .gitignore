@@ -20,3 +20,50 @@ scripts/
 *.bak
 *.backup
 *.zip
+# local notes / scratch
+README_PODMIANA.txt
+app_dump.txt
+select_result.txt
+
+# helper scripts
+*.ps1
+
+# artifacts / outputs
+artifacts/
+tracker_shots_*/
+tracker_analysis_*.mp4
+video.mp4
+
+# model files
+yolov8s.pt
+
+# backups
+*.bak
+*.bak_*
+*.backup
+*.hotfix_backup
+*.patch_v2_sticky_backup
+*.single_primary_backup
+*.v3_stable_narrow_backup
+
+# temp python helpers
+add_*.py
+fix_*.py
+patch_*.py
+tmp*.py
+test.py
+video_test.py
+
+# local tools
+tools/
+scripts/
+
+# python cache
+__pycache__/
+*/__pycache__/
+src/core/__pycache__/
+src/sim/__pycache__/
+
+# generated zips
+*.zip
+src.zip

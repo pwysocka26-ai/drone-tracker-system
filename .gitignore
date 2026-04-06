@@ -1,19 +1,22 @@
-# backups
-*.bak*
-*_backup*
-*.old
+# eksperymenty / śmieci
+fix_*.py
+patch_*.py
+tmp_*.py
+*_dump.txt
+select_result.txt
 
-# artifacts
-artifacts/
-tracker_shots_*/
+# testy
+test.py
+video_test.py
 
-# scripts
-*.ps1
+# media
+*.mp4
 
-# temp
+# lokalne narzędzia
+tools/
+scripts/
+
+# backupy
+*.bak
+*.backup
 *.zip
-*.jsonl
-
-# python cache
-__pycache__/
-*.pyc

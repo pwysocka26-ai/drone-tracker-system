@@ -64,6 +64,12 @@ class NarrowTracker:
         self.stable_count = 0
         self.last_error_norm = None
         self.jump_limited = False
+        self.last_good_bbox = None
+        self.last_good_center = None
+        self.bbox_smooth = None
+        self.last_good_bbox = None
+        self.last_good_center = None
+        self.bbox_smooth = None
 
     def reset(self):
         self.kalman.reset()
@@ -121,14 +127,14 @@ class NarrowTracker:
 
     def _step_params(self, state):
         if state == self.STATE_ACQUIRE:
-            return 0.52, 118.0, 2.0, 0.38
+            return 0.48, 108.0, 2.0, 0.42
         if state == self.STATE_STABILIZE:
-            return 0.42, 92.0, 2.0, 0.46
+            return 0.38, 84.0, 2.0, 0.52
         if state == self.STATE_LOCKED:
-            return 0.36, 74.0, 1.5, 0.54
+            return 0.28, 56.0, 1.5, 0.68
         if state == self.STATE_HOLD:
-            return 0.20, 30.0, 3.0, 0.62
-        return 0.0, 0.0, 3.0, 0.70
+            return 0.10, 12.0, 4.0, 0.82
+        return 0.0, 0.0, 3.0, 0.76
 
     def _step_towards(self, desired, active, state):
         self.jump_limited = False
@@ -172,6 +178,53 @@ class NarrowTracker:
         )
         return self.smooth_center
 
+    def _smooth_bbox(self, bbox, state):
+        if bbox is None:
+            return self.bbox_smooth
+        x1, y1, x2, y2 = [float(v) for v in bbox]
+        cx = 0.5 * (x1 + x2)
+        cy = 0.5 * (y1 + y2)
+        w = max(1.0, x2 - x1)
+        h = max(1.0, y2 - y1)
+
+        if self.bbox_smooth is None:
+            self.bbox_smooth = (cx, cy, w, h)
+            return self.bbox_smooth
+
+        pcx, pcy, pw, ph = self.bbox_smooth
+        diag = max(8.0, float((pw * pw + ph * ph) ** 0.5))
+        if state == self.STATE_ACQUIRE:
+            a_c, a_s = 0.42, 0.36
+            max_jump_c = max(34.0, diag * 0.55)
+            max_jump_s = max(22.0, 0.28 * max(pw, ph))
+        elif state == self.STATE_STABILIZE:
+            a_c, a_s = 0.58, 0.48
+            max_jump_c = max(20.0, diag * 0.34)
+            max_jump_s = max(14.0, 0.18 * max(pw, ph))
+        else:
+            a_c, a_s = 0.74, 0.64
+            max_jump_c = max(12.0, diag * 0.20)
+            max_jump_s = max(8.0, 0.12 * max(pw, ph))
+
+        dcx = max(-max_jump_c, min(max_jump_c, cx - pcx))
+        dcy = max(-max_jump_c, min(max_jump_c, cy - pcy))
+        dw = max(-max_jump_s, min(max_jump_s, w - pw))
+        dh = max(-max_jump_s, min(max_jump_s, h - ph))
+
+        scx = pcx * a_c + (pcx + dcx) * (1.0 - a_c)
+        scy = pcy * a_c + (pcy + dcy) * (1.0 - a_c)
+        sw = pw * a_s + (pw + dw) * (1.0 - a_s)
+        sh = ph * a_s + (ph + dh) * (1.0 - a_s)
+
+        self.bbox_smooth = (scx, scy, sw, sh)
+        return self.bbox_smooth
+
+    def get_display_bbox(self):
+        if self.bbox_smooth is None:
+            return None
+        cx, cy, w, h = self.bbox_smooth
+        return (cx - 0.5 * w, cy - 0.5 * h, cx + 0.5 * w, cy + 0.5 * h)
+
     def update(self, frame, active_track):
         predicted_center = self.kalman.predict()
         desired_center = None
@@ -181,9 +234,16 @@ class NarrowTracker:
             desired_center = corrected
             predicted_center = corrected
             self.hold_count = 0
+            self.last_good_center = corrected
         else:
             self.hold_count += 1
-            desired_center = predicted_center
+            if predicted_center is not None and self.last_good_center is not None:
+                desired_center = (
+                    0.80 * float(self.last_good_center[0]) + 0.20 * float(predicted_center[0]),
+                    0.80 * float(self.last_good_center[1]) + 0.20 * float(predicted_center[1]),
+                )
+            else:
+                desired_center = predicted_center or self.last_good_center
 
         error_norm = None
         if desired_center is not None and self.smooth_center is not None:
@@ -198,6 +258,8 @@ class NarrowTracker:
             return None, None, self.smooth_zoom, self.hold_count, 0.0, 0.0, self.state, self.jump_limited
 
         if active_track is not None:
+            self._smooth_bbox(active_track.bbox_xyxy, self.state)
+            self.last_good_bbox = self.get_display_bbox()
             desired_zoom = self.desired_zoom(frame, active_track, self.state)
             if desired_zoom > self.smooth_zoom:
                 alpha = 0.34 if self.state == self.STATE_ACQUIRE else 0.24

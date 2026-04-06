@@ -13,18 +13,23 @@ class TargetManager:
         reacquire_radius_auto=135.0,
         reacquire_radius_manual=220.0,
         sticky_frames=22,
-        switch_margin=0.36,
-        switch_dwell=6,
-        switch_cooldown=7,
+        switch_margin=0.48,
+        switch_dwell=7,
+        switch_cooldown=10,
         switch_persist=2,
         max_select_missed=2,
         min_start_conf=0.10,
         min_start_hits=2,
         min_confirmed_conf=0.10,
         min_hold_frames=5,
-        predicted_dist_px=95.0,
+        predicted_dist_px=82.0,
         raw_id_bonus=1.8,
         current_target_bonus=2.6,
+        raw_id_lock_bonus=3.8,
+        takeoff_switch_margin=0.95,
+        takeoff_switch_ratio=1.28,
+        raw_id_match_radius_px=72.0,
+        reacquire_prefer_same_raw_id=True,
     ):
         self.selected_id = None
         self.manual_lock = False
@@ -44,6 +49,11 @@ class TargetManager:
         self.predicted_dist_px = float(predicted_dist_px)
         self.raw_id_bonus = float(raw_id_bonus)
         self.current_target_bonus = float(current_target_bonus)
+        self.raw_id_lock_bonus = float(raw_id_lock_bonus)
+        self.takeoff_switch_margin = float(takeoff_switch_margin)
+        self.takeoff_switch_ratio = float(takeoff_switch_ratio)
+        self.raw_id_match_radius_px = float(raw_id_match_radius_px)
+        self.reacquire_prefer_same_raw_id = bool(reacquire_prefer_same_raw_id)
 
         self.lock_age = 9999
         self.frame_id = 0
@@ -149,13 +159,59 @@ class TargetManager:
         anchor = predicted_center or self.last_selected_center
         if anchor is not None:
             dist = self._distance(tuple(tr.center_xy), anchor)
-            score += max(-2.3, 1.2 - dist / max(1.0, self.predicted_dist_px))
+            score += max(-3.2, 1.4 - dist / max(1.0, self.predicted_dist_px))
+            if dist > (self.predicted_dist_px * 1.35):
+                score -= 1.2
 
         if self.last_selected_raw_id is not None and raw_id is not None:
             if int(raw_id) == int(self.last_selected_raw_id):
                 score += self.raw_id_bonus
+                if anchor is not None and self._distance(tuple(tr.center_xy), anchor) <= self.raw_id_match_radius_px:
+                    score += self.raw_id_lock_bonus
 
         return score
+
+
+    def _same_raw_id(self, tr, raw_id) -> bool:
+        rid = getattr(tr, "raw_id", None)
+        return rid is not None and raw_id is not None and int(rid) == int(raw_id)
+
+    def _same_raw_id_near_anchor(self, tr, anchor) -> bool:
+        if not self._same_raw_id(tr, self.last_selected_raw_id):
+            return False
+        if anchor is None:
+            return True
+        return self._distance(tuple(tr.center_xy), anchor) <= self.raw_id_match_radius_px
+
+    def _switch_guard(self, active, best, current_score, best_score, anchor) -> bool:
+        if active is None or best is None:
+            return False
+        active_conf = float(getattr(active, "confidence", 0.0) or 0.0)
+        best_conf = float(getattr(best, "confidence", 0.0) or 0.0)
+        active_hits = int(getattr(active, "hits", 0) or 0)
+        best_hits = int(getattr(best, "hits", 0) or 0)
+        active_missed = int(getattr(active, "missed_frames", 0) or 0)
+        best_missed = int(getattr(best, "missed_frames", 0) or 0)
+
+        best_same_raw = self._same_raw_id_near_anchor(best, anchor)
+        active_same_raw = self._same_raw_id(active, self.last_selected_raw_id)
+
+        if best_same_raw and not active_same_raw:
+            return True
+
+        if active_same_raw and not best_same_raw and active_missed <= 1 and active_hits >= 3:
+            margin = best_score - current_score
+            ratio = best_score / max(0.01, current_score)
+            if margin < self.takeoff_switch_margin and ratio < self.takeoff_switch_ratio and best_conf < (active_conf + 0.18):
+                return False
+
+        if best_missed > 0 and active_missed == 0 and best_conf < (active_conf + 0.22):
+            return False
+
+        if best_hits < active_hits and best_conf < (active_conf + 0.12):
+            return False
+
+        return True
 
     def update(self, tracks, predicted_center, frame_shape):
         self.frame_id += 1
@@ -181,9 +237,18 @@ class TargetManager:
             return self.selected_id
 
         anchor = predicted_center or self.last_selected_center
+        if anchor is not None and self.last_selected_center is not None:
+            if self._distance(anchor, self.last_selected_center) > max(self.reacquire_radius_auto * 1.15, self.raw_id_match_radius_px * 2.0):
+                self.last_selected_raw_id = None
 
         if self.selected_id is None:
-            best = max(candidates, key=lambda tr: self._score(tr, frame_shape, predicted_center))
+            same_raw_candidates = []
+            if self.reacquire_prefer_same_raw_id and self.last_selected_raw_id is not None:
+                for tr in candidates:
+                    if self._same_raw_id_near_anchor(tr, anchor):
+                        same_raw_candidates.append(tr)
+            pool = same_raw_candidates if same_raw_candidates else candidates
+            best = max(pool, key=lambda tr: self._score(tr, frame_shape, predicted_center))
             if self.pending_id == int(best.track_id):
                 self.pending_count += 1
             else:
@@ -210,7 +275,12 @@ class TargetManager:
                     close.append(tr)
 
             if close:
-                best = max(close, key=lambda tr: self._score(tr, frame_shape, predicted_center))
+                if self.reacquire_prefer_same_raw_id and self.last_selected_raw_id is not None:
+                    same_raw_close = [tr for tr in close if self._same_raw_id_near_anchor(tr, anchor)]
+                    pool = same_raw_close if same_raw_close else close
+                else:
+                    pool = close
+                best = max(pool, key=lambda tr: self._score(tr, frame_shape, predicted_center))
                 self.selected_id = int(best.track_id)
                 self.lock_age = 0
                 self.last_switch_frame = self.frame_id
@@ -255,6 +325,7 @@ class TargetManager:
             and best_score > (current_score * 1.10)
             and self.lock_age >= self.min_hold_frames
             and (self.frame_id - self.last_switch_frame) >= self.switch_cooldown
+            and self._switch_guard(active, best, current_score, best_score, anchor)
         )
 
         if need_switch:

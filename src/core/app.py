@@ -396,6 +396,7 @@ def run_app(config):
         current_target_bonus=float(tracker_cfg.get('current_target_bonus', 2.6)),
     )
     narrow_tracker = NarrowTracker(hold_frames=int(narrow_cfg.get('hold_frames', 80)))
+    narrow_tracker.last_zoom = None
     lock_pipeline = LockPipeline(config)
     display_box_smoother = DisplayBoxSmoother(
         center_alpha=float(control_cfg.get('display_center_alpha', 0.70)),
@@ -433,25 +434,41 @@ def run_app(config):
         nonlocal recording, video_writer
         recording = False
         if video_writer is not None:
-            video_writer.release()
-            video_writer = None
+            try:
+                video_writer.release()
+            except Exception as exc:
+                print(f'REC STOP WARN: {exc}')
+            finally:
+                video_writer = None
         print('REC STOP')
 
     def start_telemetry():
         nonlocal telemetry_enabled, telemetry
+        if telemetry is not None:
+            try:
+                telemetry.close()
+            except Exception:
+                pass
+            telemetry = None
         stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         run_name = f'run_{stamp}'
         telemetry = TelemetryLogger(run_name=run_name, fps=record_fps)
         telemetry_enabled = True
-        print(f'METRICS START: {telemetry.path}')
+        path = getattr(telemetry, 'path', '(unknown)')
+        print(f'METRICS START: {path}')
 
     def stop_telemetry():
         nonlocal telemetry_enabled, telemetry
         telemetry_enabled = False
         if telemetry is not None:
-            print(f'METRICS STOP: {telemetry.path}')
-            telemetry.close()
-            telemetry = None
+            path = getattr(telemetry, 'path', '(unknown)')
+            print(f'METRICS STOP: {path}')
+            try:
+                telemetry.close()
+            except Exception as exc:
+                print(f'METRICS STOP WARN: {exc}')
+            finally:
+                telemetry = None
 
     screenshot_dir = None
 
@@ -610,7 +627,8 @@ def run_app(config):
 
             if smooth_center is not None:
                 narrow_output, narrow_crop_rect = crop_to_16_9(frame, smooth_center, smooth_zoom, (780, 360), return_meta=True)
-                label = f'TARGET ID {target_manager.selected_id}' if soft_track is not None else f'TRACK HOLD ID {target_manager.selected_id}'
+                is_proxy_track = bool(getattr(steering_track, 'is_proxy', False)) if steering_track is not None else False
+                label = f'TRACK HOLD ID {target_manager.selected_id}' if is_proxy_track else (f'TARGET ID {target_manager.selected_id}' if soft_track is not None else f'TRACK HOLD ID {target_manager.selected_id}')
                 real_pan_err = 0.0
                 real_tilt_err = 0.0
                 center_lock = False
@@ -623,7 +641,19 @@ def run_app(config):
                     target_ny = (steering_track.center_xy[1] - cy1) * 360.0 / crop_h
                     real_pan_err = target_nx - 390.0
                     real_tilt_err = target_ny - 180.0
-                    center_lock = abs(real_pan_err) < 14 and abs(real_tilt_err) < 14
+                    radial_error = float((real_pan_err * real_pan_err + real_tilt_err * real_tilt_err) ** 0.5)
+                    dynamic_lock_radius = 22.0 if (is_proxy_track or narrow_state == 'HOLD' or pipeline_state in ('REACQUIRE', 'HOLD')) else 16.0
+                    center_lock = (
+                        radial_error <= dynamic_lock_radius
+                        and (
+                            local_lock_score >= 0.72
+                            or lock_confidence >= 0.68
+                            or is_proxy_track
+                            or hold_count > 0
+                        )
+                    )
+                else:
+                    radial_error = 0.0
                 radial_error = float((real_pan_err * real_pan_err + real_tilt_err * real_tilt_err) ** 0.5)
 
                 cv2.putText(narrow_output, label, (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
@@ -637,9 +667,12 @@ def run_app(config):
                 center_lock_text = 'CENTER LOCK ON' if (center_lock and steering_track is not None) else 'CENTER LOCK OFF'
                 cv2.putText(narrow_output, center_lock_text, (20, 330), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 255), 2)
 
-                if display_bbox is not None and display_center is not None:
-                    disp_id = soft_track.track_id if soft_track is not None else (target_manager.selected_id or '?')
-                    narrow_output = draw_target_on_narrow(narrow_output, narrow_crop_rect, display_bbox, display_center, disp_id)
+                overlay_track = soft_track if soft_track is not None else steering_track
+                overlay_bbox = display_bbox if (display_bbox is not None and not bool(getattr(overlay_track, 'is_proxy', False))) else (getattr(overlay_track, 'bbox_xyxy', None) if overlay_track is not None else None)
+                overlay_center = display_center if (display_center is not None and not bool(getattr(overlay_track, 'is_proxy', False))) else (getattr(overlay_track, 'center_xy', None) if overlay_track is not None else None)
+                if overlay_bbox is not None and overlay_center is not None:
+                    disp_id = getattr(overlay_track, 'track_id', None) if overlay_track is not None else (target_manager.selected_id or '?')
+                    narrow_output = draw_target_on_narrow(narrow_output, narrow_crop_rect, overlay_bbox, overlay_center, disp_id)
 
                 cross_color = (0, 255, 0) if center_lock else (0, 255, 255)
                 cv2.line(narrow_output, (390, 0), (390, 360), cross_color, 1)
@@ -736,7 +769,21 @@ def run_app(config):
                     transfer_reason=pipeline_out.get('transfer_reason'),
                     ownership_reject_reason=pipeline_out.get('ownership_reject_reason'),
                     jump_risk=pipeline_out.get('jump_risk'),
+                    active_track_id=(soft_track.track_id if soft_track is not None else None),
+                    active_track_missed=(soft_track.missed_frames if soft_track is not None else None),
+                    active_track_conf=(soft_track.confidence if soft_track is not None else None),
+                    center_delta_px=(float(((smooth_center[0] - predicted_center[0]) ** 2 + (smooth_center[1] - predicted_center[1]) ** 2) ** 0.5) if (smooth_center is not None and predicted_center is not None) else None),
+                    zoom_delta=(
+                        float(smooth_zoom - last_zoom_val)
+                        if (
+                            smooth_zoom is not None
+                            and (last_zoom_val := getattr(narrow_tracker, 'last_zoom', None)) is not None
+                        )
+                        else None
+                    ),
                 )
+                if smooth_zoom is not None:
+                    narrow_tracker.last_zoom = float(smooth_zoom)
 
             cv2.imshow(window_name, dashboard)
 
@@ -744,9 +791,29 @@ def run_app(config):
             if key in (27, ord('q')):
                 break
             elif key in (ord('r'), ord('R')):
-                stop_recording() if recording else start_recording()
+                try:
+                    stop_recording() if recording else start_recording()
+                except Exception as exc:
+                    recording = False
+                    if video_writer is not None:
+                        try:
+                            video_writer.release()
+                        except Exception:
+                            pass
+                        video_writer = None
+                    print(f'REC TOGGLE ERROR: {exc}')
             elif key in (ord('t'), ord('T')):
-                stop_telemetry() if telemetry_enabled else start_telemetry()
+                try:
+                    stop_telemetry() if telemetry_enabled else start_telemetry()
+                except Exception as exc:
+                    telemetry_enabled = False
+                    if telemetry is not None:
+                        try:
+                            telemetry.close()
+                        except Exception:
+                            pass
+                        telemetry = None
+                    print(f'METRICS TOGGLE ERROR: {exc}')
             elif key in (ord('s'), ord('S')):
                 save_screenshot(dashboard, wide_debug, narrow_output)
             elif key == ord('0'):

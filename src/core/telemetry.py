@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 from pathlib import Path
@@ -78,9 +78,14 @@ class TelemetryLogger:
         transfer_reason: Optional[str] = None,
         ownership_reject_reason: Optional[str] = None,
         jump_risk: Optional[float] = None,
+        active_track_id: Optional[int] = None,
+        active_track_missed: Optional[int] = None,
+        active_track_conf: Optional[float] = None,
+        center_delta_px: Optional[float] = None,
+        zoom_delta: Optional[float] = None,
+        **_: Any,
     ) -> None:
         tracks = list(tracks or [])
-        active_track_id = getattr(active_track, 'track_id', None) if active_track is not None else None
 
         items: list[Dict[str, Any]] = []
         for tr in tracks:
@@ -103,19 +108,24 @@ class TelemetryLogger:
                 }
             )
 
-        center_delta_px = None
+        computed_center_delta_px = None
         if narrow_center is not None and self._prev_center is not None:
             dx = float(narrow_center[0]) - float(self._prev_center[0])
             dy = float(narrow_center[1]) - float(self._prev_center[1])
-            center_delta_px = float((dx * dx + dy * dy) ** 0.5)
+            computed_center_delta_px = float((dx * dx + dy * dy) ** 0.5)
         if narrow_center is not None:
             self._prev_center = (float(narrow_center[0]), float(narrow_center[1]))
 
-        zoom_delta = None
+        computed_zoom_delta = None
         if zoom is not None and self._prev_zoom is not None:
-            zoom_delta = float(zoom) - float(self._prev_zoom)
+            computed_zoom_delta = float(zoom) - float(self._prev_zoom)
         if zoom is not None:
             self._prev_zoom = float(zoom)
+
+        if center_delta_px is None:
+            center_delta_px = computed_center_delta_px
+        if zoom_delta is None:
+            zoom_delta = computed_zoom_delta
 
         rec: Dict[str, Any] = {
             'frame_idx': int(frame_idx),
@@ -123,10 +133,22 @@ class TelemetryLogger:
             'mode': mode,
             'multi_tracks': len(tracks),
             'selected_id': selected_id,
-            'active_track_id': active_track_id,
+            'active_track_id': (
+                active_track_id
+                if active_track_id is not None
+                else (getattr(active_track, 'track_id', None) if active_track is not None else None)
+            ),
             'steering_target_id': steering_target_id,
-            'active_track_missed': getattr(active_track, 'missed_frames', None) if active_track is not None else None,
-            'active_track_conf': _safe_number(getattr(active_track, 'confidence', None)) if active_track is not None else None,
+            'active_track_missed': (
+                active_track_missed
+                if active_track_missed is not None
+                else (getattr(active_track, 'missed_frames', None) if active_track is not None else None)
+            ),
+            'active_track_conf': _safe_number(
+                active_track_conf
+                if active_track_conf is not None
+                else (getattr(active_track, 'confidence', None) if active_track is not None else None)
+            ),
             'narrow_center': list(narrow_center) if narrow_center is not None else None,
             'center_lock': bool(center_lock),
             'lock_state': lock_state,

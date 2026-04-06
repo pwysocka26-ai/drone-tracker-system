@@ -12,6 +12,10 @@ RAW_ID_BONUS = 0.60
 BBOX_ALPHA = 0.72
 CENTER_ALPHA = 0.70
 SIZE_JUMP_LIMIT = 1.35
+DUPLICATE_IOU = 0.55
+DUPLICATE_CENTER_SCALE = 0.40
+SPAWN_GUARD_IOU = 0.22
+SPAWN_GUARD_CENTER_SCALE = 0.55
 
 
 @dataclass
@@ -103,8 +107,10 @@ class MultiTargetTracker:
             self._mark_track_missed(tr)
 
         for det_idx in unmatched_dets:
-            self._tracks.append(self._spawn_track(dets[det_idx]))
+            if self._should_spawn_track(dets[det_idx]):
+                self._tracks.append(self._spawn_track(dets[det_idx]))
 
+        self._tracks = self._deduplicate_tracks(self._tracks)
         self._tracks = [
             tr for tr in self._tracks if tr.missed_frames <= self.max_missed_frames
         ]
@@ -240,6 +246,54 @@ class MultiTargetTracker:
         unmatched_dets = [i for i in range(len(detections)) if i not in used_dets]
 
         return matches, unmatched_tracks, unmatched_dets
+
+
+    def _track_strength(self, tr: MultiTrackState) -> float:
+        return (
+            2.5 * (1.0 if tr.is_confirmed else 0.0)
+            + 0.18 * float(tr.hits)
+            + 0.90 * float(tr.confidence)
+            - 0.45 * float(tr.missed_frames)
+            + 0.03 * float(tr.age)
+        )
+
+    def _center_proximity_limit(self, bbox_a: BBox, bbox_b: BBox) -> float:
+        da = max(8.0, math.hypot(*self._bbox_size(bbox_a)))
+        db = max(8.0, math.hypot(*self._bbox_size(bbox_b)))
+        return max(10.0, DUPLICATE_CENTER_SCALE * min(da, db))
+
+    def _tracks_are_duplicates(self, a: MultiTrackState, b: MultiTrackState) -> bool:
+        iou = self._iou(a.bbox_xyxy, b.bbox_xyxy)
+        dist = self._distance(a.center_xy, b.center_xy)
+        close = dist <= self._center_proximity_limit(a.bbox_xyxy, b.bbox_xyxy)
+        same_raw = a.raw_id is not None and b.raw_id is not None and int(a.raw_id) == int(b.raw_id)
+        return iou >= DUPLICATE_IOU or (same_raw and close)
+
+    def _deduplicate_tracks(self, tracks: Sequence[MultiTrackState]) -> List[MultiTrackState]:
+        survivors: List[MultiTrackState] = []
+        for tr in sorted(tracks, key=self._track_strength, reverse=True):
+            duplicate_of_existing = False
+            for kept in survivors:
+                if self._tracks_are_duplicates(tr, kept):
+                    duplicate_of_existing = True
+                    break
+            if not duplicate_of_existing:
+                survivors.append(tr)
+        return survivors
+
+    def _should_spawn_track(self, det: MultiTrackState) -> bool:
+        for tr in self._tracks:
+            if tr.missed_frames > max(1, self.confirm_hits):
+                continue
+            iou = self._iou(tr.bbox_xyxy, det.bbox_xyxy)
+            diag = max(8.0, math.hypot(*self._bbox_size(tr.bbox_xyxy)))
+            dist = self._distance(tr.center_xy, det.center_xy)
+            same_raw = tr.raw_id is not None and det.raw_id is not None and int(tr.raw_id) == int(det.raw_id)
+            if iou >= SPAWN_GUARD_IOU:
+                return False
+            if same_raw and dist <= max(12.0, SPAWN_GUARD_CENTER_SCALE * diag):
+                return False
+        return True
 
     def _smooth_bbox(self, old_bbox: BBox, new_bbox: BBox) -> BBox:
         ox1, oy1, ox2, oy2 = old_bbox

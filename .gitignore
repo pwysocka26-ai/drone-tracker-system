@@ -1,31 +1,19 @@
-# cache
-__pycache__/
-*.pyc
-src/**/__pycache__/
-sim/**/__pycache__/
+# backups
+*.bak*
+*_backup*
+*.old
 
-# tmp / eksperymenty
-tmp*.py
-fix_*.py
-patch_*.py
-add_*.py
-
-# backupi
-*.bak
-*.bak2
-
-# dumpy / wyniki pomocnicze
-*_dump.txt
-select_result.txt
-
-# nagrania / shoty
-*.mp4
+# artifacts
+artifacts/
 tracker_shots_*/
 
-# lokalne testy
-test_env/
+# scripts
+*.ps1
 
-# system
-.DS_Store
-Thumbs.db
-*.pt
+# temp
+*.zip
+*.jsonl
+
+# python cache
+__pycache__/
+*.pyc

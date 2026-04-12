@@ -7,6 +7,11 @@ class SimpleKalman2D:
         self.kf = cv2.KalmanFilter(4, 2)
         self.kf.measurementMatrix = np.array(
             [[1, 0, 0, 0],
+             [0, 1, 0, 1 * 0]],
+            np.float32,
+        )
+        self.kf.measurementMatrix = np.array(
+            [[1, 0, 0, 0],
              [0, 1, 0, 0]],
             np.float32,
         )
@@ -53,6 +58,10 @@ class NarrowTracker:
         self.hold_frames = int(hold_frames)
         self.last_pan_speed = 0.0
         self.last_tilt_speed = 0.0
+        self.degraded_count = 0
+        self.large_target_count = 0
+        self.last_good_center = None
+        self.last_good_zoom = 2.2
 
     def reset(self):
         self.kalman.reset()
@@ -61,6 +70,10 @@ class NarrowTracker:
         self.hold_count = 0
         self.last_pan_speed = 0.0
         self.last_tilt_speed = 0.0
+        self.degraded_count = 0
+        self.large_target_count = 0
+        self.last_good_center = None
+        self.last_good_zoom = 2.2
 
     def desired_zoom(self, frame, track):
         h, w = frame.shape[:2]
@@ -69,11 +82,18 @@ class NarrowTracker:
         th = max(1.0, y2 - y1)
         rel = max(tw / w, th / h)
 
-        # mały obiekt -> zoom in, duży -> zoom out
-        z = 0.060 / max(rel, 0.010)
-        return float(np.clip(z, 1.8, 4.2))
+        if rel > 0.23:
+            z = 1.65
+        elif rel > 0.16:
+            z = 1.85
+        elif rel > 0.10:
+            z = 2.10
+        else:
+            z = 0.060 / max(rel, 0.010)
 
-    def _step_towards(self, desired, active):
+        return float(np.clip(z, 1.55, 4.0))
+
+    def _step_towards(self, desired, active, degraded=False):
         if desired is None:
             self.last_pan_speed = 0.0
             self.last_tilt_speed = 0.0
@@ -88,21 +108,25 @@ class NarrowTracker:
         ex = desired[0] - self.smooth_center[0]
         ey = desired[1] - self.smooth_center[1]
 
-        # dead zone: blisko środka -> nie szarp
-        if abs(ex) < 4:
+        dead_zone = 6 if degraded else 4
+        if abs(ex) < dead_zone:
             ex = 0.0
-        if abs(ey) < 4:
+        if abs(ey) < dead_zone:
             ey = 0.0
 
-        kp = 0.28 if active else 0.18
-        max_step = 65.0 if active else 32.0
+        if active:
+            kp = 0.22 if degraded else 0.28
+            max_step = 42.0 if degraded else 60.0
+        else:
+            kp = 0.10
+            max_step = 20.0
 
         pan_speed = float(np.clip(ex * kp, -max_step, max_step))
         tilt_speed = float(np.clip(ey * kp, -max_step, max_step))
 
-        # lekkie wygładzenie prędkości
-        pan_speed = 0.70 * self.last_pan_speed + 0.30 * pan_speed
-        tilt_speed = 0.70 * self.last_tilt_speed + 0.30 * tilt_speed
+        smooth_alpha = 0.82 if degraded else 0.70
+        pan_speed = smooth_alpha * self.last_pan_speed + (1.0 - smooth_alpha) * pan_speed
+        tilt_speed = smooth_alpha * self.last_tilt_speed + (1.0 - smooth_alpha) * tilt_speed
 
         self.last_pan_speed = pan_speed
         self.last_tilt_speed = tilt_speed
@@ -118,25 +142,54 @@ class NarrowTracker:
         desired_center = None
 
         if active_track is not None:
+            x1, y1, x2, y2 = active_track.bbox_xyxy
+            bw = max(1.0, x2 - x1)
+            bh = max(1.0, y2 - y1)
+            h, w = frame.shape[:2]
+            rel = max(bw / max(1.0, w), bh / max(1.0, h))
+            missed = int(getattr(active_track, "missed_frames", 0) or 0)
+            conf = float(getattr(active_track, "confidence", 0.0) or 0.0)
+
+            large_target = rel > 0.12
+            degraded = (missed >= 1) or (conf < 0.18)
+
             corrected = self.kalman.correct(active_track.center_xy[0], active_track.center_xy[1])
             desired_center = corrected
             predicted_center = corrected
+
             self.hold_count = 0
+            self.degraded_count = self.degraded_count + 1 if degraded else 0
+            self.large_target_count = self.large_target_count + 1 if large_target else 0
 
             desired_zoom = self.desired_zoom(frame, active_track)
-            self.smooth_zoom = 0.90 * self.smooth_zoom + 0.10 * desired_zoom
+            zoom_alpha = 0.94 if large_target else (0.92 if degraded else 0.88)
+            self.smooth_zoom = zoom_alpha * self.smooth_zoom + (1.0 - zoom_alpha) * desired_zoom
+
+            smooth_center = self._step_towards(desired_center, True, degraded=degraded)
+            if smooth_center is not None:
+                self.last_good_center = smooth_center
+                self.last_good_zoom = self.smooth_zoom
+
         else:
             self.hold_count += 1
-            desired_center = predicted_center
+            self.degraded_count += 1
+            desired_center = predicted_center if predicted_center is not None else self.last_good_center
 
-            if self.hold_count > self.hold_frames:
+            soft_hold_frames = int(self.hold_frames * 1.35)
+            if self.hold_count > soft_hold_frames:
                 self.reset()
                 return None, None, self.smooth_zoom, self.hold_count, 0.0, 0.0
 
-            # podczas HOLD zoom nie powinien skakać
-            self.smooth_zoom = 0.97 * self.smooth_zoom + 0.03 * self.smooth_zoom
+            if desired_center is None and self.last_good_center is not None:
+                desired_center = self.last_good_center
 
-        smooth_center = self._step_towards(desired_center, active_track is not None)
+            if desired_center is not None:
+                smooth_center = self._step_towards(desired_center, False, degraded=True)
+            else:
+                smooth_center = self.smooth_center
+
+            target_zoom = self.last_good_zoom if self.last_good_zoom is not None else self.smooth_zoom
+            self.smooth_zoom = 0.985 * self.smooth_zoom + 0.015 * target_zoom
 
         return (
             predicted_center,

@@ -603,6 +603,20 @@ def run_app(config):
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(window_name, 1600, 900)
 
+    base_artifacts_dir = Path("artifacts")
+    runs_dir = base_artifacts_dir / "runs"
+    latest_dir = base_artifacts_dir / "latest"
+    runs_dir.mkdir(parents=True, exist_ok=True)
+    latest_dir.mkdir(parents=True, exist_ok=True)
+
+    run_id = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    run_dir = runs_dir / run_id
+    images_dir = run_dir / "images"
+    video_dir = run_dir / "video"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    images_dir.mkdir(parents=True, exist_ok=True)
+    video_dir.mkdir(parents=True, exist_ok=True)
+
     recording = False
     video_writer = None
     record_fps = 30.0
@@ -621,9 +635,8 @@ def run_app(config):
         nonlocal recording, video_writer
         if recording and video_writer is not None:
             return
-        stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        out_name = f'tracker_analysis_{stamp}.mp4'
-        video_writer = cv2.VideoWriter(out_name, cv2.VideoWriter_fourcc(*'mp4v'), record_fps, record_frame_size)
+        out_name = video_dir / "tracker_analysis.mp4"
+        video_writer = cv2.VideoWriter(str(out_name), cv2.VideoWriter_fourcc(*'mp4v'), record_fps, record_frame_size)
         if not video_writer.isOpened():
             print('REC ERROR: cannot open output file')
             video_writer = None
@@ -646,9 +659,7 @@ def run_app(config):
         nonlocal telemetry_enabled, telemetry
         if telemetry_enabled and telemetry is not None:
             return
-        stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        run_name = f'run_{stamp}'
-        telemetry = TelemetryLogger(run_name=run_name, fps=record_fps)
+        telemetry = TelemetryLogger(run_name=run_id, fps=record_fps, run_dir=run_dir)
         telemetry_enabled = True
         print(f'METRICS START: {telemetry.path}')
 
@@ -658,14 +669,19 @@ def run_app(config):
         try:
             reports = generate_run_reports(
                 telemetry_path=path_obj,
-                shot_dir=screenshot_dir,
-                output_dir=Path(path_obj).parent,
+                shot_dir=images_dir,
+                output_dir=run_dir,
                 fps=record_fps if record_fps > 0 else 30.0,
+                run_id=run_id,
+                latest_dir=latest_dir,
+                video_dir=video_dir,
             )
             print(f'RUN SUMMARY: {reports.summary_path}')
             print(f'METRICS CSV: {reports.metrics_path}')
             print(f'TIMELINE: {reports.timeline_path}')
             print(f'KEYFRAMES: {reports.keyframes_path}')
+            print(f'MANIFEST MD: {reports.manifest_md_path}')
+            print(f'MANIFEST JSON: {reports.manifest_json_path}')
         except Exception as exc:
             print(f'RUN REPORT ERROR: {exc}')
 
@@ -679,27 +695,15 @@ def run_app(config):
             telemetry = None
             generate_reports_if_possible(path_obj)
 
-    screenshot_dir = None
-
-    def ensure_screenshot_dir():
-        nonlocal screenshot_dir
-        if screenshot_dir is None:
-            stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            screenshot_dir = Path(f'tracker_shots_{stamp}')
-            screenshot_dir.mkdir(parents=True, exist_ok=True)
-            print(f'SHOT DIR: {screenshot_dir}')
-        return screenshot_dir
-
     def save_screenshot(dashboard, wide_frame=None, narrow_frame=None, tag=None):
-        shot_dir = ensure_screenshot_dir()
         stamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
         suffix = f'_{tag}' if tag else ''
-        dashboard_path = shot_dir / f'dashboard_{stamp}{suffix}.png'
+        dashboard_path = images_dir / f'dashboard_{stamp}{suffix}.png'
         cv2.imwrite(str(dashboard_path), dashboard)
         if wide_frame is not None:
-            cv2.imwrite(str(shot_dir / f'wide_{stamp}{suffix}.png'), wide_frame)
+            cv2.imwrite(str(images_dir / f'wide_{stamp}{suffix}.png'), wide_frame)
         if narrow_frame is not None:
-            cv2.imwrite(str(shot_dir / f'narrow_{stamp}{suffix}.png'), narrow_frame)
+            cv2.imwrite(str(images_dir / f'narrow_{stamp}{suffix}.png'), narrow_frame)
         print(f'SHOT SAVED: {dashboard_path}')
 
     def auto_capture_keyframe(tag, frame_idx, dashboard, wide_frame=None, narrow_frame=None):

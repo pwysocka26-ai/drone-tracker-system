@@ -38,12 +38,23 @@ def _sanitize_owner_missed(value: Any) -> Optional[int]:
 
 
 class TelemetryLogger:
-    def __init__(self, run_name: str, fps: float = 30.0, root: str = "artifacts/telemetry") -> None:
+    def __init__(
+        self,
+        run_name: str,
+        fps: float = 30.0,
+        root: str = "artifacts/runs",
+        run_dir: str | Path | None = None,
+    ) -> None:
         self.run_name = run_name
         self.fps = float(fps)
-        self.root = Path(root)
-        self.root.mkdir(parents=True, exist_ok=True)
-        self.path = self.root / f"{run_name}.jsonl"
+
+        if run_dir is not None:
+            self.run_dir = Path(run_dir)
+        else:
+            self.run_dir = Path(root) / run_name
+
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        self.path = self.run_dir / "telemetry.jsonl"
         self._fh = self.path.open("w", encoding="utf-8")
 
     def close(self) -> None:

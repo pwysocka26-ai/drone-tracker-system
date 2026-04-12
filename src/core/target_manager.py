@@ -29,6 +29,9 @@ class TargetManager:
         hard_keep_missed=1,
         hard_keep_conf=0.18,
         hard_switch_min_gain=1.10,
+        owner_switch_min_gap_px=22.0,
+        degraded_switch_persist=2,
+        healthy_switch_persist=4,
     ):
         self.selected_id = None
         self.manual_lock = False
@@ -52,6 +55,9 @@ class TargetManager:
         self.hard_keep_missed = int(hard_keep_missed)
         self.hard_keep_conf = float(hard_keep_conf)
         self.hard_switch_min_gain = float(hard_switch_min_gain)
+        self.owner_switch_min_gap_px = float(owner_switch_min_gap_px)
+        self.degraded_switch_persist = int(degraded_switch_persist)
+        self.healthy_switch_persist = int(healthy_switch_persist)
 
         self.lock_age = 9999
         self.frame_id = 0
@@ -170,7 +176,6 @@ class TargetManager:
             score += 1.8
         score -= missed * 1.8
 
-        # mocniejsza stickiness aktualnego celu
         if is_current:
             score += self.current_target_bonus
             if missed >= 2:
@@ -266,15 +271,22 @@ class TargetManager:
 
             if close:
                 best = max(close, key=lambda tr: self._score(tr, frame_shape, predicted_center))
-                self.selected_id = int(best.track_id)
-                self.lock_age = 0
-                self.last_switch_frame = self.frame_id
-                self.pending_id = None
-                self.pending_count = 0
-                self.last_selected_center = self._score_center(best)
-                rid = getattr(best, "raw_id", None)
-                if rid is not None:
-                    self.last_selected_raw_id = int(rid)
+                if self.pending_id == int(best.track_id):
+                    self.pending_count += 1
+                else:
+                    self.pending_id = int(best.track_id)
+                    self.pending_count = 1
+
+                if self.pending_count >= max(2, self.degraded_switch_persist):
+                    self.selected_id = int(best.track_id)
+                    self.lock_age = 0
+                    self.last_switch_frame = self.frame_id
+                    self.pending_id = None
+                    self.pending_count = 0
+                    self.last_selected_center = self._score_center(best)
+                    rid = getattr(best, "raw_id", None)
+                    if rid is not None:
+                        self.last_selected_raw_id = int(rid)
                 return self.selected_id
 
             self.lock_age += 1
@@ -314,20 +326,21 @@ class TargetManager:
             and current_conf >= self.hard_keep_conf
         )
 
-        # precyzyjny hard-keep: nie przełączaj zdrowego celu na podobnego sąsiada
-        if current_healthy:
-            dist_best_to_anchor = self._distance(best_center, anchor)
-            dist_current_to_anchor = self._distance(current_center, anchor)
-            score_gap = best_score - current_score
-            same_raw = (
-                self.last_selected_raw_id is not None
-                and getattr(best, "raw_id", None) is not None
-                and int(getattr(best, "raw_id")) == int(self.last_selected_raw_id)
-            )
+        score_gap = best_score - current_score
+        center_gap = self._distance(best_center, current_center)
+        dist_best_to_anchor = self._distance(best_center, anchor)
+        dist_current_to_anchor = self._distance(current_center, anchor)
+        same_raw = (
+            self.last_selected_raw_id is not None
+            and getattr(best, "raw_id", None) is not None
+            and int(getattr(best, "raw_id")) == int(self.last_selected_raw_id)
+        )
 
+        if current_healthy:
             if (
                 score_gap < self.hard_switch_min_gain
                 and dist_best_to_anchor >= dist_current_to_anchor * 0.92
+                and center_gap < max(self.owner_switch_min_gap_px, self.predicted_dist_px * 0.35)
                 and not same_raw
             ):
                 self.pending_id = None
@@ -338,10 +351,11 @@ class TargetManager:
         current_degraded = (current_missed >= 3) or (current_conf < 0.16)
         near_anchor = self._distance(best_center, anchor) <= min(self.reacquire_radius_auto, self.predicted_dist_px)
 
-        margin = self.switch_margin * (0.35 if current_degraded else 1.0)
-        ratio_ok = best_score > (current_score * (1.01 if current_degraded else 1.08))
-        dwell_ok = self.lock_age >= (1 if current_degraded else self.min_hold_frames)
-        cooldown_ok = (self.frame_id - self.last_switch_frame) >= (1 if current_degraded else self.switch_cooldown)
+        margin = self.switch_margin * (0.30 if current_degraded else 1.20)
+        ratio_ok = best_score > (current_score * (1.01 if current_degraded else 1.12))
+        dwell_ok = self.lock_age >= (2 if current_degraded else max(self.min_hold_frames, self.switch_dwell))
+        cooldown_ok = (self.frame_id - self.last_switch_frame) >= (2 if current_degraded else max(self.switch_cooldown, 8))
+        geometry_separation_ok = center_gap >= (8.0 if current_degraded else self.owner_switch_min_gap_px)
 
         need_switch = (
             near_anchor
@@ -349,6 +363,7 @@ class TargetManager:
             and ratio_ok
             and dwell_ok
             and cooldown_ok
+            and geometry_separation_ok
         )
 
         if need_switch:
@@ -358,7 +373,7 @@ class TargetManager:
                 self.pending_id = int(best.track_id)
                 self.pending_count = 1
 
-            required_persist = 1 if current_degraded else max(3, self.switch_persist)
+            required_persist = self.degraded_switch_persist if current_degraded else max(self.healthy_switch_persist, self.switch_persist)
             if self.pending_count >= required_persist:
                 self.selected_id = int(best.track_id)
                 self.lock_age = 0
@@ -369,7 +384,7 @@ class TargetManager:
                 rid = getattr(best, "raw_id", None)
                 if rid is not None:
                     self.last_selected_raw_id = int(rid)
-                self.freeze_to(self.selected_id, self.selection_freeze_frames)
+                self.freeze_to(self.selected_id, self.selection_freeze_frames + 4)
                 return self.selected_id
         else:
             self.pending_id = None

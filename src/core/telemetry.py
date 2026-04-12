@@ -23,6 +23,20 @@ def _bbox_metrics(bbox: Sequence[float]) -> tuple[float, float]:
     return area, aspect
 
 
+def _sanitize_owner_missed(value: Any) -> Optional[int]:
+    try:
+        if value is None:
+            return None
+        iv = int(value)
+        if iv < 0:
+            return None
+        if iv >= 9999:
+            return None
+        return iv
+    except Exception:
+        return None
+
+
 class TelemetryLogger:
     def __init__(self, run_name: str, fps: float = 30.0, root: str = "artifacts/telemetry") -> None:
         self.run_name = run_name
@@ -88,21 +102,21 @@ class TelemetryLogger:
             "drift_gate_open": bool(drift_gate_open),
             "tracks": items,
         }
+
         for key, value in (extra or {}).items():
-            if hasattr(value, "__dict__"):
-                try:
-                    value = dict(value.__dict__)
-                except Exception:
-                    pass
+            if key == "owner_missed_frames":
+                rec[key] = _sanitize_owner_missed(value)
+                continue
+
             if isinstance(value, (list, dict, str, bool, int, float)) or value is None:
                 rec[key] = value
             else:
                 rec[key] = _safe_number(value)
+
         self._fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
         self._fh.flush()
 
 
-# === V6 PIVOT telemetry helpers ===
 def telemetry_local_identity_state(ctx):
     tracker = getattr(ctx, "local_target_tracker", None)
     if tracker is None:

@@ -3,6 +3,8 @@ from __future__ import annotations
 import csv
 import json
 import re
+import shutil
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -14,6 +16,8 @@ class RunReportPaths:
     metrics_path: Path
     timeline_path: Path
     keyframes_path: Path
+    manifest_md_path: Path
+    manifest_json_path: Path
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -50,10 +54,19 @@ def _safe_bool(value: Any, default: bool = False) -> bool:
     return default
 
 
+def _md_scalar(value: Any) -> str:
+    if value is None:
+        return "none"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
 def _load_jsonl(path: Path) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     if not path.exists():
         return rows
+
     with path.open("r", encoding="utf-8") as handle:
         for line in handle:
             line = line.strip()
@@ -100,9 +113,11 @@ def _sanitize_owner_missed(value: Any) -> int | None:
 
 def _build_rows(rows: list[dict[str, Any]], fps: float) -> list[dict[str, Any]]:
     cooked: list[dict[str, Any]] = []
+
     for idx, row in enumerate(rows):
         frame_idx = _pick_frame_index(row, idx)
         ts_s = _pick_timestamp_s(row, frame_idx, fps)
+
         cooked.append(
             {
                 "raw": row,
@@ -111,33 +126,76 @@ def _build_rows(rows: list[dict[str, Any]], fps: float) -> list[dict[str, Any]]:
                 "wide_owner_id": row.get("wide_owner_id"),
                 "narrow_owner_id": row.get("narrow_owner_id"),
                 "pending_owner_id": row.get("pending_owner_id"),
-                "lock_state": str(row.get("lock_state", row.get("narrow_runtime", {}).get("lock_state", ""))),
+                "lock_state": str(
+                    row.get(
+                        "lock_state",
+                        row.get("narrow_runtime", {}).get("lock_state", ""),
+                    )
+                ),
                 "handoff_reason": str(
                     row.get(
                         "handoff_reject_reason",
-                        row.get("handoff_reason", row.get("handoff_decision", {}).get("reject_reason", "")),
+                        row.get(
+                            "handoff_reason",
+                            row.get("handoff_decision", {}).get("reject_reason", ""),
+                        ),
                     )
                 ),
                 "owner_reason": str(row.get("owner_reason", "")),
                 "wide_quality": _safe_float(
-                    row.get("wide_owner_quality", row.get("quality_score", row.get("handoff_decision", {}).get("quality_score")))
+                    row.get(
+                        "wide_owner_quality",
+                        row.get(
+                            "quality_score",
+                            row.get("handoff_decision", {}).get("quality_score"),
+                        ),
+                    )
                 ),
                 "geometry_score": _safe_float(
-                    row.get("geometry_score", row.get("handoff_decision", {}).get("geometry_score"))
+                    row.get(
+                        "geometry_score",
+                        row.get("handoff_decision", {}).get("geometry_score"),
+                    )
                 ),
-                "center_lock_on": _safe_bool(row.get("center_lock_on", row.get("center_lock"))),
+                "center_lock_on": _safe_bool(
+                    row.get("center_lock_on", row.get("center_lock"))
+                ),
                 "edge_active": _safe_bool(
-                    row.get("edge_limit_active", row.get("edge_active", row.get("narrow_runtime", {}).get("edge_limit_active")))
+                    row.get(
+                        "edge_limit_active",
+                        row.get(
+                            "edge_active",
+                            row.get("narrow_runtime", {}).get("edge_limit_active"),
+                        ),
+                    )
                 ),
-                "blind_streak": _safe_int(row.get("narrow_blind_streak", row.get("handoff_decision", {}).get("narrow_blind_streak"))),
+                "blind_streak": _safe_int(
+                    row.get(
+                        "narrow_blind_streak",
+                        row.get("handoff_decision", {}).get("narrow_blind_streak"),
+                    )
+                ),
                 "owner_missed": _sanitize_owner_missed(
-                    row.get("owner_missed_frames", row.get("active_track_missed", row.get("handoff_decision", {}).get("owner_missed_frames")))
+                    row.get(
+                        "owner_missed_frames",
+                        row.get(
+                            "active_track_missed",
+                            row.get("handoff_decision", {}).get("owner_missed_frames"),
+                        ),
+                    )
                 ),
                 "boxes": _safe_int(row.get("boxes", row.get("yolo_boxes"))),
-                "dets": _safe_int(row.get("dets", row.get("detections", row.get("yolo_dets")))),
-                "drop": _safe_int(row.get("drop", row.get("dropped", row.get("yolo_drop")))),
+                "dets": _safe_int(
+                    row.get("dets", row.get("detections", row.get("yolo_dets")))
+                ),
+                "drop": _safe_int(
+                    row.get("drop", row.get("dropped", row.get("yolo_drop")))
+                ),
+                "manual_lock": _safe_bool(row.get("manual_lock")),
+                "active_track_area": _safe_float(row.get("active_track_area")),
             }
         )
+
     return cooked
 
 
@@ -155,6 +213,7 @@ def _find_shots(shot_dir: Path | None) -> list[dict[str, Any]]:
         if match:
             micros = _safe_int(match.group(3), 0)
             tag = match.group(4) or ""
+
         shots.append(
             {
                 "path": path,
@@ -164,10 +223,16 @@ def _find_shots(shot_dir: Path | None) -> list[dict[str, Any]]:
                 "tag": tag,
             }
         )
+
     return shots
 
 
-def _closest_shot(frame_idx: int, rows_count: int, shots: list[dict[str, Any]], event_kind: str = "") -> str:
+def _closest_shot(
+    frame_idx: int,
+    rows_count: int,
+    shots: list[dict[str, Any]],
+    event_kind: str = "",
+) -> str:
     if not shots:
         return ""
 
@@ -183,8 +248,21 @@ def _closest_shot(frame_idx: int, rows_count: int, shots: list[dict[str, Any]], 
     return str(best["name"])
 
 
-def _emit_event(events: list[dict[str, Any]], frame_idx: int, ts_s: float, kind: str, description: str) -> None:
-    events.append({"frame_idx": frame_idx, "ts_s": ts_s, "kind": kind, "description": description})
+def _emit_event(
+    events: list[dict[str, Any]],
+    frame_idx: int,
+    ts_s: float,
+    kind: str,
+    description: str,
+) -> None:
+    events.append(
+        {
+            "frame_idx": frame_idx,
+            "ts_s": ts_s,
+            "kind": kind,
+            "description": description,
+        }
+    )
 
 
 def _build_timeline(cooked: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -296,7 +374,13 @@ def _build_timeline(cooked: list[dict[str, Any]]) -> list[dict[str, Any]]:
         prev_missed = prev["owner_missed"] if prev["owner_missed"] is not None else 0
         cur_missed = row["owner_missed"] if row["owner_missed"] is not None else 0
         if prev_missed < 3 <= cur_missed:
-            _emit_event(events, frame_idx, ts_s, "drift", f"Owner missed count escalated to {cur_missed}")
+            _emit_event(
+                events,
+                frame_idx,
+                ts_s,
+                "drift",
+                f"Owner missed count escalated to {cur_missed}",
+            )
 
         prev = row
 
@@ -308,10 +392,15 @@ def _build_timeline(cooked: list[dict[str, Any]]) -> list[dict[str, Any]]:
             continue
         seen.add(key)
         deduped.append(event)
+
     return deduped
 
 
-def _compute_metrics(cooked: list[dict[str, Any]], events: list[dict[str, Any]], fps: float) -> dict[str, Any]:
+def _compute_metrics(
+    cooked: list[dict[str, Any]],
+    events: list[dict[str, Any]],
+    fps: float,
+) -> dict[str, Any]:
     if not cooked:
         return {
             "frames_total": 0,
@@ -329,6 +418,10 @@ def _compute_metrics(cooked: list[dict[str, Any]], events: list[dict[str, Any]],
             "narrow_tracking_ratio": 0.0,
             "max_owner_missed": 0,
             "max_drop": 0,
+            "auto_frames": 0,
+            "manual_frames": 0,
+            "final_wide_owner": None,
+            "final_narrow_owner": None,
         }
 
     frames_total = len(cooked)
@@ -338,6 +431,7 @@ def _compute_metrics(cooked: list[dict[str, Any]], events: list[dict[str, Any]],
 
     owner_missed_values = [r["owner_missed"] for r in cooked if r["owner_missed"] is not None]
     max_owner_missed = max(owner_missed_values) if owner_missed_values else 0
+    last = cooked[-1]
 
     return {
         "frames_total": frames_total,
@@ -352,9 +446,16 @@ def _compute_metrics(cooked: list[dict[str, Any]], events: list[dict[str, Any]],
         "avg_geometry_score": round(sum(r["geometry_score"] for r in cooked) / frames_total, 4),
         "avg_wide_quality": round(sum(r["wide_quality"] for r in cooked) / frames_total, 4),
         "frames_with_narrow_owner": sum(1 for r in cooked if r["narrow_owner_id"] is not None),
-        "narrow_tracking_ratio": round(sum(1 for r in cooked if r["narrow_owner_id"] is not None) / frames_total, 4),
+        "narrow_tracking_ratio": round(
+            sum(1 for r in cooked if r["narrow_owner_id"] is not None) / frames_total,
+            4,
+        ),
         "max_owner_missed": max_owner_missed,
         "max_drop": max(r["drop"] for r in cooked),
+        "auto_frames": sum(1 for r in cooked if not r["manual_lock"]),
+        "manual_frames": sum(1 for r in cooked if r["manual_lock"]),
+        "final_wide_owner": last["wide_owner_id"],
+        "final_narrow_owner": last["narrow_owner_id"],
     }
 
 
@@ -367,26 +468,270 @@ def _write_metrics_csv(metrics_path: Path, metrics: dict[str, Any]) -> None:
 
 
 def _write_timeline_md(timeline_path: Path, events: list[dict[str, Any]]) -> None:
-    lines = ["# Timeline", "", "| Frame | Time [s] | Type | Description |", "|---:|---:|---|---|"]
+    lines = [
+        "# Timeline",
+        "",
+        "| Frame | Time [s] | Type | Description |",
+        "|---:|---:|---|---|",
+    ]
+
     for e in events:
-        lines.append(f"| {e['frame_idx']} | {e['ts_s']:.2f} | {e['kind']} | {e['description']} |")
+        lines.append(
+            f"| {e['frame_idx']} | {e['ts_s']:.2f} | {e['kind']} | {e['description']} |"
+        )
+
     if not events:
         lines.append("| - | - | info | No events detected |")
+
     timeline_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def _write_keyframes_md(keyframes_path: Path, events: list[dict[str, Any]], shots: list[dict[str, Any]], rows_count: int) -> None:
-    lines = ["# Keyframes", "", "| Frame | Time [s] | Type | Screenshot | Description |", "|---:|---:|---|---|---|"]
+def _write_keyframes_md(
+    keyframes_path: Path,
+    events: list[dict[str, Any]],
+    shots: list[dict[str, Any]],
+    rows_count: int,
+) -> None:
+    lines = [
+        "# Keyframes",
+        "",
+        "| Frame | Time [s] | Type | Screenshot | Description |",
+        "|---:|---:|---|---|---|",
+    ]
+
     if not events:
         lines.append("| - | - | info | - | No key events detected |")
     else:
         for e in events:
             shot = _closest_shot(e["frame_idx"], rows_count, shots, e["kind"]) or "-"
-            lines.append(f"| {e['frame_idx']} | {e['ts_s']:.2f} | {e['kind']} | {shot} | {e['description']} |")
+            lines.append(
+                f"| {e['frame_idx']} | {e['ts_s']:.2f} | {e['kind']} | {shot} | {e['description']} |"
+            )
+
     keyframes_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def _write_run_summary_md(summary_path: Path, cooked: list[dict[str, Any]], metrics: dict[str, Any], events: list[dict[str, Any]]) -> None:
+def _guess_failure_mode(metrics: dict[str, Any], events: list[dict[str, Any]]) -> str:
+    if metrics["lock_lost_count"] > 0 and metrics["reacquire_count"] > 0:
+        return "reacquire_failure_with_owner_instability"
+    if metrics["center_lock_off_count"] >= 3:
+        return "edge_geometry_break"
+    if metrics["detection_gap_count"] >= 3:
+        return "detection_dropout_burst"
+    if metrics["wide_owner_switches"] + metrics["narrow_owner_switches"] >= 8:
+        return "selected_id_instability"
+    return "general_tracking_instability"
+
+
+def _analysis_priority(events: list[dict[str, Any]]) -> list[str]:
+    kinds = {e["kind"] for e in events}
+    priority = ["timeline", "keyframes", "metrics", "telemetry"]
+    if "lock_lost" in kinds or "reacquire" in kinds:
+        return ["timeline", "keyframes", "telemetry", "metrics"]
+    return priority
+
+
+def _preferred_windows(events: list[dict[str, Any]]) -> list[list[int]]:
+    priority_order = [
+        "lock_lost",
+        "reacquire",
+        "center_lock_off",
+        "drift",
+        "owner_switch",
+        "narrow_switch",
+        "detection_gap",
+        "detection_drop",
+    ]
+    picked: list[list[int]] = []
+    seen_ranges: set[tuple[int, int]] = set()
+
+    for kind in priority_order:
+        for e in events:
+            if e["kind"] != kind:
+                continue
+
+            start = max(0, int(e["frame_idx"]) - 12)
+            end = int(e["frame_idx"]) + 12
+
+            merged = False
+            for idx, existing in enumerate(picked):
+                if not (end < existing[0] - 6 or start > existing[1] + 6):
+                    picked[idx] = [min(start, existing[0]), max(end, existing[1])]
+                    merged = True
+                    break
+
+            if not merged:
+                key = (start, end)
+                if key not in seen_ranges:
+                    picked.append([start, end])
+                    seen_ranges.add(key)
+
+            if len(picked) >= 3:
+                break
+
+        if len(picked) >= 3:
+            break
+
+    picked.sort(key=lambda x: x[0])
+    return picked
+
+
+def _git_text(repo_root: Path, args: list[str]) -> str:
+    try:
+        result = subprocess.run(
+            ["git", *args],
+            cwd=str(repo_root),
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return result.stdout.strip()
+    except Exception:
+        return ""
+
+
+def _git_meta(repo_root: Path) -> dict[str, Any]:
+    branch = _git_text(repo_root, ["rev-parse", "--abbrev-ref", "HEAD"]) or "unknown"
+    commit = _git_text(repo_root, ["rev-parse", "--short", "HEAD"]) or "unknown"
+    porcelain = _git_text(repo_root, ["status", "--porcelain"])
+    dirty = bool(porcelain.strip()) if porcelain is not None else False
+    return {
+        "branch": branch,
+        "commit": commit,
+        "dirty_worktree": dirty,
+    }
+
+
+def _final_state(cooked: list[dict[str, Any]]) -> dict[str, Any]:
+    if not cooked:
+        return {
+            "wide_owner": None,
+            "narrow_owner": None,
+            "tracking_state": "UNKNOWN",
+            "center_lock": False,
+            "lock_active": False,
+        }
+
+    last = cooked[-1]
+    narrow_owner = last["narrow_owner_id"]
+    lock_state = last["lock_state"] or "UNKNOWN"
+
+    return {
+        "wide_owner": last["wide_owner_id"],
+        "narrow_owner": narrow_owner,
+        "tracking_state": lock_state,
+        "center_lock": bool(last["center_lock_on"]),
+        "lock_active": bool(
+            narrow_owner is not None
+            and lock_state in {"TRACKING", "CENTER_LOCK", "LOCKED"}
+        ),
+    }
+
+
+def _artifact_status(
+    output_dir: Path,
+    telemetry_path: Path,
+    shot_dir: Path | None,
+    video_dir: Path | None,
+) -> dict[str, bool]:
+    return {
+        "run_summary": (output_dir / "run_summary.md").exists(),
+        "timeline": (output_dir / "timeline.md").exists(),
+        "keyframes": (output_dir / "keyframes.md").exists(),
+        "metrics": (output_dir / "metrics.csv").exists(),
+        "telemetry": telemetry_path.exists(),
+        "images_dir": shot_dir.exists() if shot_dir is not None else False,
+        "video_dir": video_dir.exists() if video_dir is not None else False,
+    }
+
+
+def _symptoms(
+    metrics: dict[str, Any],
+    events: list[dict[str, Any]],
+    final_state: dict[str, Any],
+) -> list[str]:
+    symptoms: list[str] = []
+
+    if metrics["narrow_owner_switches"] >= 2:
+        symptoms.append("frequent_narrow_switches")
+    if metrics["wide_owner_switches"] >= 3:
+        symptoms.append("wide_owner_instability")
+    if metrics["short_drop_count"] > 0 or metrics["detection_gap_count"] > 0:
+        symptoms.append("repeated_short_detection_drops")
+    if metrics["lock_lost_count"] > 0:
+        symptoms.append("lock_loss_after_owner_instability")
+    if metrics["reacquire_count"] > 0:
+        symptoms.append("reacquire_entry_after_drift")
+    if metrics["center_lock_off_count"] > 0:
+        symptoms.append("center_lock_breaks")
+    if final_state["narrow_owner"] is None:
+        symptoms.append("run_ended_without_narrow_owner")
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for item in symptoms:
+        if item not in seen:
+            seen.add(item)
+            deduped.append(item)
+
+    return deduped
+
+
+def _recommended_first_action(
+    metrics: dict[str, Any],
+    events: list[dict[str, Any]],
+    final_state: dict[str, Any],
+) -> dict[str, str]:
+    if metrics["lock_lost_count"] > 0 or metrics["reacquire_count"] > 0:
+        return {
+            "type": "inspect_and_patch",
+            "module": "src/core/narrow_tracker.py",
+            "change_kind": "reacquire_gate_tightening",
+            "reason": "narrow owner instability around lock_lost and reacquire transitions",
+        }
+    if metrics["center_lock_off_count"] >= 2:
+        return {
+            "type": "inspect_and_patch",
+            "module": "src/core/target_manager.py",
+            "change_kind": "edge_geometry_gate_tightening",
+            "reason": "center lock breaks suggest edge and geometry instability in owner selection",
+        }
+    if metrics["wide_owner_switches"] >= 3:
+        return {
+            "type": "inspect_and_patch",
+            "module": "src/core/target_manager.py",
+            "change_kind": "owner_selection_stabilization",
+            "reason": "wide owner selection is unstable and likely drives downstream narrow churn",
+        }
+    return {
+        "type": "inspect",
+        "module": "src/core/app.py",
+        "change_kind": "integration_trace_validation",
+        "reason": "start from the integration path and validate event generation against telemetry",
+    }
+
+
+def _run_classification(metrics: dict[str, Any], final_state: dict[str, Any]) -> str:
+    if not final_state.get("lock_active", False):
+        if metrics.get("lock_lost_count", 0) > 0 or metrics.get("reacquire_count", 0) > 0:
+            return "failed_end_state"
+        return "unstable"
+
+    if metrics.get("wide_owner_switches", 0) + metrics.get("narrow_owner_switches", 0) >= 8:
+        return "unstable"
+
+    if metrics.get("detection_gap_count", 0) >= 3:
+        return "degraded"
+
+    return "stable"
+
+
+def _write_run_summary_md(
+    summary_path: Path,
+    cooked: list[dict[str, Any]],
+    metrics: dict[str, Any],
+    events: list[dict[str, Any]],
+) -> None:
     if not cooked:
         summary_path.write_text("# Run summary\n\nNo telemetry rows found.\n", encoding="utf-8")
         return
@@ -412,15 +757,283 @@ def _write_run_summary_md(summary_path: Path, cooked: list[dict[str, Any]], metr
         "",
     ]
 
-    important_kinds = {"owner_switch", "lock_lost", "reacquire", "center_lock_off", "drift", "detection_gap"}
+    important_kinds = {
+        "owner_switch",
+        "lock_lost",
+        "reacquire",
+        "center_lock_off",
+        "drift",
+        "detection_gap",
+    }
     highlighted = [e for e in events if e["kind"] in important_kinds][:8]
     for e in highlighted:
-        lines.append(f"At frame {e['frame_idx']} ({e['ts_s']:.2f}s) the system recorded {e['kind']}: {e['description']}.")
+        lines.append(
+            f"At frame {e['frame_idx']} ({e['ts_s']:.2f}s) the system recorded {e['kind']}: {e['description']}."
+        )
 
     while len([x for x in lines if x and not x.startswith("#")]) < 12:
-        lines.append("Telemetry stayed broadly consistent with the current wide/narrow handoff logic during frames without major events.")
+        lines.append(
+            "Telemetry stayed broadly consistent with the current wide/narrow handoff logic during frames without major events."
+        )
 
     summary_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _write_manifest_md(
+    path: Path,
+    run_id: str,
+    metrics: dict[str, Any],
+    events: list[dict[str, Any]],
+    output_dir: Path,
+    telemetry_path: Path,
+    shot_dir: Path | None,
+    video_dir: Path | None,
+    git_meta: dict[str, Any],
+    final_state: dict[str, Any],
+    artifacts_status: dict[str, bool],
+    symptoms: list[str],
+    recommended_first_action: dict[str, str],
+) -> None:
+    manifest_version = "1.0"
+    failure_mode = _guess_failure_mode(metrics, events)
+    run_classification = _run_classification(metrics, final_state)
+
+    verdict = (
+        "This run looks unstable. The main suspected issue is narrow owner instability under repeated detection gaps and edge-triggered geometry breaks."
+        if failure_mode != "general_tracking_instability"
+        else "This run looks somewhat unstable. The main suspected issue is general owner and handoff instability."
+    )
+
+    key_events = events[:8]
+    windows = _preferred_windows(events)
+
+    lines = [
+        "# Latest Run Manifest",
+        "",
+        "## Run identity",
+        f"- manifest_version: {manifest_version}",
+        f"- run_id: {run_id}",
+        f"- created_at: {run_id}",
+        "- project_repo: pwysocka26-ai/drone-tracker-system",
+        f"- branch: {_md_scalar(git_meta['branch'])}",
+        f"- commit: {_md_scalar(git_meta['commit'])}",
+        f"- dirty_worktree: {_md_scalar(git_meta['dirty_worktree'])}",
+        "- scenario: video tracking run",
+        "- source: local telemetry export",
+        "",
+        "## Quick verdict",
+        verdict,
+        "",
+        "## Run classification",
+        f"- run_classification: {run_classification}",
+        "",
+        "## Key metrics",
+        f"- frames: {metrics['frames_total']}",
+        f"- duration_s: {metrics['duration_s']}",
+        f"- wide_owner_switches: {metrics['wide_owner_switches']}",
+        f"- narrow_owner_switches: {metrics['narrow_owner_switches']}",
+        f"- lock_losses: {metrics['lock_lost_count']}",
+        f"- reacquire_phases: {metrics['reacquire_count']}",
+        f"- detection_gap_count: {metrics['detection_gap_count']}",
+        f"- short_drop_count: {metrics['short_drop_count']}",
+        f"- avg_wide_owner_quality: {metrics['avg_wide_quality']}",
+        f"- avg_geometry_score: {metrics['avg_geometry_score']}",
+        f"- final_wide_owner: {_md_scalar(metrics['final_wide_owner'])}",
+        f"- final_narrow_owner: {_md_scalar(metrics['final_narrow_owner'])}",
+        "",
+        "## Final state",
+        f"- wide_owner: {_md_scalar(final_state['wide_owner'])}",
+        f"- narrow_owner: {_md_scalar(final_state['narrow_owner'])}",
+        f"- tracking_state: {_md_scalar(final_state['tracking_state'])}",
+        f"- center_lock: {'ON' if final_state['center_lock'] else 'OFF'}",
+        f"- lock_active: {_md_scalar(final_state['lock_active'])}",
+        "",
+        "## Key events",
+    ]
+
+    for e in key_events:
+        lines.append(f"- frame {e['frame_idx']}: {e['kind']} — {e['description']}")
+
+    lines += [
+        "",
+        "## Symptoms",
+    ]
+    if symptoms:
+        for item in symptoms:
+            lines.append(f"- {item}")
+    else:
+        lines.append("- none")
+
+    lines += [
+        "",
+        "## Suspected failure mode",
+        failure_mode,
+        "",
+        "## Analysis priority",
+    ]
+    for item in _analysis_priority(events):
+        lines.append(f"- {item}")
+
+    lines += [
+        "",
+        "## Recommended first action",
+        f"- type: {recommended_first_action['type']}",
+        f"- module: {recommended_first_action['module']}",
+        f"- change_kind: {recommended_first_action['change_kind']}",
+        f"- reason: {recommended_first_action['reason']}",
+        "",
+        "## Artifact paths",
+        f"- run_summary: {output_dir / 'run_summary.md'}",
+        f"- timeline: {output_dir / 'timeline.md'}",
+        f"- keyframes: {output_dir / 'keyframes.md'}",
+        f"- metrics: {output_dir / 'metrics.csv'}",
+        f"- telemetry: {telemetry_path}",
+        f"- images_dir: {shot_dir if shot_dir is not None else output_dir / 'images'}",
+        f"- video_dir: {video_dir if video_dir is not None else output_dir / 'video'}",
+        "",
+        "## Artifact status",
+        f"- run_summary: {_md_scalar(artifacts_status['run_summary'])}",
+        f"- timeline: {_md_scalar(artifacts_status['timeline'])}",
+        f"- keyframes: {_md_scalar(artifacts_status['keyframes'])}",
+        f"- metrics: {_md_scalar(artifacts_status['metrics'])}",
+        f"- telemetry: {_md_scalar(artifacts_status['telemetry'])}",
+        f"- images_dir: {_md_scalar(artifacts_status['images_dir'])}",
+        f"- video_dir: {_md_scalar(artifacts_status['video_dir'])}",
+        "",
+        "## Recommended analysis windows",
+    ]
+
+    if windows:
+        for w in windows:
+            lines.append(f"- frames {w[0]}-{w[1]}")
+    else:
+        lines.append("- full run")
+
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _write_manifest_json(
+    path: Path,
+    run_id: str,
+    metrics: dict[str, Any],
+    events: list[dict[str, Any]],
+    output_dir: Path,
+    telemetry_path: Path,
+    shot_dir: Path | None,
+    video_dir: Path | None,
+    git_meta: dict[str, Any],
+    final_state: dict[str, Any],
+    artifacts_status: dict[str, bool],
+    symptoms: list[str],
+    recommended_first_action: dict[str, str],
+) -> None:
+    manifest_version = "1.0"
+    failure_mode = _guess_failure_mode(metrics, events)
+    run_classification = _run_classification(metrics, final_state)
+
+    payload = {
+        "manifest_version": manifest_version,
+        "run_classification": run_classification,
+        "run": {
+            "run_id": run_id,
+            "created_at": run_id,
+            "repo": "pwysocka26-ai/drone-tracker-system",
+            "branch": git_meta["branch"],
+            "commit": git_meta["commit"],
+            "dirty_worktree": git_meta["dirty_worktree"],
+            "scenario": "video tracking run",
+            "source": "local telemetry export",
+        },
+        "summary": {
+            "quick_verdict": (
+                "Run unstable. Main suspected issue is narrow owner instability under repeated detection gaps and edge-triggered geometry breaks."
+                if failure_mode != "general_tracking_instability"
+                else "Run somewhat unstable. Main suspected issue is general owner and handoff instability."
+            ),
+            "suspected_failure_mode": failure_mode,
+            "analysis_priority": _analysis_priority(events),
+        },
+        "metrics": {
+            "frames": metrics["frames_total"],
+            "duration_s": metrics["duration_s"],
+            "wide_owner_switches": metrics["wide_owner_switches"],
+            "narrow_owner_switches": metrics["narrow_owner_switches"],
+            "lock_losses": metrics["lock_lost_count"],
+            "reacquire_phases": metrics["reacquire_count"],
+            "detection_gap_count": metrics["detection_gap_count"],
+            "short_drop_count": metrics["short_drop_count"],
+            "avg_wide_owner_quality": metrics["avg_wide_quality"],
+            "avg_geometry_score": metrics["avg_geometry_score"],
+            "max_owner_missed": metrics["max_owner_missed"],
+            "max_drop": metrics["max_drop"],
+            "auto_frames": metrics["auto_frames"],
+            "manual_frames": metrics["manual_frames"],
+            "final_wide_owner": metrics["final_wide_owner"],
+            "final_narrow_owner": metrics["final_narrow_owner"],
+        },
+        "final_state": final_state,
+        "events": [
+            {
+                "frame": e["frame_idx"],
+                "time_s": round(e["ts_s"], 2),
+                "type": e["kind"],
+                "description": e["description"],
+            }
+            for e in events[:12]
+        ],
+        "artifacts": {
+            "run_summary": str(output_dir / "run_summary.md"),
+            "timeline": str(output_dir / "timeline.md"),
+            "keyframes": str(output_dir / "keyframes.md"),
+            "metrics": str(output_dir / "metrics.csv"),
+            "telemetry": str(telemetry_path),
+            "images_dir": str(shot_dir if shot_dir is not None else output_dir / "images"),
+            "video_dir": str(video_dir if video_dir is not None else output_dir / "video"),
+        },
+        "artifacts_status": artifacts_status,
+        "baseline": {
+            "baseline_run_id": None,
+            "baseline_manifest": None,
+            "compare_focus": [
+                "wide_owner_switches",
+                "narrow_owner_switches",
+                "lock_losses",
+                "reacquire_phases",
+            ],
+        },
+        "symptoms": symptoms,
+        "recommended_first_action": recommended_first_action,
+        "agent_hints": {
+            "primary_modules_to_check": [
+                "src/core/target_manager.py",
+                "src/core/narrow_tracker.py",
+                "src/core/app.py",
+            ],
+            "primary_recipes_to_try": [
+                "selected_id_instability",
+                "edge_geometry_break",
+                "reacquire_failure",
+            ],
+            "preferred_analysis_window_frames": _preferred_windows(events),
+            "patch_strategy": "minimal_safe_patch",
+            "regression_focus": [
+                "narrow_owner_switches",
+                "lock_losses",
+                "final_narrow_owner",
+            ],
+        },
+    }
+
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _publish_latest(manifest_md: Path, manifest_json: Path, latest_dir: Path) -> None:
+    latest_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(manifest_md, latest_dir / "latest_run_manifest.md")
+    shutil.copy2(manifest_json, latest_dir / "latest_run_manifest.json")
 
 
 def generate_run_reports(
@@ -428,16 +1041,23 @@ def generate_run_reports(
     shot_dir: str | Path | None = None,
     output_dir: str | Path | None = None,
     fps: float = 30.0,
+    run_id: str | None = None,
+    latest_dir: str | Path | None = "artifacts/latest",
+    video_dir: str | Path | None = None,
 ) -> RunReportPaths:
     telemetry_path = Path(telemetry_path)
     output_dir = Path(output_dir) if output_dir is not None else telemetry_path.parent
     shot_dir_path = Path(shot_dir) if shot_dir is not None else None
+    video_dir_path = Path(video_dir) if video_dir is not None else None
+
     output_dir.mkdir(parents=True, exist_ok=True)
 
     summary_path = output_dir / "run_summary.md"
     metrics_path = output_dir / "metrics.csv"
     timeline_path = output_dir / "timeline.md"
     keyframes_path = output_dir / "keyframes.md"
+    manifest_md_path = output_dir / "latest_run_manifest.md"
+    manifest_json_path = output_dir / "latest_run_manifest.json"
 
     raw_rows = _load_jsonl(telemetry_path)
     cooked = _build_rows(raw_rows, fps=fps)
@@ -450,9 +1070,58 @@ def generate_run_reports(
     _write_timeline_md(timeline_path, events)
     _write_keyframes_md(keyframes_path, events, shots, len(cooked))
 
+    resolved_run_id = run_id or output_dir.name
+    repo_root = Path(__file__).resolve().parents[2]
+    git_meta = _git_meta(repo_root)
+    final_state = _final_state(cooked)
+    artifacts_status = _artifact_status(
+        output_dir,
+        telemetry_path,
+        shot_dir_path,
+        video_dir_path,
+    )
+    symptoms = _symptoms(metrics, events, final_state)
+    recommended_first_action = _recommended_first_action(metrics, events, final_state)
+
+    _write_manifest_md(
+        manifest_md_path,
+        resolved_run_id,
+        metrics,
+        events,
+        output_dir,
+        telemetry_path,
+        shot_dir_path,
+        video_dir_path,
+        git_meta,
+        final_state,
+        artifacts_status,
+        symptoms,
+        recommended_first_action,
+    )
+    _write_manifest_json(
+        manifest_json_path,
+        resolved_run_id,
+        metrics,
+        events,
+        output_dir,
+        telemetry_path,
+        shot_dir_path,
+        video_dir_path,
+        git_meta,
+        final_state,
+        artifacts_status,
+        symptoms,
+        recommended_first_action,
+    )
+
+    if latest_dir is not None:
+        _publish_latest(manifest_md_path, manifest_json_path, Path(latest_dir))
+
     return RunReportPaths(
         summary_path=summary_path,
         metrics_path=metrics_path,
         timeline_path=timeline_path,
         keyframes_path=keyframes_path,
+        manifest_md_path=manifest_md_path,
+        manifest_json_path=manifest_json_path,
     )

@@ -726,6 +726,20 @@ def _run_classification(metrics: dict[str, Any], final_state: dict[str, Any]) ->
     return "stable"
 
 
+def _links(output_dir: Path, git_meta: dict[str, Any]) -> dict[str, str]:
+    repo_slug = "pwysocka26-ai/drone-tracker-system"
+    commit = git_meta.get("commit", "unknown")
+    return {
+        "github_repo": f"https://github.com/{repo_slug}",
+        "commit_url": (
+            f"https://github.com/{repo_slug}/commit/{commit}"
+            if commit and commit != "unknown"
+            else ""
+        ),
+        "run_folder": str(output_dir),
+    }
+
+
 def _write_run_summary_md(
     summary_path: Path,
     cooked: list[dict[str, Any]],
@@ -797,6 +811,7 @@ def _write_manifest_md(
     manifest_version = "1.0"
     failure_mode = _guess_failure_mode(metrics, events)
     run_classification = _run_classification(metrics, final_state)
+    links = _links(output_dir, git_meta)
 
     verdict = (
         "This run looks unstable. The main suspected issue is narrow owner instability under repeated detection gaps and edge-triggered geometry breaks."
@@ -882,6 +897,11 @@ def _write_manifest_md(
         f"- change_kind: {recommended_first_action['change_kind']}",
         f"- reason: {recommended_first_action['reason']}",
         "",
+        "## Quick links",
+        f"- github_repo: {links['github_repo']}",
+        f"- commit_url: {links['commit_url'] or 'none'}",
+        f"- run_folder: {links['run_folder']}",
+        "",
         "## Artifact paths",
         f"- run_summary: {output_dir / 'run_summary.md'}",
         f"- timeline: {output_dir / 'timeline.md'}",
@@ -930,6 +950,7 @@ def _write_manifest_json(
     manifest_version = "1.0"
     failure_mode = _guess_failure_mode(metrics, events)
     run_classification = _run_classification(metrics, final_state)
+    links = _links(output_dir, git_meta)
 
     payload = {
         "manifest_version": manifest_version,
@@ -981,6 +1002,7 @@ def _write_manifest_json(
             }
             for e in events[:12]
         ],
+        "links": links,
         "artifacts": {
             "run_summary": str(output_dir / "run_summary.md"),
             "timeline": str(output_dir / "timeline.md"),

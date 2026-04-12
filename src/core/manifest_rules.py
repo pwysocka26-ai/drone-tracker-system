@@ -286,6 +286,81 @@ def recommend_first_action(
     }
 
 
+def build_quick_verdict(
+    metrics: dict[str, Any],
+    final_state: dict[str, Any],
+    classification: dict[str, str],
+    symptom_result: dict[str, Any],
+) -> str:
+    run_classification = str(classification.get("run_classification", "mixed_failure"))
+    secondary_classification = str(classification.get("secondary_classification", "mixed_failure"))
+    final_narrow_owner = final_state.get("narrow_owner", metrics.get("final_narrow_owner"))
+    avg_geometry_score = _safe_float(metrics.get("avg_geometry_score"))
+    avg_wide_owner_quality = _safe_float(metrics.get("avg_wide_quality", metrics.get("avg_wide_owner_quality")))
+    lock_losses = _safe_int(metrics.get("lock_lost_count", metrics.get("lock_losses")))
+    reacquire_count = _safe_int(metrics.get("reacquire_count", metrics.get("reacquire_phases")))
+    primary_symptom = str(symptom_result.get("primary_symptom", "none"))
+
+    if run_classification == "stable":
+        return "Run stable. No major terminal failure pattern was detected."
+
+    if (
+        final_narrow_owner is None
+        and avg_geometry_score < 0.60
+        and avg_wide_owner_quality < 0.35
+        and lock_losses >= 1
+    ):
+        return "Run failed in late-stage tracking after quality degradation, edge-triggered center lock break, and reacquire loss."
+
+    if run_classification == "failed_end_state" and secondary_classification == "reacquire_failure":
+        return "Run ended in failed end state after lock loss and unsuccessful reacquire recovery."
+
+    if primary_symptom == "narrow_owner_instability":
+        return "Run unstable due to repeated narrow owner instability and weak recovery behavior."
+
+    if reacquire_count >= 1 and lock_losses >= 1:
+        return "Run unstable with lock-loss and reacquire transitions concentrated in the failing phase."
+
+    return "Run unstable. Main suspected issue is narrow owner instability under repeated detection gaps and edge-triggered geometry breaks."
+
+
+def build_primary_modules_to_check(
+    recommended_first_action: dict[str, Any],
+    classification: dict[str, str],
+    symptom_result: dict[str, Any],
+) -> list[str]:
+    first_module = str(recommended_first_action.get("module", "") or "")
+    run_classification = str(classification.get("run_classification", "mixed_failure"))
+    symptoms = list(symptom_result.get("symptoms", []))
+
+    ordered: list[str] = []
+
+    def add(module: str) -> None:
+        if module and module not in ordered:
+            ordered.append(module)
+
+    add(first_module)
+
+    if first_module == "src/core/narrow_tracker.py":
+        add("src/core/target_manager.py")
+        add("src/core/app.py")
+    elif first_module == "src/core/target_manager.py":
+        add("src/core/narrow_tracker.py")
+        add("src/core/app.py")
+    elif first_module == "src/core/app.py":
+        add("src/core/narrow_tracker.py")
+        add("src/core/target_manager.py")
+    else:
+        add("src/core/narrow_tracker.py")
+        add("src/core/target_manager.py")
+        add("src/core/app.py")
+
+    if run_classification == "detection_dropout_dominated" or "repeated_short_detection_drops" in symptoms:
+        add("config/config.yaml")
+
+    return ordered
+
+
 def _window_around(frame: int, pre_margin: int, post_margin: int) -> list[int]:
     return [max(0, int(frame) - int(pre_margin)), int(frame) + int(post_margin)]
 
@@ -351,36 +426,50 @@ def select_analysis_windows(timeline_events: list[dict[str, Any]]) -> list[list[
 def top_failure_frames(timeline_events: list[dict[str, Any]]) -> list[dict[str, Any]]:
     severity_rank = {
         "lock_lost": 100,
-        "reacquire": 90,
-        "center_lock_off": 80,
-        "drift": 70,
-        "owner_switch": 60,
-        "narrow_switch": 55,
-        "detection_gap": 50,
-        "detection_drop": 40,
+        "reacquire": 95,
+        "center_lock_off": 90,
+        "drift": 85,
+        "detection_gap": 70,
+        "detection_drop": 55,
+        "owner_switch": 30,
+        "narrow_switch": 25,
     }
 
-    ranked = sorted(
-        timeline_events,
-        key=lambda e: (
-            severity_rank.get(str(e.get("kind")), 0),
-            _safe_int(e.get("frame_idx", e.get("frame"))),
-        ),
-        reverse=True,
-    )
+    def score(event: dict[str, Any]) -> tuple[int, int]:
+        kind = str(event.get("kind", event.get("type")))
+        frame = _safe_int(event.get("frame_idx", event.get("frame")))
+        base = severity_rank.get(kind, 0)
+
+        if frame < 15 and kind not in {"lock_lost", "reacquire"}:
+            base -= 40
+
+        return (base, frame)
+
+    ranked = sorted(timeline_events, key=score, reverse=True)
 
     picked: list[dict[str, Any]] = []
     used_frames: set[int] = set()
 
     for e in ranked:
+        kind = str(e.get("kind", e.get("type")))
+        if kind not in {"lock_lost", "reacquire", "center_lock_off", "drift", "detection_gap", "detection_drop", "owner_switch", "narrow_switch"}:
+            continue
+
         frame = _safe_int(e.get("frame_idx", e.get("frame")))
+        base = severity_rank.get(kind, 0)
+        if frame < 15 and kind not in {"lock_lost", "reacquire"}:
+            base -= 40
+        if base <= 0:
+            continue
+
         if any(abs(frame - uf) <= 6 for uf in used_frames):
             continue
+
         picked.append(
             {
                 "frame": frame,
                 "time_s": round(_safe_float(e.get("ts_s", e.get("time_s"))), 2),
-                "type": str(e.get("kind", e.get("type"))),
+                "type": kind,
                 "description": str(e.get("description", "")),
             }
         )

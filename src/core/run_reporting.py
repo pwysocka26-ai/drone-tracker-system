@@ -10,12 +10,14 @@ from pathlib import Path
 from typing import Any
 
 from core.manifest_rules import (
+    build_primary_modules_to_check,
+    build_quick_verdict,
     classify_run,
     detect_symptoms,
     recommend_first_action,
     select_analysis_windows,
-    top_failure_frames,
     select_manifest_events,
+    top_failure_frames,
 )
 
 
@@ -678,17 +680,13 @@ def _write_manifest_md(
     windows = select_analysis_windows(events)
     top_frames = top_failure_frames(events)
     selected_events = select_manifest_events(events)
+    quick_verdict = build_quick_verdict(metrics, final_state, classification, symptom_result)
+    primary_modules_to_check = build_primary_modules_to_check(first_action, classification, symptom_result)
 
     run_classification = classification.get("run_classification", "mixed_failure")
     secondary_classification = classification.get("secondary_classification", "mixed_failure")
     primary_symptom = symptom_result.get("primary_symptom", "none")
     symptoms = symptom_result.get("symptoms", [])
-
-    verdict = (
-        "This run looks unstable. The main suspected issue is narrow owner instability under repeated detection gaps and edge-triggered geometry breaks."
-        if run_classification != "stable"
-        else "This run looks stable. No major terminal failure pattern was detected."
-    )
 
     lines = [
         "# Latest Run Manifest",
@@ -705,7 +703,7 @@ def _write_manifest_md(
         "- source: local telemetry export",
         "",
         "## Quick verdict",
-        verdict,
+        quick_verdict,
         "",
         "## Run classification",
         f"- run_classification: {run_classification}",
@@ -771,6 +769,13 @@ def _write_manifest_md(
         f"- confidence: {first_action['confidence']}",
         f"- priority: {first_action['priority']}",
         "",
+        "## Primary modules to check",
+    ]
+    for module in primary_modules_to_check:
+        lines.append(f"- {module}")
+
+    lines += [
+        "",
         "## Quick links",
         f"- github_repo: {links['github_repo']}",
         f"- commit_url: {links['commit_url'] or 'none'}",
@@ -833,6 +838,8 @@ def _write_manifest_json(
     windows = select_analysis_windows(events)
     top_frames = top_failure_frames(events)
     selected_events = select_manifest_events(events)
+    quick_verdict = build_quick_verdict(metrics, final_state, classification, symptom_result)
+    primary_modules_to_check = build_primary_modules_to_check(first_action, classification, symptom_result)
 
     payload = {
         "manifest_version": manifest_version,
@@ -849,11 +856,7 @@ def _write_manifest_json(
             "source": "local telemetry export",
         },
         "summary": {
-            "quick_verdict": (
-                "Run unstable. Main suspected issue is narrow owner instability under repeated detection gaps and edge-triggered geometry breaks."
-                if classification.get("run_classification") != "stable"
-                else "Run stable. No major terminal failure pattern was detected."
-            ),
+            "quick_verdict": quick_verdict,
             "suspected_failure_mode": classification.get("secondary_classification", "mixed_failure"),
             "analysis_priority": ["timeline", "keyframes", "telemetry", "metrics"],
         },
@@ -911,11 +914,7 @@ def _write_manifest_json(
             ],
         },
         "agent_hints": {
-            "primary_modules_to_check": [
-                "src/core/target_manager.py",
-                "src/core/narrow_tracker.py",
-                "src/core/app.py",
-            ],
+            "primary_modules_to_check": primary_modules_to_check,
             "primary_recipes_to_try": [
                 "selected_id_instability",
                 "edge_geometry_break",

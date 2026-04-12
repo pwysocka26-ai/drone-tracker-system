@@ -740,6 +740,92 @@ def _links(output_dir: Path, git_meta: dict[str, Any]) -> dict[str, str]:
     }
 
 
+def _top_failure_frames(
+    events: list[dict[str, Any]],
+    final_state: dict[str, Any],
+) -> list[dict[str, Any]]:
+    severity_rank = {
+        "lock_lost": 100,
+        "reacquire": 90,
+        "center_lock_off": 80,
+        "drift": 70,
+        "owner_switch": 60,
+        "narrow_switch": 55,
+        "detection_gap": 50,
+        "detection_drop": 40,
+    }
+
+    ranked = sorted(
+        events,
+        key=lambda e: (
+            severity_rank.get(e["kind"], 0),
+            e["frame_idx"],
+        ),
+        reverse=True,
+    )
+
+    picked: list[dict[str, Any]] = []
+    used_frames: set[int] = set()
+
+    for e in ranked:
+        frame = int(e["frame_idx"])
+        if any(abs(frame - uf) <= 6 for uf in used_frames):
+            continue
+        picked.append(
+            {
+                "frame": frame,
+                "time_s": round(float(e["ts_s"]), 2),
+                "type": e["kind"],
+                "description": e["description"],
+            }
+        )
+        used_frames.add(frame)
+        if len(picked) >= 3:
+            break
+
+    picked.sort(key=lambda x: x["frame"])
+    return picked
+
+
+def _selected_manifest_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not events:
+        return []
+
+    severity_order = {
+        "lock_lost": 100,
+        "reacquire": 90,
+        "center_lock_off": 80,
+        "drift": 70,
+        "owner_switch": 60,
+        "narrow_switch": 55,
+        "detection_gap": 50,
+        "detection_drop": 40,
+        "reacquire_complete": 35,
+        "center_lock_on": 20,
+        "detection_return": 10,
+    }
+
+    tail_events = sorted(events[-3:], key=lambda e: e["frame_idx"])
+    important = sorted(
+        events,
+        key=lambda e: (severity_order.get(e["kind"], 0), e["frame_idx"]),
+        reverse=True,
+    )
+
+    merged: list[dict[str, Any]] = []
+    seen: set[tuple[int, str]] = set()
+
+    for e in important[:10] + tail_events:
+        key = (int(e["frame_idx"]), str(e["kind"]))
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(e)
+
+    merged.sort(key=lambda e: e["frame_idx"])
+    return merged[:12]
+
+
 def _write_run_summary_md(
     summary_path: Path,
     cooked: list[dict[str, Any]],
@@ -812,6 +898,7 @@ def _write_manifest_md(
     failure_mode = _guess_failure_mode(metrics, events)
     run_classification = _run_classification(metrics, final_state)
     links = _links(output_dir, git_meta)
+    top_failure_frames = _top_failure_frames(events, final_state)
 
     verdict = (
         "This run looks unstable. The main suspected issue is narrow owner instability under repeated detection gaps and edge-triggered geometry breaks."
@@ -819,7 +906,7 @@ def _write_manifest_md(
         else "This run looks somewhat unstable. The main suspected issue is general owner and handoff instability."
     )
 
-    key_events = events[:8]
+    key_events = _selected_manifest_events(events)
     windows = _preferred_windows(events)
 
     lines = [
@@ -868,6 +955,18 @@ def _write_manifest_md(
 
     for e in key_events:
         lines.append(f"- frame {e['frame_idx']}: {e['kind']} — {e['description']}")
+
+    lines += [
+        "",
+        "## Top failure frames",
+    ]
+    if top_failure_frames:
+        for item in top_failure_frames:
+            lines.append(
+                f"- frame {item['frame']} ({item['time_s']:.2f}s): {item['type']} — {item['description']}"
+            )
+    else:
+        lines.append("- none")
 
     lines += [
         "",
@@ -920,6 +1019,11 @@ def _write_manifest_md(
         f"- images_dir: {_md_scalar(artifacts_status['images_dir'])}",
         f"- video_dir: {_md_scalar(artifacts_status['video_dir'])}",
         "",
+        "## Baseline comparison",
+        "- baseline_run_id: none",
+        "- baseline_manifest: none",
+        "- compare_focus: wide_owner_switches, narrow_owner_switches, lock_losses, reacquire_phases",
+        "",
         "## Recommended analysis windows",
     ]
 
@@ -951,6 +1055,8 @@ def _write_manifest_json(
     failure_mode = _guess_failure_mode(metrics, events)
     run_classification = _run_classification(metrics, final_state)
     links = _links(output_dir, git_meta)
+    top_failure_frames = _top_failure_frames(events, final_state)
+    selected_events = _selected_manifest_events(events)
 
     payload = {
         "manifest_version": manifest_version,
@@ -1000,8 +1106,9 @@ def _write_manifest_json(
                 "type": e["kind"],
                 "description": e["description"],
             }
-            for e in events[:12]
+            for e in selected_events
         ],
+        "top_failure_frames": top_failure_frames,
         "links": links,
         "artifacts": {
             "run_summary": str(output_dir / "run_summary.md"),

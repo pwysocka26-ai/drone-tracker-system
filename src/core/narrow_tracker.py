@@ -1,4 +1,4 @@
-import cv2
+﻿import cv2
 import numpy as np
 
 
@@ -45,99 +45,35 @@ class SimpleKalman2D:
 
 
 class NarrowTracker:
-    STATE_LOST = 'LOST'
-    STATE_ACQUIRE = 'ACQUIRE'
-    STATE_STABILIZE = 'STABILIZE'
-    STATE_LOCKED = 'LOCKED'
-    STATE_HOLD = 'HOLD'
-
     def __init__(self, hold_frames=120):
         self.kalman = SimpleKalman2D()
         self.smooth_center = None
-        self.smooth_zoom = 2.8
+        self.smooth_zoom = 2.2
         self.hold_count = 0
         self.hold_frames = int(hold_frames)
         self.last_pan_speed = 0.0
         self.last_tilt_speed = 0.0
-        self.state = self.STATE_LOST
-        self.acquire_count = 0
-        self.stable_count = 0
-        self.last_error_norm = None
-        self.jump_limited = False
-        self.last_good_bbox = None
-        self.last_good_center = None
-        self.bbox_smooth = None
-        self.last_good_bbox = None
-        self.last_good_center = None
-        self.bbox_smooth = None
 
     def reset(self):
         self.kalman.reset()
         self.smooth_center = None
-        self.smooth_zoom = 2.8
+        self.smooth_zoom = 2.2
         self.hold_count = 0
         self.last_pan_speed = 0.0
         self.last_tilt_speed = 0.0
-        self.state = self.STATE_LOST
-        self.acquire_count = 0
-        self.stable_count = 0
-        self.last_error_norm = None
-        self.jump_limited = False
 
-    def desired_zoom(self, frame, track, state):
+    def desired_zoom(self, frame, track):
         h, w = frame.shape[:2]
         x1, y1, x2, y2 = track.bbox_xyxy
         tw = max(1.0, x2 - x1)
         th = max(1.0, y2 - y1)
         rel = max(tw / w, th / h)
 
-        base = 0.125 / max(rel, 0.0075)
-        if state == self.STATE_ACQUIRE:
-            base *= 0.92
-        elif state == self.STATE_STABILIZE:
-            base *= 1.00
-        elif state == self.STATE_LOCKED:
-            base *= 1.08
-        return float(np.clip(base, 2.4, 5.8))
+        # mały obiekt -> zoom in, duży -> zoom out
+        z = 0.060 / max(rel, 0.010)
+        return float(np.clip(z, 1.8, 4.2))
 
-    def _choose_state(self, active_track, error_norm):
-        if active_track is None:
-            if self.hold_count > 0:
-                return self.STATE_HOLD
-            return self.STATE_LOST
-
-        if self.state in (self.STATE_LOST, self.STATE_HOLD):
-            self.acquire_count += 1
-            self.stable_count = 0
-            if self.acquire_count < 4:
-                return self.STATE_ACQUIRE
-            return self.STATE_STABILIZE
-
-        if error_norm is None:
-            return self.STATE_STABILIZE
-
-        if error_norm < 18.0:
-            self.stable_count += 1
-        else:
-            self.stable_count = 0
-
-        if self.stable_count >= 6:
-            return self.STATE_LOCKED
-        return self.STATE_STABILIZE
-
-    def _step_params(self, state):
-        if state == self.STATE_ACQUIRE:
-            return 0.48, 108.0, 2.0, 0.42
-        if state == self.STATE_STABILIZE:
-            return 0.38, 84.0, 2.0, 0.52
-        if state == self.STATE_LOCKED:
-            return 0.28, 56.0, 1.5, 0.68
-        if state == self.STATE_HOLD:
-            return 0.10, 12.0, 4.0, 0.82
-        return 0.0, 0.0, 3.0, 0.76
-
-    def _step_towards(self, desired, active, state):
-        self.jump_limited = False
+    def _step_towards(self, desired, active):
         if desired is None:
             self.last_pan_speed = 0.0
             self.last_tilt_speed = 0.0
@@ -151,23 +87,22 @@ class NarrowTracker:
 
         ex = desired[0] - self.smooth_center[0]
         ey = desired[1] - self.smooth_center[1]
-        self.last_error_norm = float((ex * ex + ey * ey) ** 0.5)
 
-        kp, max_step, dead_zone, inertia = self._step_params(state)
-
-        if abs(ex) < dead_zone:
+        # dead zone: blisko środka -> nie szarp
+        if abs(ex) < 4:
             ex = 0.0
-        if abs(ey) < dead_zone:
+        if abs(ey) < 4:
             ey = 0.0
 
-        raw_pan = float(np.clip(ex * kp, -max_step, max_step))
-        raw_tilt = float(np.clip(ey * kp, -max_step, max_step))
+        kp = 0.28 if active else 0.18
+        max_step = 65.0 if active else 32.0
 
-        if abs(ex) > max_step * 2.0 or abs(ey) > max_step * 2.0:
-            self.jump_limited = True
+        pan_speed = float(np.clip(ex * kp, -max_step, max_step))
+        tilt_speed = float(np.clip(ey * kp, -max_step, max_step))
 
-        pan_speed = inertia * self.last_pan_speed + (1.0 - inertia) * raw_pan
-        tilt_speed = inertia * self.last_tilt_speed + (1.0 - inertia) * raw_tilt
+        # lekkie wygładzenie prędkości
+        pan_speed = 0.70 * self.last_pan_speed + 0.30 * pan_speed
+        tilt_speed = 0.70 * self.last_tilt_speed + 0.30 * tilt_speed
 
         self.last_pan_speed = pan_speed
         self.last_tilt_speed = tilt_speed
@@ -178,53 +113,6 @@ class NarrowTracker:
         )
         return self.smooth_center
 
-    def _smooth_bbox(self, bbox, state):
-        if bbox is None:
-            return self.bbox_smooth
-        x1, y1, x2, y2 = [float(v) for v in bbox]
-        cx = 0.5 * (x1 + x2)
-        cy = 0.5 * (y1 + y2)
-        w = max(1.0, x2 - x1)
-        h = max(1.0, y2 - y1)
-
-        if self.bbox_smooth is None:
-            self.bbox_smooth = (cx, cy, w, h)
-            return self.bbox_smooth
-
-        pcx, pcy, pw, ph = self.bbox_smooth
-        diag = max(8.0, float((pw * pw + ph * ph) ** 0.5))
-        if state == self.STATE_ACQUIRE:
-            a_c, a_s = 0.42, 0.36
-            max_jump_c = max(34.0, diag * 0.55)
-            max_jump_s = max(22.0, 0.28 * max(pw, ph))
-        elif state == self.STATE_STABILIZE:
-            a_c, a_s = 0.58, 0.48
-            max_jump_c = max(20.0, diag * 0.34)
-            max_jump_s = max(14.0, 0.18 * max(pw, ph))
-        else:
-            a_c, a_s = 0.74, 0.64
-            max_jump_c = max(12.0, diag * 0.20)
-            max_jump_s = max(8.0, 0.12 * max(pw, ph))
-
-        dcx = max(-max_jump_c, min(max_jump_c, cx - pcx))
-        dcy = max(-max_jump_c, min(max_jump_c, cy - pcy))
-        dw = max(-max_jump_s, min(max_jump_s, w - pw))
-        dh = max(-max_jump_s, min(max_jump_s, h - ph))
-
-        scx = pcx * a_c + (pcx + dcx) * (1.0 - a_c)
-        scy = pcy * a_c + (pcy + dcy) * (1.0 - a_c)
-        sw = pw * a_s + (pw + dw) * (1.0 - a_s)
-        sh = ph * a_s + (ph + dh) * (1.0 - a_s)
-
-        self.bbox_smooth = (scx, scy, sw, sh)
-        return self.bbox_smooth
-
-    def get_display_bbox(self):
-        if self.bbox_smooth is None:
-            return None
-        cx, cy, w, h = self.bbox_smooth
-        return (cx - 0.5 * w, cy - 0.5 * h, cx + 0.5 * w, cy + 0.5 * h)
-
     def update(self, frame, active_track):
         predicted_center = self.kalman.predict()
         desired_center = None
@@ -234,43 +122,21 @@ class NarrowTracker:
             desired_center = corrected
             predicted_center = corrected
             self.hold_count = 0
-            self.last_good_center = corrected
+
+            desired_zoom = self.desired_zoom(frame, active_track)
+            self.smooth_zoom = 0.90 * self.smooth_zoom + 0.10 * desired_zoom
         else:
             self.hold_count += 1
-            if predicted_center is not None and self.last_good_center is not None:
-                desired_center = (
-                    0.80 * float(self.last_good_center[0]) + 0.20 * float(predicted_center[0]),
-                    0.80 * float(self.last_good_center[1]) + 0.20 * float(predicted_center[1]),
-                )
-            else:
-                desired_center = predicted_center or self.last_good_center
+            desired_center = predicted_center
 
-        error_norm = None
-        if desired_center is not None and self.smooth_center is not None:
-            dx = desired_center[0] - self.smooth_center[0]
-            dy = desired_center[1] - self.smooth_center[1]
-            error_norm = float((dx * dx + dy * dy) ** 0.5)
+            if self.hold_count > self.hold_frames:
+                self.reset()
+                return None, None, self.smooth_zoom, self.hold_count, 0.0, 0.0
 
-        self.state = self._choose_state(active_track, error_norm)
+            # podczas HOLD zoom nie powinien skakać
+            self.smooth_zoom = 0.97 * self.smooth_zoom + 0.03 * self.smooth_zoom
 
-        if active_track is None and self.hold_count > self.hold_frames:
-            self.reset()
-            return None, None, self.smooth_zoom, self.hold_count, 0.0, 0.0, self.state, self.jump_limited
-
-        if active_track is not None:
-            self._smooth_bbox(active_track.bbox_xyxy, self.state)
-            self.last_good_bbox = self.get_display_bbox()
-            desired_zoom = self.desired_zoom(frame, active_track, self.state)
-            if desired_zoom > self.smooth_zoom:
-                alpha = 0.34 if self.state == self.STATE_ACQUIRE else 0.24
-            else:
-                alpha = 0.08
-            self.smooth_zoom = (1.0 - alpha) * self.smooth_zoom + alpha * desired_zoom
-        else:
-            # hold zoom almost fixed for short losses
-            self.smooth_zoom = 0.998 * self.smooth_zoom + 0.002 * self.smooth_zoom
-
-        smooth_center = self._step_towards(desired_center, active_track is not None, self.state)
+        smooth_center = self._step_towards(desired_center, active_track is not None)
 
         return (
             predicted_center,
@@ -279,6 +145,4 @@ class NarrowTracker:
             self.hold_count,
             self.last_pan_speed,
             self.last_tilt_speed,
-            self.state,
-            self.jump_limited,
         )

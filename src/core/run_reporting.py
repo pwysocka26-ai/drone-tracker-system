@@ -9,6 +9,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from core.manifest_rules import (
+    classify_run,
+    detect_symptoms,
+    recommend_first_action,
+    select_analysis_windows,
+    top_failure_frames,
+    select_manifest_events,
+)
+
 
 @dataclass
 class RunReportPaths:
@@ -459,123 +468,6 @@ def _compute_metrics(
     }
 
 
-def _write_metrics_csv(metrics_path: Path, metrics: dict[str, Any]) -> None:
-    with metrics_path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.writer(handle)
-        writer.writerow(["metric", "value"])
-        for k, v in metrics.items():
-            writer.writerow([k, v])
-
-
-def _write_timeline_md(timeline_path: Path, events: list[dict[str, Any]]) -> None:
-    lines = [
-        "# Timeline",
-        "",
-        "| Frame | Time [s] | Type | Description |",
-        "|---:|---:|---|---|",
-    ]
-
-    for e in events:
-        lines.append(
-            f"| {e['frame_idx']} | {e['ts_s']:.2f} | {e['kind']} | {e['description']} |"
-        )
-
-    if not events:
-        lines.append("| - | - | info | No events detected |")
-
-    timeline_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-
-def _write_keyframes_md(
-    keyframes_path: Path,
-    events: list[dict[str, Any]],
-    shots: list[dict[str, Any]],
-    rows_count: int,
-) -> None:
-    lines = [
-        "# Keyframes",
-        "",
-        "| Frame | Time [s] | Type | Screenshot | Description |",
-        "|---:|---:|---|---|---|",
-    ]
-
-    if not events:
-        lines.append("| - | - | info | - | No key events detected |")
-    else:
-        for e in events:
-            shot = _closest_shot(e["frame_idx"], rows_count, shots, e["kind"]) or "-"
-            lines.append(
-                f"| {e['frame_idx']} | {e['ts_s']:.2f} | {e['kind']} | {shot} | {e['description']} |"
-            )
-
-    keyframes_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-
-def _guess_failure_mode(metrics: dict[str, Any], events: list[dict[str, Any]]) -> str:
-    if metrics["lock_lost_count"] > 0 and metrics["reacquire_count"] > 0:
-        return "reacquire_failure_with_owner_instability"
-    if metrics["center_lock_off_count"] >= 3:
-        return "edge_geometry_break"
-    if metrics["detection_gap_count"] >= 3:
-        return "detection_dropout_burst"
-    if metrics["wide_owner_switches"] + metrics["narrow_owner_switches"] >= 8:
-        return "selected_id_instability"
-    return "general_tracking_instability"
-
-
-def _analysis_priority(events: list[dict[str, Any]]) -> list[str]:
-    kinds = {e["kind"] for e in events}
-    priority = ["timeline", "keyframes", "metrics", "telemetry"]
-    if "lock_lost" in kinds or "reacquire" in kinds:
-        return ["timeline", "keyframes", "telemetry", "metrics"]
-    return priority
-
-
-def _preferred_windows(events: list[dict[str, Any]]) -> list[list[int]]:
-    priority_order = [
-        "lock_lost",
-        "reacquire",
-        "center_lock_off",
-        "drift",
-        "owner_switch",
-        "narrow_switch",
-        "detection_gap",
-        "detection_drop",
-    ]
-    picked: list[list[int]] = []
-    seen_ranges: set[tuple[int, int]] = set()
-
-    for kind in priority_order:
-        for e in events:
-            if e["kind"] != kind:
-                continue
-
-            start = max(0, int(e["frame_idx"]) - 12)
-            end = int(e["frame_idx"]) + 12
-
-            merged = False
-            for idx, existing in enumerate(picked):
-                if not (end < existing[0] - 6 or start > existing[1] + 6):
-                    picked[idx] = [min(start, existing[0]), max(end, existing[1])]
-                    merged = True
-                    break
-
-            if not merged:
-                key = (start, end)
-                if key not in seen_ranges:
-                    picked.append([start, end])
-                    seen_ranges.add(key)
-
-            if len(picked) >= 3:
-                break
-
-        if len(picked) >= 3:
-            break
-
-    picked.sort(key=lambda x: x[0])
-    return picked
-
-
 def _git_text(repo_root: Path, args: list[str]) -> str:
     try:
         result = subprocess.run(
@@ -645,87 +537,6 @@ def _artifact_status(
     }
 
 
-def _symptoms(
-    metrics: dict[str, Any],
-    events: list[dict[str, Any]],
-    final_state: dict[str, Any],
-) -> list[str]:
-    symptoms: list[str] = []
-
-    if metrics["narrow_owner_switches"] >= 2:
-        symptoms.append("frequent_narrow_switches")
-    if metrics["wide_owner_switches"] >= 3:
-        symptoms.append("wide_owner_instability")
-    if metrics["short_drop_count"] > 0 or metrics["detection_gap_count"] > 0:
-        symptoms.append("repeated_short_detection_drops")
-    if metrics["lock_lost_count"] > 0:
-        symptoms.append("lock_loss_after_owner_instability")
-    if metrics["reacquire_count"] > 0:
-        symptoms.append("reacquire_entry_after_drift")
-    if metrics["center_lock_off_count"] > 0:
-        symptoms.append("center_lock_breaks")
-    if final_state["narrow_owner"] is None:
-        symptoms.append("run_ended_without_narrow_owner")
-
-    deduped: list[str] = []
-    seen: set[str] = set()
-    for item in symptoms:
-        if item not in seen:
-            seen.add(item)
-            deduped.append(item)
-
-    return deduped
-
-
-def _recommended_first_action(
-    metrics: dict[str, Any],
-    events: list[dict[str, Any]],
-    final_state: dict[str, Any],
-) -> dict[str, str]:
-    if metrics["lock_lost_count"] > 0 or metrics["reacquire_count"] > 0:
-        return {
-            "type": "inspect_and_patch",
-            "module": "src/core/narrow_tracker.py",
-            "change_kind": "reacquire_gate_tightening",
-            "reason": "narrow owner instability around lock_lost and reacquire transitions",
-        }
-    if metrics["center_lock_off_count"] >= 2:
-        return {
-            "type": "inspect_and_patch",
-            "module": "src/core/target_manager.py",
-            "change_kind": "edge_geometry_gate_tightening",
-            "reason": "center lock breaks suggest edge and geometry instability in owner selection",
-        }
-    if metrics["wide_owner_switches"] >= 3:
-        return {
-            "type": "inspect_and_patch",
-            "module": "src/core/target_manager.py",
-            "change_kind": "owner_selection_stabilization",
-            "reason": "wide owner selection is unstable and likely drives downstream narrow churn",
-        }
-    return {
-        "type": "inspect",
-        "module": "src/core/app.py",
-        "change_kind": "integration_trace_validation",
-        "reason": "start from the integration path and validate event generation against telemetry",
-    }
-
-
-def _run_classification(metrics: dict[str, Any], final_state: dict[str, Any]) -> str:
-    if not final_state.get("lock_active", False):
-        if metrics.get("lock_lost_count", 0) > 0 or metrics.get("reacquire_count", 0) > 0:
-            return "failed_end_state"
-        return "unstable"
-
-    if metrics.get("wide_owner_switches", 0) + metrics.get("narrow_owner_switches", 0) >= 8:
-        return "unstable"
-
-    if metrics.get("detection_gap_count", 0) >= 3:
-        return "degraded"
-
-    return "stable"
-
-
 def _links(output_dir: Path, git_meta: dict[str, Any]) -> dict[str, str]:
     repo_slug = "pwysocka26-ai/drone-tracker-system"
     commit = git_meta.get("commit", "unknown")
@@ -740,90 +551,56 @@ def _links(output_dir: Path, git_meta: dict[str, Any]) -> dict[str, str]:
     }
 
 
-def _top_failure_frames(
-    events: list[dict[str, Any]],
-    final_state: dict[str, Any],
-) -> list[dict[str, Any]]:
-    severity_rank = {
-        "lock_lost": 100,
-        "reacquire": 90,
-        "center_lock_off": 80,
-        "drift": 70,
-        "owner_switch": 60,
-        "narrow_switch": 55,
-        "detection_gap": 50,
-        "detection_drop": 40,
-    }
+def _write_metrics_csv(metrics_path: Path, metrics: dict[str, Any]) -> None:
+    with metrics_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["metric", "value"])
+        for k, v in metrics.items():
+            writer.writerow([k, v])
 
-    ranked = sorted(
-        events,
-        key=lambda e: (
-            severity_rank.get(e["kind"], 0),
-            e["frame_idx"],
-        ),
-        reverse=True,
-    )
 
-    picked: list[dict[str, Any]] = []
-    used_frames: set[int] = set()
+def _write_timeline_md(timeline_path: Path, events: list[dict[str, Any]]) -> None:
+    lines = [
+        "# Timeline",
+        "",
+        "| Frame | Time [s] | Type | Description |",
+        "|---:|---:|---|---|",
+    ]
 
-    for e in ranked:
-        frame = int(e["frame_idx"])
-        if any(abs(frame - uf) <= 6 for uf in used_frames):
-            continue
-        picked.append(
-            {
-                "frame": frame,
-                "time_s": round(float(e["ts_s"]), 2),
-                "type": e["kind"],
-                "description": e["description"],
-            }
+    for e in events:
+        lines.append(
+            f"| {e['frame_idx']} | {e['ts_s']:.2f} | {e['kind']} | {e['description']} |"
         )
-        used_frames.add(frame)
-        if len(picked) >= 3:
-            break
 
-    picked.sort(key=lambda x: x["frame"])
-    return picked
-
-
-def _selected_manifest_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
     if not events:
-        return []
+        lines.append("| - | - | info | No events detected |")
 
-    severity_order = {
-        "lock_lost": 100,
-        "reacquire": 90,
-        "center_lock_off": 80,
-        "drift": 70,
-        "owner_switch": 60,
-        "narrow_switch": 55,
-        "detection_gap": 50,
-        "detection_drop": 40,
-        "reacquire_complete": 35,
-        "center_lock_on": 20,
-        "detection_return": 10,
-    }
+    timeline_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
-    tail_events = sorted(events[-3:], key=lambda e: e["frame_idx"])
-    important = sorted(
-        events,
-        key=lambda e: (severity_order.get(e["kind"], 0), e["frame_idx"]),
-        reverse=True,
-    )
 
-    merged: list[dict[str, Any]] = []
-    seen: set[tuple[int, str]] = set()
+def _write_keyframes_md(
+    keyframes_path: Path,
+    events: list[dict[str, Any]],
+    shots: list[dict[str, Any]],
+    rows_count: int,
+) -> None:
+    lines = [
+        "# Keyframes",
+        "",
+        "| Frame | Time [s] | Type | Screenshot | Description |",
+        "|---:|---:|---|---|---|",
+    ]
 
-    for e in important[:10] + tail_events:
-        key = (int(e["frame_idx"]), str(e["kind"]))
-        if key in seen:
-            continue
-        seen.add(key)
-        merged.append(e)
+    if not events:
+        lines.append("| - | - | info | - | No key events detected |")
+    else:
+        for e in events:
+            shot = _closest_shot(e["frame_idx"], rows_count, shots, e["kind"]) or "-"
+            lines.append(
+                f"| {e['frame_idx']} | {e['ts_s']:.2f} | {e['kind']} | {shot} | {e['description']} |"
+            )
 
-    merged.sort(key=lambda e: e["frame_idx"])
-    return merged[:12]
+    keyframes_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def _write_run_summary_md(
@@ -891,23 +668,27 @@ def _write_manifest_md(
     git_meta: dict[str, Any],
     final_state: dict[str, Any],
     artifacts_status: dict[str, bool],
-    symptoms: list[str],
-    recommended_first_action: dict[str, str],
 ) -> None:
     manifest_version = "1.0"
-    failure_mode = _guess_failure_mode(metrics, events)
-    run_classification = _run_classification(metrics, final_state)
     links = _links(output_dir, git_meta)
-    top_failure_frames = _top_failure_frames(events, final_state)
+
+    classification = classify_run(metrics, final_state, events)
+    symptom_result = detect_symptoms(metrics, final_state, events)
+    first_action = recommend_first_action(classification, symptom_result)
+    windows = select_analysis_windows(events)
+    top_frames = top_failure_frames(events)
+    selected_events = select_manifest_events(events)
+
+    run_classification = classification.get("run_classification", "mixed_failure")
+    secondary_classification = classification.get("secondary_classification", "mixed_failure")
+    primary_symptom = symptom_result.get("primary_symptom", "none")
+    symptoms = symptom_result.get("symptoms", [])
 
     verdict = (
         "This run looks unstable. The main suspected issue is narrow owner instability under repeated detection gaps and edge-triggered geometry breaks."
-        if failure_mode != "general_tracking_instability"
-        else "This run looks somewhat unstable. The main suspected issue is general owner and handoff instability."
+        if run_classification != "stable"
+        else "This run looks stable. No major terminal failure pattern was detected."
     )
-
-    key_events = _selected_manifest_events(events)
-    windows = _preferred_windows(events)
 
     lines = [
         "# Latest Run Manifest",
@@ -928,6 +709,7 @@ def _write_manifest_md(
         "",
         "## Run classification",
         f"- run_classification: {run_classification}",
+        f"- secondary_classification: {secondary_classification}",
         "",
         "## Key metrics",
         f"- frames: {metrics['frames_total']}",
@@ -953,15 +735,15 @@ def _write_manifest_md(
         "## Key events",
     ]
 
-    for e in key_events:
+    for e in selected_events:
         lines.append(f"- frame {e['frame_idx']}: {e['kind']} — {e['description']}")
 
     lines += [
         "",
         "## Top failure frames",
     ]
-    if top_failure_frames:
-        for item in top_failure_frames:
+    if top_frames:
+        for item in top_frames:
             lines.append(
                 f"- frame {item['frame']} ({item['time_s']:.2f}s): {item['type']} — {item['description']}"
             )
@@ -971,6 +753,7 @@ def _write_manifest_md(
     lines += [
         "",
         "## Symptoms",
+        f"- primary_symptom: {primary_symptom}",
     ]
     if symptoms:
         for item in symptoms:
@@ -980,21 +763,13 @@ def _write_manifest_md(
 
     lines += [
         "",
-        "## Suspected failure mode",
-        failure_mode,
-        "",
-        "## Analysis priority",
-    ]
-    for item in _analysis_priority(events):
-        lines.append(f"- {item}")
-
-    lines += [
-        "",
         "## Recommended first action",
-        f"- type: {recommended_first_action['type']}",
-        f"- module: {recommended_first_action['module']}",
-        f"- change_kind: {recommended_first_action['change_kind']}",
-        f"- reason: {recommended_first_action['reason']}",
+        f"- type: {first_action['type']}",
+        f"- module: {first_action['module']}",
+        f"- change_kind: {first_action['change_kind']}",
+        f"- reason: {first_action['reason']}",
+        f"- confidence: {first_action['confidence']}",
+        f"- priority: {first_action['priority']}",
         "",
         "## Quick links",
         f"- github_repo: {links['github_repo']}",
@@ -1048,19 +823,21 @@ def _write_manifest_json(
     git_meta: dict[str, Any],
     final_state: dict[str, Any],
     artifacts_status: dict[str, bool],
-    symptoms: list[str],
-    recommended_first_action: dict[str, str],
 ) -> None:
     manifest_version = "1.0"
-    failure_mode = _guess_failure_mode(metrics, events)
-    run_classification = _run_classification(metrics, final_state)
     links = _links(output_dir, git_meta)
-    top_failure_frames = _top_failure_frames(events, final_state)
-    selected_events = _selected_manifest_events(events)
+
+    classification = classify_run(metrics, final_state, events)
+    symptom_result = detect_symptoms(metrics, final_state, events)
+    first_action = recommend_first_action(classification, symptom_result)
+    windows = select_analysis_windows(events)
+    top_frames = top_failure_frames(events)
+    selected_events = select_manifest_events(events)
 
     payload = {
         "manifest_version": manifest_version,
-        "run_classification": run_classification,
+        "run_classification": classification.get("run_classification", "mixed_failure"),
+        "secondary_classification": classification.get("secondary_classification", "mixed_failure"),
         "run": {
             "run_id": run_id,
             "created_at": run_id,
@@ -1074,11 +851,11 @@ def _write_manifest_json(
         "summary": {
             "quick_verdict": (
                 "Run unstable. Main suspected issue is narrow owner instability under repeated detection gaps and edge-triggered geometry breaks."
-                if failure_mode != "general_tracking_instability"
-                else "Run somewhat unstable. Main suspected issue is general owner and handoff instability."
+                if classification.get("run_classification") != "stable"
+                else "Run stable. No major terminal failure pattern was detected."
             ),
-            "suspected_failure_mode": failure_mode,
-            "analysis_priority": _analysis_priority(events),
+            "suspected_failure_mode": classification.get("secondary_classification", "mixed_failure"),
+            "analysis_priority": ["timeline", "keyframes", "telemetry", "metrics"],
         },
         "metrics": {
             "frames": metrics["frames_total"],
@@ -1108,7 +885,10 @@ def _write_manifest_json(
             }
             for e in selected_events
         ],
-        "top_failure_frames": top_failure_frames,
+        "top_failure_frames": top_frames,
+        "primary_symptom": symptom_result.get("primary_symptom", "none"),
+        "symptoms": symptom_result.get("symptoms", []),
+        "recommended_first_action": first_action,
         "links": links,
         "artifacts": {
             "run_summary": str(output_dir / "run_summary.md"),
@@ -1130,8 +910,6 @@ def _write_manifest_json(
                 "reacquire_phases",
             ],
         },
-        "symptoms": symptoms,
-        "recommended_first_action": recommended_first_action,
         "agent_hints": {
             "primary_modules_to_check": [
                 "src/core/target_manager.py",
@@ -1143,7 +921,7 @@ def _write_manifest_json(
                 "edge_geometry_break",
                 "reacquire_failure",
             ],
-            "preferred_analysis_window_frames": _preferred_windows(events),
+            "preferred_analysis_window_frames": windows,
             "patch_strategy": "minimal_safe_patch",
             "regression_focus": [
                 "narrow_owner_switches",
@@ -1209,8 +987,6 @@ def generate_run_reports(
         shot_dir_path,
         video_dir_path,
     )
-    symptoms = _symptoms(metrics, events, final_state)
-    recommended_first_action = _recommended_first_action(metrics, events, final_state)
 
     _write_manifest_md(
         manifest_md_path,
@@ -1224,8 +1000,6 @@ def generate_run_reports(
         git_meta,
         final_state,
         artifacts_status,
-        symptoms,
-        recommended_first_action,
     )
     _write_manifest_json(
         manifest_json_path,
@@ -1239,8 +1013,6 @@ def generate_run_reports(
         git_meta,
         final_state,
         artifacts_status,
-        symptoms,
-        recommended_first_action,
     )
 
     if latest_dir is not None:

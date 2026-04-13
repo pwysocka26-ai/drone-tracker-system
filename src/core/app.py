@@ -142,6 +142,38 @@ def clamp_box(x1, y1, x2, y2, w, h):
     return max(0, int(x1)), max(0, int(y1)), min(w, int(x2)), min(h, int(y2))
 
 
+
+def keep_target_inside_crop(center, target_center, crop_w, crop_h, frame_shape, margin_ratio=0.22):
+    if center is None or target_center is None:
+        return center
+    h, w = frame_shape[:2]
+    cx, cy = float(center[0]), float(center[1])
+    tx, ty = float(target_center[0]), float(target_center[1])
+
+    # Keep the owner inside an inner safe window of the crop.
+    margin_x = max(8.0, crop_w * float(margin_ratio))
+    margin_y = max(8.0, crop_h * float(margin_ratio))
+
+    left = cx - crop_w * 0.5 + margin_x
+    right = cx + crop_w * 0.5 - margin_x
+    top = cy - crop_h * 0.5 + margin_y
+    bottom = cy + crop_h * 0.5 - margin_y
+
+    if tx < left:
+        cx -= (left - tx)
+    elif tx > right:
+        cx += (tx - right)
+
+    if ty < top:
+        cy -= (top - ty)
+    elif ty > bottom:
+        cy += (ty - bottom)
+
+    cx = max(crop_w * 0.5, min(float(w) - crop_w * 0.5, cx))
+    cy = max(crop_h * 0.5, min(float(h) - crop_h * 0.5, cy))
+    return (cx, cy)
+
+
 def crop_to_16_9(frame, center=None, scale=2.5, out_size=(780, 360), return_meta=False):
     out_w, out_h = out_size
     h, w = frame.shape[:2]
@@ -179,6 +211,24 @@ def crop_to_16_9(frame, center=None, scale=2.5, out_size=(780, 360), return_meta
     if return_meta:
         return resized, (x1, y1, x2, y2)
     return resized
+
+
+
+def estimate_crop_size_for_zoom(frame_shape, zoom, out_size=(780, 360)):
+    out_w, out_h = out_size
+    h, w = frame_shape[:2]
+    aspect = out_w / out_h
+
+    if (w / h) > aspect:
+        crop_h = h / max(1.0, float(zoom))
+        crop_w = crop_h * aspect
+    else:
+        crop_w = w / max(1.0, float(zoom))
+        crop_h = crop_w / aspect
+
+    crop_w = max(80.0, min(float(w), crop_w))
+    crop_h = max(80.0, min(float(h), crop_h))
+    return crop_w, crop_h
 
 
 def crop_group(frame, tracks, out_size=(780, 360)):
@@ -252,11 +302,42 @@ def draw_tracks(frame, tracks, selected_id):
     return out
 
 
+
+def recenter_bbox_for_owner(display_bbox, display_center, frame_shape=None, shrink=0.72, min_size=16):
+    if display_bbox is None or display_center is None:
+        return display_bbox
+    x1, y1, x2, y2 = display_bbox
+    bw = max(1.0, float(x2) - float(x1))
+    bh = max(1.0, float(y2) - float(y1))
+
+    # Keep the detector size cue, but anchor the box strictly on the selected owner center.
+    bw = max(float(min_size), bw * float(shrink))
+    bh = max(float(min_size), bh * float(shrink))
+
+    cx = float(display_center[0])
+    cy = float(display_center[1])
+
+    nx1 = cx - 0.5 * bw
+    ny1 = cy - 0.5 * bh
+    nx2 = cx + 0.5 * bw
+    ny2 = cy + 0.5 * bh
+
+    if frame_shape is not None:
+        h, w = frame_shape[:2]
+        nx1 = max(0.0, min(float(w - 1), nx1))
+        ny1 = max(0.0, min(float(h - 1), ny1))
+        nx2 = max(0.0, min(float(w - 1), nx2))
+        ny2 = max(0.0, min(float(h - 1), ny2))
+
+    return (nx1, ny1, nx2, ny2)
+
+
 def draw_target_on_narrow(narrow_frame, crop_rect, display_bbox, display_center, display_no='?'):
     if display_bbox is None or display_center is None:
         return narrow_frame
 
-    x1, y1, x2, y2 = tighten_bbox(display_bbox, min_size=14)
+    owner_bbox = recenter_bbox_for_owner(display_bbox, display_center, shrink=0.58, min_size=14)
+    x1, y1, x2, y2 = tighten_bbox(owner_bbox, min_size=14)
     cx1, cy1, cx2, cy2 = crop_rect
     crop_w = max(1, cx2 - cx1)
     crop_h = max(1, cy2 - cy1)
@@ -472,9 +553,12 @@ def _estimate_zoom_for_track(frame_shape, track, current_zoom, max_zoom=19.5, sc
     tx, ty = track.center_xy
     bw, bh = _bbox_size(track.bbox_xyxy)
 
-    linear_fill = max(0.20, min(0.75, screen_fill ** 0.5))
-    desired_crop_w = max(bw / linear_fill, 180.0)
-    desired_crop_h = max(bh / linear_fill, 110.0)
+    # screen_fill is area-like target occupancy. Convert to linear occupancy.
+    linear_fill = max(0.28, min(0.80, screen_fill ** 0.5))
+
+    # Desired crop that makes the selected target visibly large in narrow view.
+    desired_crop_w = max(bw / linear_fill, 120.0)
+    desired_crop_h = max(bh / linear_fill, 72.0)
 
     aspect = 780.0 / 360.0
     if desired_crop_w / desired_crop_h < aspect:
@@ -482,6 +566,7 @@ def _estimate_zoom_for_track(frame_shape, track, current_zoom, max_zoom=19.5, sc
     else:
         desired_crop_h = desired_crop_w / aspect
 
+    # Maximum crop allowed if we still want to keep the target center inside frame near edges.
     margin_x = min(tx, fw - tx)
     margin_y = min(ty, fh - ty)
     edge_crop_w = max(80.0, margin_x * 2.0)
@@ -491,10 +576,12 @@ def _estimate_zoom_for_track(frame_shape, track, current_zoom, max_zoom=19.5, sc
     else:
         edge_crop_w = edge_crop_h * aspect
 
-    crop_w = max(desired_crop_w, min(edge_crop_w, fw))
-    crop_h = max(desired_crop_h, min(edge_crop_h, fh))
-    crop_w = min(crop_w, fw)
-    crop_h = min(crop_h, fh)
+    # IMPORTANT:
+    # We want the crop as tight as possible for zoom, but not larger than edge/frame limits.
+    crop_w = min(desired_crop_w, edge_crop_w, float(fw))
+    crop_h = min(desired_crop_h, edge_crop_h, float(fh))
+    crop_w = max(80.0, crop_w)
+    crop_h = max(80.0, crop_h)
 
     if (fw / fh) > aspect:
         req_zoom = fh / max(1.0, crop_h)
@@ -503,8 +590,9 @@ def _estimate_zoom_for_track(frame_shape, track, current_zoom, max_zoom=19.5, sc
 
     req_zoom = max(1.0, min(max_zoom, req_zoom))
 
-    max_step_up = 0.12
-    max_step_down = 0.08
+    # Faster zoom-in response, slightly slower zoom-out response.
+    max_step_up = 0.30
+    max_step_down = 0.12
     if req_zoom > current_zoom:
         req_zoom = min(req_zoom, current_zoom + max_step_up)
     else:
@@ -924,8 +1012,11 @@ def run_app(config):
             edge_limit_active = False
             tracking_quality_state = 'REACQUIRE'
             if soft_track is not None:
-                display_center, display_bbox = display_box_smoother.update(soft_track)
-                tx, ty = display_center if display_center is not None else soft_track.center_xy
+                # Crop motion can be smoothed, but lock/overlay must refer to the actual selected owner.
+                _, _smoothed_bbox = display_box_smoother.update(soft_track)
+                display_center = tuple(float(v) for v in soft_track.center_xy)
+                display_bbox = tuple(float(v) for v in soft_track.bbox_xyxy)
+                tx, ty = display_center
                 if smooth_center is None:
                     smooth_center = (tx, ty)
                 pan_err = tx - smooth_center[0]
@@ -936,12 +1027,30 @@ def run_app(config):
                     pan_speed = pan_err
                     tilt_speed = tilt_err
                 else:
+                    err_mag = max(abs(pan_err), abs(tilt_err))
+
+                    # Faster center chase when the target is visibly off-center,
+                    # especially at higher zoom where even small offsets matter.
                     alpha = 0.18
+                    max_step = crop_max_step_px
+                    if handoff_state.zoom >= 3.0 or err_mag >= 24.0:
+                        alpha = 0.34
+                        max_step = max(crop_max_step_px, 42.0)
+                    if handoff_state.zoom >= 6.0 or err_mag >= 48.0:
+                        alpha = 0.52
+                        max_step = max(crop_max_step_px, 72.0)
+                    if handoff_state.zoom >= 12.0 or err_mag >= 72.0:
+                        alpha = 0.78
+                        max_step = max(crop_max_step_px, 140.0)
+
                     cx = smooth_center[0] + alpha * pan_err
                     cy = smooth_center[1] + alpha * tilt_err
+
+                    # Hard snap if we're already close enough.
                     if abs(pan_err) < crop_snap_deadband_px and abs(tilt_err) < crop_snap_deadband_px:
                         cx, cy = tx, ty
-                    smooth_center = _apply_center_slew_limit(smooth_center, (cx, cy), max_step=crop_max_step_px)
+
+                    smooth_center = _apply_center_slew_limit(smooth_center, (cx, cy), max_step=max_step)
                     pan_speed = pan_err * alpha
                     tilt_speed = tilt_err * alpha
 
@@ -953,6 +1062,23 @@ def run_app(config):
                     screen_fill=float(narrow_camera['screen_fill']),
                 )
                 target_zoom = max(float(narrow_camera['min_zoom']), min(float(narrow_camera['max_zoom']), target_zoom))
+
+                # If the target is still far from the crop center, temporarily relax zoom
+                # so the centering loop can catch up and the box lands on the target.
+                center_err_mag = max(abs(pan_err), abs(tilt_err))
+                if center_err_mag >= 90.0:
+                    relaxed_zoom = max(float(narrow_camera['min_zoom']), handoff_state.zoom - 2.20)
+                    target_zoom = min(target_zoom, relaxed_zoom)
+                elif center_err_mag >= 60.0:
+                    relaxed_zoom = max(float(narrow_camera['min_zoom']), handoff_state.zoom - 1.20)
+                    target_zoom = min(target_zoom, relaxed_zoom)
+                elif center_err_mag >= 40.0:
+                    relaxed_zoom = max(float(narrow_camera['min_zoom']), handoff_state.zoom - 0.65)
+                    target_zoom = min(target_zoom, relaxed_zoom)
+                elif center_err_mag >= 24.0:
+                    relaxed_zoom = max(float(narrow_camera['min_zoom']), handoff_state.zoom - 0.30)
+                    target_zoom = min(target_zoom, relaxed_zoom)
+
                 handoff_state.zoom = target_zoom
                 smooth_zoom = target_zoom
 
@@ -963,6 +1089,8 @@ def run_app(config):
                     display_bbox = handoff_state.last_good_bbox
                     tracking_quality_state = 'HOLD'
                 else:
+                    handoff_state.last_good_center = display_center
+                    handoff_state.last_good_bbox = display_bbox
                     handoff_state.last_good_zoom = smooth_zoom
                     tracking_quality_state = 'TRACKING'
 
@@ -1000,6 +1128,17 @@ def run_app(config):
             wide_debug = crop_group(debug_frame, tracks, (1560, 450))
 
             if smooth_center is not None:
+                if display_center is not None:
+                    crop_w, crop_h = estimate_crop_size_for_zoom(frame.shape, smooth_zoom, (780, 360))
+                    safe_margin_ratio = 0.18 if smooth_zoom >= 10.0 else 0.22
+                    smooth_center = keep_target_inside_crop(
+                        smooth_center,
+                        display_center,
+                        crop_w,
+                        crop_h,
+                        frame.shape,
+                        margin_ratio=safe_margin_ratio,
+                    )
                 narrow_output, narrow_crop_rect = crop_to_16_9(frame, smooth_center, smooth_zoom, (780, 360), return_meta=True)
                 label = f'TARGET ID {target_manager.selected_id}' if soft_track is not None else f'TRACK HOLD ID {target_manager.selected_id}'
                 real_pan_err = 0.0
@@ -1020,6 +1159,7 @@ def run_app(config):
                 cv2.putText(narrow_output, f'PAN ERR {real_pan_err:.1f}  TILT ERR {real_tilt_err:.1f}', (20, 108), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
                 cv2.putText(narrow_output, f'ZOOM {smooth_zoom:.1f}x', (20, 146), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
                 cv2.putText(narrow_output, f'HOLD {hold_count}', (20, 184), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+                cv2.putText(narrow_output, 'ZOOM MODE: TARGET FILL + RECENTER', (20, 320), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
                 cv2.putText(narrow_output, f'QUALITY {tracking_quality_state}', (20, 258), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255, 255, 255), 2)
                 center_lock_text = 'CENTER LOCK ON' if (center_lock and display_center is not None) else 'CENTER LOCK OFF'
                 cv2.putText(narrow_output, center_lock_text, (20, 222), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)

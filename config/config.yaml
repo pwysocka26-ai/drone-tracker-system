@@ -56,3 +56,14 @@ narrow_control:
   display_size_alpha: 0.82
   display_max_center_step: 42.0
   display_max_size_step: 24.0
+camera:
+  wide:
+    width: 1920
+    height: 1080
+    fov_deg: 34.5
+  narrow:
+    width: 1920
+    height: 1080
+    fov_min_deg: 1.77
+    fov_max_deg: 49.0
+    screen_fill: 0.18

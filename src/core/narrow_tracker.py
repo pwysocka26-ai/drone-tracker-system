@@ -62,6 +62,9 @@ class NarrowTracker:
         self.large_target_count = 0
         self.last_good_center = None
         self.last_good_zoom = 2.2
+        self.reacquire_grace_frames = max(8, int(self.hold_frames * 0.18))
+        self.reacquire_boost_frames = max(12, int(self.hold_frames * 0.25))
+        self.terminal_hold_frames = max(6, int(self.hold_frames * 0.10))
 
     def reset(self):
         self.kalman.reset()
@@ -151,7 +154,9 @@ class NarrowTracker:
             conf = float(getattr(active_track, "confidence", 0.0) or 0.0)
 
             large_target = rel > 0.12
+            reacquire_recent = 0 < self.hold_count <= self.reacquire_boost_frames
             degraded = (missed >= 1) or (conf < 0.18)
+            degraded = degraded or reacquire_recent
 
             corrected = self.kalman.correct(active_track.center_xy[0], active_track.center_xy[1])
             desired_center = corrected
@@ -162,11 +167,15 @@ class NarrowTracker:
             self.large_target_count = self.large_target_count + 1 if large_target else 0
 
             desired_zoom = self.desired_zoom(frame, active_track)
-            zoom_alpha = 0.94 if large_target else (0.92 if degraded else 0.88)
+            if reacquire_recent:
+                desired_zoom = 0.72 * self.smooth_zoom + 0.28 * desired_zoom
+            zoom_alpha = 0.96 if reacquire_recent else (0.94 if large_target else (0.92 if degraded else 0.88))
             self.smooth_zoom = zoom_alpha * self.smooth_zoom + (1.0 - zoom_alpha) * desired_zoom
 
             smooth_center = self._step_towards(desired_center, True, degraded=degraded)
-            if smooth_center is not None:
+            if smooth_center is not None and (
+                (not reacquire_recent) or (conf >= 0.14) or (missed <= 1)
+            ):
                 self.last_good_center = smooth_center
                 self.last_good_zoom = self.smooth_zoom
 
@@ -176,20 +185,42 @@ class NarrowTracker:
             desired_center = predicted_center if predicted_center is not None else self.last_good_center
 
             soft_hold_frames = int(self.hold_frames * 1.35)
-            if self.hold_count > soft_hold_frames:
+            final_hold_frames = int(self.hold_frames * 1.75)
+            if self.hold_count > final_hold_frames:
                 self.reset()
                 return None, None, self.smooth_zoom, self.hold_count, 0.0, 0.0
+
+            terminal_hold_active = self.hold_count <= self.terminal_hold_frames and self.last_good_center is not None
 
             if desired_center is None and self.last_good_center is not None:
                 desired_center = self.last_good_center
 
-            if desired_center is not None:
+            if terminal_hold_active:
+                smooth_center = self.last_good_center
+                self.smooth_center = smooth_center
+                self.last_pan_speed = 0.0
+                self.last_tilt_speed = 0.0
+            elif desired_center is not None:
                 smooth_center = self._step_towards(desired_center, False, degraded=True)
+                if self.hold_count <= self.reacquire_grace_frames and self.last_good_center is not None:
+                    gx = 0.82 * self.last_good_center[0] + 0.18 * smooth_center[0]
+                    gy = 0.82 * self.last_good_center[1] + 0.18 * smooth_center[1]
+                    smooth_center = (gx, gy)
+                    self.smooth_center = smooth_center
             else:
                 smooth_center = self.smooth_center
 
             target_zoom = self.last_good_zoom if self.last_good_zoom is not None else self.smooth_zoom
-            self.smooth_zoom = 0.985 * self.smooth_zoom + 0.015 * target_zoom
+            if terminal_hold_active:
+                self.smooth_zoom = 0.998 * self.smooth_zoom + 0.002 * target_zoom
+            else:
+                zoom_hold_alpha = 0.992 if self.hold_count <= self.reacquire_grace_frames else 0.985
+                self.smooth_zoom = zoom_hold_alpha * self.smooth_zoom + (1.0 - zoom_hold_alpha) * target_zoom
+
+            if self.hold_count > soft_hold_frames and self.last_good_center is not None:
+                smooth_center = self.last_good_center
+                self.smooth_center = smooth_center
+                self.smooth_zoom = 0.996 * self.smooth_zoom + 0.004 * target_zoom
 
         return (
             predicted_center,

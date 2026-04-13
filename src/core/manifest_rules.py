@@ -47,6 +47,39 @@ def _late_run_failure(events: list[dict[str, Any]], metrics: dict[str, Any]) -> 
     return False
 
 
+def _late_terminal_reacquire(metrics: dict[str, Any], final_state: dict[str, Any], events: list[dict[str, Any]]) -> bool:
+    final_narrow_owner = final_state.get("narrow_owner", metrics.get("final_narrow_owner"))
+    tracking_state = str(final_state.get("tracking_state", "") or "")
+    lock_active = bool(final_state.get("lock_active", False))
+
+    if final_narrow_owner is not None or lock_active:
+        return False
+    if tracking_state != "REACQUIRE":
+        return False
+    if not _late_run_failure(events, metrics):
+        return False
+
+    lock_losses = _safe_int(metrics.get("lock_lost_count", metrics.get("lock_losses")))
+    reacquire_phases = _safe_int(metrics.get("reacquire_count", metrics.get("reacquire_phases")))
+    wide_switches = _safe_int(metrics.get("wide_owner_switches"))
+    narrow_switches = _safe_int(metrics.get("narrow_owner_switches"))
+    avg_geometry_score = _safe_float(metrics.get("avg_geometry_score"))
+    avg_wide_owner_quality = _safe_float(metrics.get("avg_wide_quality", metrics.get("avg_wide_owner_quality")))
+    max_owner_missed = _safe_int(metrics.get("max_owner_missed"))
+    max_drop = _safe_int(metrics.get("max_drop"))
+
+    return (
+        lock_losses <= 1
+        and reacquire_phases <= 2
+        and wide_switches <= 4
+        and narrow_switches <= 6
+        and avg_geometry_score >= 0.78
+        and avg_wide_owner_quality >= 0.48
+        and max_owner_missed <= 30
+        and max_drop <= 50
+    )
+
+
 def classify_run(
     metrics: dict[str, Any],
     final_state: dict[str, Any],
@@ -74,6 +107,11 @@ def classify_run(
     edge_triggered = _has_edge_center_lock_break(timeline_events)
 
     if failed_end_state:
+        if _late_terminal_reacquire(metrics, final_state, timeline_events):
+            return {
+                "run_classification": "late_terminal_reacquire",
+                "secondary_classification": "degraded_but_stable_until_end",
+            }
         if lock_losses >= 1 and reacquire_phases >= 1:
             return {
                 "run_classification": "failed_end_state",
@@ -226,6 +264,16 @@ def recommend_first_action(
     symptoms = list(symptom_result.get("symptoms", []))
     primary_symptom = str(symptom_result.get("primary_symptom", "none"))
 
+    if run_classification == "late_terminal_reacquire":
+        return {
+            "type": "inspect",
+            "module": "src/core/run_reporting.py",
+            "change_kind": "terminal_state_reporting_review",
+            "reason": "runtime stayed broadly stable and only the terminal reacquire state remained unresolved at the end of the run",
+            "confidence": 0.82,
+            "priority": "medium",
+        }
+
     if run_classification == "failed_end_state" or run_classification == "reacquire_failure":
         return {
             "type": "inspect_and_patch",
@@ -311,6 +359,9 @@ def build_quick_verdict(
         and lock_losses >= 1
     ):
         return "Run failed in late-stage tracking after quality degradation, edge-triggered center lock break, and reacquire loss."
+
+    if run_classification == "late_terminal_reacquire":
+        return "Run stayed broadly stable and only ended in a late terminal reacquire after a final lock loss near the end of the scenario."
 
     if run_classification == "failed_end_state" and secondary_classification == "reacquire_failure":
         return "Run ended in failed end state after lock loss and unsuccessful reacquire recovery."

@@ -343,12 +343,12 @@ class NarrowHandoffState:
         self.track = None
         self.center = None
         self.bbox = None
-        self.zoom = 1.8
+        self.zoom = 1.0
         self.missed = 9999
         self.age = 9999
         self.last_good_center = None
         self.last_good_bbox = None
-        self.last_good_zoom = 1.8
+        self.last_good_zoom = 1.0
         self.gap_len = 0
         self.max_gap_len = 0
 
@@ -356,12 +356,12 @@ class NarrowHandoffState:
         self.track = None
         self.center = None
         self.bbox = None
-        self.zoom = 1.8
+        self.zoom = 1.0
         self.missed = 9999
         self.age = 9999
         self.last_good_center = None
         self.last_good_bbox = None
-        self.last_good_zoom = 1.8
+        self.last_good_zoom = 1.0
         self.gap_len = 0
         self.max_gap_len = 0
 
@@ -423,6 +423,7 @@ def _choose_soft_handoff_track(tracks, selected_id, handoff_state, radius_px=140
 
     best = None
     best_score = -1e9
+    strict_reacquire = int(getattr(handoff_state, 'missed', 0) or 0) <= 3
     for tr in tracks:
         dist = _distance(tuple(tr.center_xy), anchor)
         if dist > radius_px:
@@ -430,7 +431,11 @@ def _choose_soft_handoff_track(tracks, selected_id, handoff_state, radius_px=140
 
         conf = float(getattr(tr, 'confidence', 0.0) or 0.0)
         sim = _bbox_similarity(getattr(tr, 'bbox_xyxy', None), handoff_state.last_good_bbox or handoff_state.bbox)
-        score = conf * 8.0 + sim * 4.0 - dist / max(1.0, radius_px)
+        min_sim = 0.72 if strict_reacquire else 0.60
+        if sim < min_sim:
+            continue
+
+        score = conf * 6.0 + sim * 8.0 - dist / max(1.0, radius_px)
         if best is None or score > best_score:
             best = tr
             best_score = score
@@ -462,13 +467,14 @@ def _blend_track_with_handoff(tr, handoff_state, center_alpha=0.76, size_alpha=0
     return tr
 
 
-def _estimate_zoom_for_track(frame_shape, track, current_zoom, max_zoom=2.4):
+def _estimate_zoom_for_track(frame_shape, track, current_zoom, max_zoom=19.5, screen_fill=0.18):
     fh, fw = frame_shape[:2]
     tx, ty = track.center_xy
     bw, bh = _bbox_size(track.bbox_xyxy)
 
-    desired_crop_w = max(bw * 9.0, 180.0)
-    desired_crop_h = max(bh * 9.0, 110.0)
+    linear_fill = max(0.20, min(0.75, screen_fill ** 0.5))
+    desired_crop_w = max(bw / linear_fill, 180.0)
+    desired_crop_h = max(bh / linear_fill, 110.0)
 
     aspect = 780.0 / 360.0
     if desired_crop_w / desired_crop_h < aspect:
@@ -521,6 +527,41 @@ def _apply_center_slew_limit(prev_center, next_center, max_step=24.0):
     return (nx, ny)
 
 
+def _camera_profiles_from_defaults(camera_cfg):
+    wide_cfg = camera_cfg.get('wide') or {}
+    narrow_cfg = camera_cfg.get('narrow') or {}
+
+    wide_width = int(wide_cfg.get('width', camera_cfg.get('wide_width', 1920)))
+    wide_height = int(wide_cfg.get('height', camera_cfg.get('wide_height', 1080)))
+    wide_fov_deg = float(wide_cfg.get('fov_deg', camera_cfg.get('fixed_fov_deg', 34.5)))
+
+    narrow_width = int(narrow_cfg.get('width', camera_cfg.get('narrow_width', 1920)))
+    narrow_height = int(narrow_cfg.get('height', camera_cfg.get('narrow_height', 1080)))
+    narrow_fov_min_deg = float(narrow_cfg.get('fov_min_deg', camera_cfg.get('zoom_fov_min_deg', 1.77)))
+    narrow_fov_max_deg = float(narrow_cfg.get('fov_max_deg', camera_cfg.get('zoom_fov_max_deg', 49.0)))
+    screen_fill = float(narrow_cfg.get('screen_fill', camera_cfg.get('screen_fill', 0.18)))
+
+    max_zoom = wide_fov_deg / max(0.1, narrow_fov_min_deg)
+    min_zoom = wide_fov_deg / max(0.1, narrow_fov_max_deg)
+
+    return {
+        'wide': {
+            'width': wide_width,
+            'height': wide_height,
+            'fov_deg': wide_fov_deg,
+        },
+        'narrow': {
+            'width': narrow_width,
+            'height': narrow_height,
+            'fov_min_deg': narrow_fov_min_deg,
+            'fov_max_deg': narrow_fov_max_deg,
+            'screen_fill': max(0.08, min(0.60, screen_fill)),
+            'min_zoom': max(1.0, min_zoom),
+            'max_zoom': max(1.0, max_zoom),
+        },
+    }
+
+
 def run_app(config):
     mode = config.get('mode', 'video')
     if mode != 'video':
@@ -533,6 +574,11 @@ def run_app(config):
     narrow_cfg = config.get('narrow') or {}
     handoff_cfg = config.get('handoff') or {}
     control_cfg = config.get('narrow_control') or {}
+    camera_cfg = config.get('camera') or {}
+
+    camera_profiles = _camera_profiles_from_defaults(camera_cfg)
+    wide_camera = camera_profiles['wide']
+    narrow_camera = camera_profiles['narrow']
 
     source = video_cfg.get('source', 'video.mp4')
     model_name = yolo_cfg.get('model', 'yolov8n.pt')
@@ -592,6 +638,8 @@ def run_app(config):
     )
     narrow_tracker = NarrowTracker(hold_frames=int(narrow_cfg.get('hold_frames', 80)))
     handoff_state = NarrowHandoffState()
+    handoff_state.zoom = float(narrow_camera['min_zoom'])
+    handoff_state.last_good_zoom = float(narrow_camera['min_zoom'])
     display_box_smoother = DisplayBoxSmoother(
         center_alpha=float(control_cfg.get('display_center_alpha', 0.78)),
         size_alpha=float(control_cfg.get('display_size_alpha', 0.82)),
@@ -792,11 +840,16 @@ def run_app(config):
             selection_tracks = confirmed_tracks if confirmed_tracks else tracks
 
             target_manager.update(selection_tracks, predicted_center, frame.shape)
-            selected_track = target_manager.find_active_track(tracks)
+            selected_track = target_manager.find_active_track(selection_tracks)
 
             active_track = selected_track
-            if active_track is not None and int(getattr(active_track, 'missed_frames', 0) or 0) > soft_active_max_missed:
-                active_track = None
+            if active_track is not None:
+                active_missed = int(getattr(active_track, 'missed_frames', 0) or 0)
+                soft_grace_missed = soft_active_max_missed
+                if handoff_state.last_good_center is not None and handoff_state.missed <= handoff_hold_frames:
+                    soft_grace_missed = max(soft_active_max_missed, soft_active_max_missed + 2)
+                if active_missed > soft_grace_missed:
+                    active_track = None
 
             if selected_track is not None and int(getattr(selected_track, 'missed_frames', 0) or 0) <= soft_active_max_missed:
                 handoff_state.update_from_track(selected_track, zoom=handoff_state.zoom)
@@ -816,13 +869,40 @@ def run_app(config):
                 if reacquired is not None:
                     soft_track = _blend_track_with_handoff(reacquired, handoff_state)
                     handoff_state.update_from_track(soft_track, zoom=handoff_state.zoom)
-                elif handoff_state.last_good_center is not None and handoff_state.last_good_bbox is not None:
+                elif (
+                    target_manager.selected_id is not None
+                    and handoff_state.last_good_center is not None
+                    and handoff_state.last_good_bbox is not None
+                    and handoff_state.missed <= handoff_hold_frames
+                ):
                     soft_track = Track(
-                        track_id=int(target_manager.selected_id if target_manager.selected_id is not None else -1),
-                        raw_id=int(target_manager.selected_id if target_manager.selected_id is not None else -1),
+                        track_id=int(target_manager.selected_id),
+                        raw_id=int(target_manager.selected_id),
                         bbox_xyxy=handoff_state.last_good_bbox,
                         center_xy=handoff_state.last_good_center,
-                        confidence=0.0,
+                        confidence=0.01,
+                    )
+                    reused_last_good = True
+
+            if (
+                soft_track is not None
+                and target_manager.selected_id is not None
+                and int(getattr(soft_track, 'track_id', -1)) != int(target_manager.selected_id)
+                and handoff_state.last_good_center is not None
+                and handoff_state.last_good_bbox is not None
+                and handoff_state.missed <= handoff_hold_frames
+                and target_manager.lock_age >= max(6, target_manager.min_hold_frames + 2)
+            ):
+                selected_exact = next((tr for tr in selection_tracks if int(getattr(tr, 'track_id', -1)) == int(target_manager.selected_id)), None)
+                if selected_exact is not None:
+                    soft_track = selected_exact
+                else:
+                    soft_track = Track(
+                        track_id=int(target_manager.selected_id),
+                        raw_id=int(target_manager.selected_id),
+                        bbox_xyxy=handoff_state.last_good_bbox,
+                        center_xy=handoff_state.last_good_center,
+                        confidence=0.02,
                     )
                     reused_last_good = True
 
@@ -837,9 +917,12 @@ def run_app(config):
 
             predicted_center, smooth_center, smooth_zoom, hold_count, _, _ = narrow_tracker.update(frame, soft_track)
 
+            effective_track = soft_track
+            terminal_hold_latch = False
             display_center = None
             display_bbox = None
             edge_limit_active = False
+            tracking_quality_state = 'REACQUIRE'
             if soft_track is not None:
                 display_center, display_bbox = display_box_smoother.update(soft_track)
                 tx, ty = display_center if display_center is not None else soft_track.center_xy
@@ -862,7 +945,14 @@ def run_app(config):
                     pan_speed = pan_err * alpha
                     tilt_speed = tilt_err * alpha
 
-                target_zoom = _estimate_zoom_for_track(frame.shape, soft_track, handoff_state.zoom, max_zoom=2.4)
+                target_zoom = _estimate_zoom_for_track(
+                    frame.shape,
+                    soft_track,
+                    handoff_state.zoom,
+                    max_zoom=float(narrow_camera['max_zoom']),
+                    screen_fill=float(narrow_camera['screen_fill']),
+                )
+                target_zoom = max(float(narrow_camera['min_zoom']), min(float(narrow_camera['max_zoom']), target_zoom))
                 handoff_state.zoom = target_zoom
                 smooth_zoom = target_zoom
 
@@ -871,19 +961,35 @@ def run_app(config):
                     smooth_zoom = handoff_state.last_good_zoom
                     display_center = handoff_state.last_good_center
                     display_bbox = handoff_state.last_good_bbox
+                    tracking_quality_state = 'HOLD'
                 else:
                     handoff_state.last_good_zoom = smooth_zoom
+                    tracking_quality_state = 'TRACKING'
 
                 edge_limit_active = abs(smooth_zoom - target_zoom) < 1e-6
             else:
                 pan_speed = 0.0
                 tilt_speed = 0.0
                 display_box_smoother.reset()
-                if handoff_state.missed <= handoff_hold_frames and handoff_state.last_good_center is not None:
+                if (
+                    handoff_state.missed <= handoff_hold_frames
+                    and target_manager.selected_id is not None
+                    and handoff_state.last_good_center is not None
+                    and handoff_state.last_good_bbox is not None
+                ):
                     smooth_center = handoff_state.last_good_center
                     smooth_zoom = handoff_state.last_good_zoom
                     display_center = handoff_state.last_good_center
                     display_bbox = handoff_state.last_good_bbox
+                    effective_track = Track(
+                        track_id=int(target_manager.selected_id),
+                        raw_id=int(target_manager.selected_id),
+                        bbox_xyxy=handoff_state.last_good_bbox,
+                        center_xy=handoff_state.last_good_center,
+                        confidence=0.005,
+                    )
+                    terminal_hold_latch = True
+                    tracking_quality_state = 'HOLD'
 
             wide_program = crop_group(frame, tracks, (780, 360))
             debug_frame = draw_tracks(frame, tracks, target_manager.selected_id)
@@ -914,10 +1020,11 @@ def run_app(config):
                 cv2.putText(narrow_output, f'PAN ERR {real_pan_err:.1f}  TILT ERR {real_tilt_err:.1f}', (20, 108), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
                 cv2.putText(narrow_output, f'ZOOM {smooth_zoom:.1f}x', (20, 146), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
                 cv2.putText(narrow_output, f'HOLD {hold_count}', (20, 184), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+                cv2.putText(narrow_output, f'QUALITY {tracking_quality_state}', (20, 258), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255, 255, 255), 2)
                 center_lock_text = 'CENTER LOCK ON' if (center_lock and display_center is not None) else 'CENTER LOCK OFF'
                 cv2.putText(narrow_output, center_lock_text, (20, 222), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
                 if edge_limit_active:
-                    cv2.putText(narrow_output, 'EDGE LIMIT COMP', (20, 258), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
+                    cv2.putText(narrow_output, 'EDGE LIMIT COMP', (20, 292), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
                 if display_bbox is not None and display_center is not None:
                     disp_id = soft_track.track_id if soft_track is not None else (target_manager.selected_id or '?')
                     narrow_output = draw_target_on_narrow(narrow_output, narrow_crop_rect, display_bbox, display_center, disp_id)
@@ -946,11 +1053,20 @@ def run_app(config):
                 (255, 255, 255),
                 2,
             )
-            cv2.putText(wide_debug, 'CORE MODE: PRIMARY TARGET', (20, 352), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-            cv2.putText(wide_debug, 'SUPPORT TRACKS: DEBUG ONLY', (20, 388), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+            cv2.putText(
+                wide_debug,
+                f"WIDE {wide_camera['width']}x{wide_camera['height']} FOV {wide_camera['fov_deg']:.1f}  NARROW {narrow_camera['width']}x{narrow_camera['height']} FOV {narrow_camera['fov_min_deg']:.2f}-{narrow_camera['fov_max_deg']:.1f}  MAXZ {narrow_camera['max_zoom']:.1f}x  FILL {narrow_camera['screen_fill']*100:.0f}%",
+                (20, 352),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.62,
+                (255, 255, 255),
+                2,
+            )
+            cv2.putText(wide_debug, 'CORE MODE: PRIMARY TARGET', (20, 388), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+            cv2.putText(wide_debug, 'SUPPORT TRACKS: DEBUG ONLY', (20, 424), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
             auto_text = 'AUTO PICK ENABLED' if not target_manager.manual_lock else 'AUTO PICK DISABLED'
-            cv2.putText(wide_debug, auto_text, (20, 424), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
-            cv2.putText(wide_debug, f'HANDOFF MISS: {handoff_state.missed}  MAX GAP: {handoff_state.max_gap_len}', (20, 460), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2)
+            cv2.putText(wide_debug, auto_text, (20, 460), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+            cv2.putText(wide_debug, f'HANDOFF MISS: {handoff_state.missed}  MAX GAP: {handoff_state.max_gap_len}', (20, 496), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2)
 
             wide_program = add_title(wide_program, 'WIDE PROGRAM')
             narrow_output = add_title(narrow_output, 'NARROW OUTPUT')
@@ -958,8 +1074,8 @@ def run_app(config):
             dashboard = cv2.vconcat([cv2.hconcat([wide_program, narrow_output]), wide_debug])
 
             current_wide_owner_id = target_manager.selected_id
-            current_narrow_owner_id = soft_track.track_id if soft_track is not None else None
-            current_lock_state = 'TRACKING' if soft_track is not None else 'REACQUIRE'
+            current_narrow_owner_id = effective_track.track_id if effective_track is not None else None
+            current_lock_state = 'HOLD' if terminal_hold_latch else ('TRACKING' if effective_track is not None else 'REACQUIRE')
             current_center_lock = bool(center_lock)
 
             if prev_wide_owner_id is not None and current_wide_owner_id != prev_wide_owner_id and current_wide_owner_id is not None:
@@ -1000,35 +1116,35 @@ def run_app(config):
             )
 
             if telemetry_enabled and telemetry is not None:
-                active_bbox = list(soft_track.bbox_xyxy) if soft_track is not None else None
+                active_bbox = list(effective_track.bbox_xyxy) if effective_track is not None else None
                 active_area = None
-                if soft_track is not None:
-                    bw = max(0.0, float(soft_track.bbox_xyxy[2]) - float(soft_track.bbox_xyxy[0]))
-                    bh = max(0.0, float(soft_track.bbox_xyxy[3]) - float(soft_track.bbox_xyxy[1]))
+                if effective_track is not None:
+                    bw = max(0.0, float(effective_track.bbox_xyxy[2]) - float(effective_track.bbox_xyxy[0]))
+                    bh = max(0.0, float(effective_track.bbox_xyxy[3]) - float(effective_track.bbox_xyxy[1]))
                     active_area = bw * bh
 
                 telemetry.log_frame(
                     frame_idx=frame_id,
                     mode=('MANUAL' if target_manager.manual_lock else 'AUTO'),
                     selected_id=target_manager.selected_id,
-                    active_track=soft_track,
+                    active_track=effective_track,
                     tracks=tracks,
                     narrow_center=smooth_center,
                     center_lock=center_lock,
-                    drift_gate_open=(soft_track is None and smooth_center is not None),
+                    drift_gate_open=((effective_track is None and smooth_center is not None) and not terminal_hold_latch),
                     wide_owner_id=target_manager.selected_id,
-                    narrow_owner_id=(soft_track.track_id if soft_track is not None else None),
+                    narrow_owner_id=(effective_track.track_id if effective_track is not None else None),
                     pending_owner_id=None,
-                    lock_state=('TRACKING' if soft_track is not None else 'REACQUIRE'),
-                    wide_owner_quality=(float(getattr(soft_track, 'confidence', 0.0)) if soft_track is not None else 0.0),
-                    geometry_score=1.0 if center_lock else 0.0,
+                    lock_state=('HOLD' if terminal_hold_latch else ('TRACKING' if effective_track is not None else 'REACQUIRE')),
+                    wide_owner_quality=(float(getattr(effective_track, 'confidence', 0.0)) if effective_track is not None else 0.0),
+                    geometry_score=(max(0.0, 1.0 - ((abs(real_pan_err) + abs(real_tilt_err)) / 260.0)) if display_center is not None else 0.0),
                     edge_active=edge_limit_active,
                     edge_limit_active=edge_limit_active,
                     owner_missed_frames=handoff_state.missed,
                     yolo_boxes=last_yolo_boxes,
                     yolo_dets=last_det_tracks,
                     yolo_drop=drop_streak,
-                    owner_reason='manual_lock' if target_manager.manual_lock else 'auto_tracking',
+                    owner_reason=('manual_lock' if target_manager.manual_lock else f'auto_tracking:{tracking_quality_state.lower()}'),
                     handoff_reject_reason='',
                     manual_lock=bool(target_manager.manual_lock),
                     active_track_bbox=active_bbox,

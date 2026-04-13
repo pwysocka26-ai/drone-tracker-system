@@ -113,9 +113,39 @@ class TargetManager:
     def find_active_track(self, tracks):
         if self.selected_id is None:
             return None
-        for tr in tracks or []:
+
+        tracks = list(tracks or [])
+        if not tracks:
+            return None
+
+        for tr in tracks:
             if int(getattr(tr, "track_id", -1)) == int(self.selected_id):
                 return tr
+
+        fallback_candidates = []
+        for tr in tracks:
+            missed = int(getattr(tr, "missed_frames", 0) or 0)
+            conf = float(getattr(tr, "confidence", 0.0) or 0.0)
+            if missed > max(self.max_select_missed + 1, self.hard_keep_missed + 1):
+                continue
+            if conf < max(0.06, self.min_confirmed_conf * 0.8):
+                continue
+            fallback_candidates.append(tr)
+
+        if not fallback_candidates:
+            return None
+
+        if self.last_selected_raw_id is not None:
+            raw_matches = [
+                tr for tr in fallback_candidates
+                if getattr(tr, "raw_id", None) is not None
+                and int(getattr(tr, "raw_id")) == int(self.last_selected_raw_id)
+            ]
+            if raw_matches:
+                if self.last_selected_center is not None:
+                    return min(raw_matches, key=lambda tr: self._distance(self._score_center(tr), self.last_selected_center))
+                return raw_matches[0]
+
         return None
 
     def _distance(self, a: Optional[Point], b: Optional[Point]) -> float:

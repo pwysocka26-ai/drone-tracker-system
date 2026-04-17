@@ -131,6 +131,7 @@ class MultiTrackState:
 
     history: List[Point] = field(default_factory=list)
     predicted_center_xy: Optional[Point] = None
+    updated_this_frame: bool = False
     _kalman: Optional[SimpleKalman2D] = field(default=None, repr=False, compare=False)
 
     def copy_for_output(self) -> "MultiTrackState":
@@ -151,6 +152,7 @@ class MultiTrackState:
             target_score=self.target_score,
             history=list(self.history),
             predicted_center_xy=self.predicted_center_xy,
+            updated_this_frame=self.updated_this_frame,
             _kalman=self._kalman.clone_for_copy() if self._kalman is not None else None,
         )
 
@@ -190,6 +192,8 @@ class MultiTargetTracker:
 
     def update(self, detections: Iterable[object], frame_shape: Optional[Sequence[int]] = None) -> List[MultiTrackState]:
         dets = [self._normalize_detection(det) for det in detections]
+        for tr in self._tracks:
+            tr.updated_this_frame = False
         predicted_centers = [self._predict_center(tr) for tr in self._tracks]
         matches, unmatched_tracks, unmatched_dets = self._greedy_match(self._tracks, predicted_centers, dets)
 
@@ -357,6 +361,7 @@ class MultiTargetTracker:
         tr.hits += 1
         tr.missed_frames = 0
         tr.is_confirmed = tr.hits >= self.confirm_hits
+        tr.updated_this_frame = True
 
         tr.history.append(tr.center_xy)
         if len(tr.history) > self.history_size:
@@ -391,6 +396,7 @@ class MultiTargetTracker:
     def _spawn_track(self, det: MultiTrackState) -> MultiTrackState:
         tr = det.copy_for_output()
         tr.track_id = self._next_id
+        tr.updated_this_frame = True
         tr.age = 1
         tr.hits = 1
         tr.missed_frames = 0

@@ -1,6 +1,7 @@
 mode: video
 video:
   source: video.mp4
+  record_on_start: true
 yolo:
   model: yolov8s.pt
   backend: track
@@ -11,44 +12,51 @@ yolo:
   - 4
   inference_every: 1
   search_fallback: true
-  search_conf: 0.08
-  search_imgsz: 1536
-  search_interval: 2
+  search_conf: 0.07
+  search_imgsz: 1664
+  search_interval: 1
 tracker:
-  max_missed_frames: 24
+  max_missed_frames: 36
   confirm_hits: 2
-  max_center_distance: 180.0
+  max_center_distance: 220.0
   min_iou_for_match: 0.01
   velocity_alpha: 0.65
   history_size: 12
   reacquire_radius_auto: 135.0
   reacquire_radius_manual: 220.0
-  sticky_frames: 10
-  switch_margin: 0.15
-  switch_dwell: 3
-  switch_cooldown: 2
-  switch_persist: 1
-  max_select_missed: 2
+  sticky_frames: 24
+  switch_margin: 0.55
+  switch_dwell: 8
+  switch_cooldown: 10
+  switch_persist: 5
+  max_select_missed: 4
   min_start_conf: 0.1
   min_start_hits: 2
   min_confirmed_conf: 0.1
   min_hold_frames: 5
-  predicted_dist_px: 95.0
-  raw_id_bonus: 0.8
-  current_target_bonus: 1.4
-  target_selection_freeze_frames: 4
+  predicted_dist_px: 120.0
+  raw_id_bonus: 2.2
+  current_target_bonus: 5.4
+  target_selection_freeze_frames: 14
+  hard_keep_missed: 1
+  hard_keep_conf: 0.16
+  hard_switch_min_gain: 1.45
+  owner_switch_min_gap_px: 30.0
+  degraded_switch_persist: 3
+  healthy_switch_persist: 6
+  owner_sync_frames: 8
   use_kalman: true
   kalman_process_noise: 0.03
   kalman_measurement_noise: 0.2
 handoff:
-  soft_active_max_missed: 4
-  handoff_reacquire_radius: 165.0
-  handoff_hold_frames: 10
+  soft_active_max_missed: 8
+  handoff_reacquire_radius: 220.0
+  handoff_hold_frames: 20
   active_missed_soft_frames: 1
   active_missed_hard_frames: 3
   desync_guard_frames: 1
 narrow:
-  hold_frames: 80
+  hold_frames: 120
 narrow_control:
   crop_max_step_px: 24.0
   crop_snap_deadband_px: 14.0
@@ -67,3 +75,19 @@ camera:
     fov_min_deg: 1.77
     fov_max_deg: 49.0
     screen_fill: 0.18
+roi_search:
+  enabled: true
+  conf: 0.06
+  imgsz: 1920
+  interval: 1
+  required_drop: 1
+  expand: 4.8
+  min_size: 280
+  max_size: 1200
+  merge_iou: 0.16
+  merge_center_px: 48.0
+local_tracker:
+  enabled: true
+  max_lost_frames: 20
+  min_score: 0.55
+  reacquire_radius_px: 240.0

@@ -5,6 +5,7 @@ from typing import Optional, Tuple
 
 
 Point = Tuple[float, float]
+BBox = Tuple[float, float, float, float]
 
 
 class TargetManager:
@@ -32,6 +33,11 @@ class TargetManager:
         owner_switch_min_gap_px=22.0,
         degraded_switch_persist=2,
         healthy_switch_persist=4,
+        fallback_recover_radius=185.0,
+        fallback_bbox_min_similarity=0.42,
+        same_owner_commit_persist=2,
+        stale_owner_frames=8,
+        stale_global_switch_persist=3,
     ):
         self.selected_id = None
         self.manual_lock = False
@@ -58,6 +64,11 @@ class TargetManager:
         self.owner_switch_min_gap_px = float(owner_switch_min_gap_px)
         self.degraded_switch_persist = int(degraded_switch_persist)
         self.healthy_switch_persist = int(healthy_switch_persist)
+        self.fallback_recover_radius = float(fallback_recover_radius)
+        self.fallback_bbox_min_similarity = float(fallback_bbox_min_similarity)
+        self.same_owner_commit_persist = int(same_owner_commit_persist)
+        self.stale_owner_frames = int(stale_owner_frames)
+        self.stale_global_switch_persist = int(stale_global_switch_persist)
 
         self.lock_age = 9999
         self.frame_id = 0
@@ -66,9 +77,11 @@ class TargetManager:
         self.pending_count = 0
 
         self.last_selected_center = None
+        self.last_selected_bbox = None
         self.last_selected_raw_id = None
         self.selection_freeze_id = None
         self.selection_freeze_left = 0
+        self.selected_missing_frames = 0
 
     def reset(self):
         self.selected_id = None
@@ -79,9 +92,11 @@ class TargetManager:
         self.pending_id = None
         self.pending_count = 0
         self.last_selected_center = None
+        self.last_selected_bbox = None
         self.last_selected_raw_id = None
         self.selection_freeze_id = None
         self.selection_freeze_left = 0
+        self.selected_missing_frames = 0
 
     def set_auto_mode(self):
         self.manual_lock = False
@@ -89,6 +104,9 @@ class TargetManager:
         self.lock_age = 9999
         self.pending_id = None
         self.pending_count = 0
+        self.selection_freeze_id = None
+        self.selection_freeze_left = 0
+        self.selected_missing_frames = 0
 
     def set_manual_target(self, tid):
         self.manual_lock = True
@@ -99,6 +117,7 @@ class TargetManager:
         self.pending_count = 0
         self.selection_freeze_id = None
         self.selection_freeze_left = 0
+        self.selected_missing_frames = 0
 
     def freeze_to(self, tid, frames=None):
         if tid is None:
@@ -109,6 +128,95 @@ class TargetManager:
     def clear_freeze(self):
         self.selection_freeze_id = None
         self.selection_freeze_left = 0
+
+    def _distance(self, a: Optional[Point], b: Optional[Point]) -> float:
+        if a is None or b is None:
+            return float("inf")
+        return math.hypot(a[0] - b[0], a[1] - b[1])
+
+    def _score_center(self, tr):
+        pred = getattr(tr, "predicted_center_xy", None)
+        ctr = getattr(tr, "center_xy", None)
+        ref = pred or ctr
+        if ref is None:
+            return None
+        return (float(ref[0]), float(ref[1]))
+
+    def _bbox_similarity(self, a: Optional[BBox], b: Optional[BBox]) -> float:
+        if a is None or b is None:
+            return 0.0
+        aw = max(1.0, float(a[2]) - float(a[0]))
+        ah = max(1.0, float(a[3]) - float(a[1]))
+        bw = max(1.0, float(b[2]) - float(b[0]))
+        bh = max(1.0, float(b[3]) - float(b[1]))
+        dw = abs(aw - bw) / max(aw, bw)
+        dh = abs(ah - bh) / max(ah, bh)
+        return max(0.0, 1.0 - 0.5 * (dw + dh))
+
+    def _store_owner_reference(self, tr) -> None:
+        if tr is None:
+            return
+        center = self._score_center(tr)
+        if center is not None:
+            self.last_selected_center = center
+        bbox = getattr(tr, "bbox_xyxy", None)
+        if bbox is not None:
+            self.last_selected_bbox = tuple(float(v) for v in bbox)
+        rid = getattr(tr, "raw_id", None)
+        if rid is not None:
+            self.last_selected_raw_id = int(rid)
+
+    def _recovery_radius(self) -> float:
+        growth = 1.0 + min(0.80, 0.08 * float(self.selected_missing_frames))
+        return max(self.reacquire_radius_auto, self.fallback_recover_radius) * growth
+
+    def _fallback_same_owner_score(self, tr) -> float:
+        center = self._score_center(tr)
+        ref_center = self.last_selected_center
+        dist = self._distance(center, ref_center)
+        sim = self._bbox_similarity(getattr(tr, "bbox_xyxy", None), self.last_selected_bbox)
+        conf = float(getattr(tr, "confidence", 0.0) or 0.0)
+        raw_match = (
+            self.last_selected_raw_id is not None
+            and getattr(tr, "raw_id", None) is not None
+            and int(getattr(tr, "raw_id")) == int(self.last_selected_raw_id)
+        )
+        raw_bonus = 1.8 if raw_match else 0.0
+        radius = max(1.0, self._recovery_radius())
+        return sim * 8.0 + conf * 5.0 + raw_bonus - (dist / radius) * 2.5
+
+    def _same_owner_fallback_candidates(self, tracks):
+        if self.last_selected_center is None and self.last_selected_bbox is None:
+            return []
+
+        radius = self._recovery_radius()
+        out = []
+        for tr in tracks:
+            missed = int(getattr(tr, "missed_frames", 0) or 0)
+            conf = float(getattr(tr, "confidence", 0.0) or 0.0)
+            if missed > max(self.max_select_missed + 2, self.hard_keep_missed + 2):
+                continue
+            if conf < max(0.05, self.min_confirmed_conf * 0.60):
+                continue
+
+            center = self._score_center(tr)
+            dist = self._distance(center, self.last_selected_center)
+            sim = self._bbox_similarity(getattr(tr, "bbox_xyxy", None), self.last_selected_bbox)
+            raw_match = (
+                self.last_selected_raw_id is not None
+                and getattr(tr, "raw_id", None) is not None
+                and int(getattr(tr, "raw_id")) == int(self.last_selected_raw_id)
+            )
+
+            if raw_match:
+                out.append(tr)
+                continue
+
+            strong_geom = sim >= max(self.fallback_bbox_min_similarity, 0.58) and dist <= radius * 1.15
+            plausible_geom = sim >= self.fallback_bbox_min_similarity and dist <= radius
+            if strong_geom or plausible_geom:
+                out.append(tr)
+        return out
 
     def find_active_track(self, tracks):
         if self.selected_id is None:
@@ -146,15 +254,11 @@ class TargetManager:
                     return min(raw_matches, key=lambda tr: self._distance(self._score_center(tr), self.last_selected_center))
                 return raw_matches[0]
 
+        same_owner = self._same_owner_fallback_candidates(fallback_candidates)
+        if same_owner:
+            return max(same_owner, key=self._fallback_same_owner_score)
+
         return None
-
-    def _distance(self, a: Optional[Point], b: Optional[Point]) -> float:
-        if a is None or b is None:
-            return float("inf")
-        return math.hypot(a[0] - b[0], a[1] - b[1])
-
-    def _score_center(self, tr):
-        return tuple(getattr(tr, "predicted_center_xy", None) or tr.center_xy)
 
     def _eligible_tracks(self, tracks):
         out = []
@@ -225,21 +329,44 @@ class TargetManager:
             if int(raw_id) == int(self.last_selected_raw_id):
                 score += self.raw_id_bonus
 
+        if self.last_selected_bbox is not None:
+            score += self._bbox_similarity(getattr(tr, "bbox_xyxy", None), self.last_selected_bbox) * 2.0
+
         return score
+
+    def _advance_pending(self, candidate_id: int) -> int:
+        if self.pending_id == int(candidate_id):
+            self.pending_count += 1
+        else:
+            self.pending_id = int(candidate_id)
+            self.pending_count = 1
+        return self.pending_count
+
+    def _commit_selected(self, tr, freeze_extra=0):
+        self.selected_id = int(getattr(tr, "track_id"))
+        self.lock_age = 0
+        self.last_switch_frame = self.frame_id
+        self.pending_id = None
+        self.pending_count = 0
+        self.selected_missing_frames = 0
+        self._store_owner_reference(tr)
+        self.freeze_to(self.selected_id, self.selection_freeze_frames + int(freeze_extra))
+        return self.selected_id
 
     def update(self, tracks, predicted_center, frame_shape):
         self.frame_id += 1
         tracks = list(tracks or [])
         if not tracks:
+            self.selected_missing_frames += 1
             self.lock_age += 1
             return self.selected_id
 
         active = self.find_active_track(tracks)
         if active is not None:
-            self.last_selected_center = self._score_center(active)
-            rid = getattr(active, "raw_id", None)
-            if rid is not None:
-                self.last_selected_raw_id = int(rid)
+            self.selected_missing_frames = 0
+            self._store_owner_reference(active)
+        else:
+            self.selected_missing_frames += 1
 
         if self.manual_lock:
             self.lock_age = 0 if active is not None else self.lock_age + 1
@@ -254,13 +381,11 @@ class TargetManager:
             self.selection_freeze_left = max(0, self.selection_freeze_left - 1)
             if frozen is not None:
                 self.selected_id = int(getattr(frozen, "track_id", self.selection_freeze_id))
-                self.last_selected_center = self._score_center(frozen)
-                rid = getattr(frozen, "raw_id", None)
-                if rid is not None:
-                    self.last_selected_raw_id = int(rid)
+                self._store_owner_reference(frozen)
                 self.pending_id = None
                 self.pending_count = 0
                 self.lock_age += 1
+                self.selected_missing_frames = 0
                 return self.selected_id
             if self.selection_freeze_left == 0:
                 self.clear_freeze()
@@ -274,50 +399,47 @@ class TargetManager:
 
         if self.selected_id is None:
             best = max(candidates, key=lambda tr: self._score(tr, frame_shape, predicted_center))
-            if self.pending_id == int(best.track_id):
-                self.pending_count += 1
-            else:
-                self.pending_id = int(best.track_id)
-                self.pending_count = 1
+            pending = self._advance_pending(int(best.track_id))
+            if pending >= 2:
+                return self._commit_selected(best, freeze_extra=0)
+            return self.selected_id
 
-            if self.pending_count >= 2:
-                self.selected_id = int(best.track_id)
-                self.lock_age = 0
-                self.last_switch_frame = self.frame_id
-                self.pending_id = None
-                self.pending_count = 0
-                self.last_selected_center = self._score_center(best)
-                rid = getattr(best, "raw_id", None)
-                if rid is not None:
-                    self.last_selected_raw_id = int(rid)
+        # If exact ID vanished but a geometrically-consistent replacement exists,
+        # adopt the new track ID quickly instead of staying latched to a ghost owner.
+        if active is not None and int(getattr(active, "track_id", -1)) != int(self.selected_id):
+            same_raw = (
+                self.last_selected_raw_id is not None
+                and getattr(active, "raw_id", None) is not None
+                and int(getattr(active, "raw_id")) == int(self.last_selected_raw_id)
+            )
+            required = 1 if same_raw else max(2, self.same_owner_commit_persist)
+            pending = self._advance_pending(int(getattr(active, "track_id")))
+            if pending >= required:
+                return self._commit_selected(active, freeze_extra=2)
             return self.selected_id
 
         if active is None and anchor is not None:
             close = []
+            reacquire_radius = max(self.reacquire_radius_auto, self._recovery_radius())
             for tr in candidates:
                 dist = self._distance(self._score_center(tr), anchor)
-                if dist <= self.reacquire_radius_auto:
+                if dist <= reacquire_radius:
                     close.append(tr)
 
             if close:
                 best = max(close, key=lambda tr: self._score(tr, frame_shape, predicted_center))
-                if self.pending_id == int(best.track_id):
-                    self.pending_count += 1
-                else:
-                    self.pending_id = int(best.track_id)
-                    self.pending_count = 1
-
-                if self.pending_count >= max(2, self.degraded_switch_persist):
-                    self.selected_id = int(best.track_id)
-                    self.lock_age = 0
-                    self.last_switch_frame = self.frame_id
-                    self.pending_id = None
-                    self.pending_count = 0
-                    self.last_selected_center = self._score_center(best)
-                    rid = getattr(best, "raw_id", None)
-                    if rid is not None:
-                        self.last_selected_raw_id = int(rid)
+                pending = self._advance_pending(int(best.track_id))
+                if pending >= max(2, self.degraded_switch_persist):
+                    return self._commit_selected(best, freeze_extra=2)
                 return self.selected_id
+
+            # Hard stale-owner escape hatch: if we have visible candidates for a while,
+            # stop clinging to a dead owner and move to the strongest visible target.
+            if self.selected_missing_frames >= self.stale_owner_frames:
+                global_best = max(candidates, key=lambda tr: self._score(tr, frame_shape, predicted_center))
+                pending = self._advance_pending(int(global_best.track_id))
+                if pending >= max(2, self.stale_global_switch_persist):
+                    return self._commit_selected(global_best, freeze_extra=1)
 
             self.lock_age += 1
             return self.selected_id
@@ -379,7 +501,7 @@ class TargetManager:
                 return self.selected_id
 
         current_degraded = (current_missed >= 3) or (current_conf < 0.16)
-        near_anchor = self._distance(best_center, anchor) <= min(self.reacquire_radius_auto, self.predicted_dist_px)
+        near_anchor = self._distance(best_center, anchor) <= min(max(self.reacquire_radius_auto, self._recovery_radius()), self.predicted_dist_px * 1.8)
 
         margin = self.switch_margin * (0.30 if current_degraded else 1.20)
         ratio_ok = best_score > (current_score * (1.01 if current_degraded else 1.12))
@@ -397,25 +519,10 @@ class TargetManager:
         )
 
         if need_switch:
-            if self.pending_id == int(best.track_id):
-                self.pending_count += 1
-            else:
-                self.pending_id = int(best.track_id)
-                self.pending_count = 1
-
+            pending = self._advance_pending(int(best.track_id))
             required_persist = self.degraded_switch_persist if current_degraded else max(self.healthy_switch_persist, self.switch_persist)
-            if self.pending_count >= required_persist:
-                self.selected_id = int(best.track_id)
-                self.lock_age = 0
-                self.last_switch_frame = self.frame_id
-                self.pending_id = None
-                self.pending_count = 0
-                self.last_selected_center = self._score_center(best)
-                rid = getattr(best, "raw_id", None)
-                if rid is not None:
-                    self.last_selected_raw_id = int(rid)
-                self.freeze_to(self.selected_id, self.selection_freeze_frames + 4)
-                return self.selected_id
+            if pending >= required_persist:
+                return self._commit_selected(best, freeze_extra=4)
         else:
             self.pending_id = None
             self.pending_count = 0

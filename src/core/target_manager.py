@@ -573,6 +573,15 @@ class TargetManager:
         cooldown_ok = (self.frame_id - self.last_switch_frame) >= (3 if current_degraded else max(self.switch_cooldown, 10))
         geometry_separation_ok = center_gap >= (8.0 if current_degraded else self.owner_switch_min_gap_px)
 
+        velocity_coherent = True
+        if not current_degraded:
+            avx, avy = getattr(active, "velocity_xy", (0.0, 0.0)) or (0.0, 0.0)
+            bvx, bvy = getattr(best, "velocity_xy", (0.0, 0.0)) or (0.0, 0.0)
+            owner_speed = math.sqrt(avx * avx + avy * avy)
+            if owner_speed >= 4.0:
+                dot = avx * bvx + avy * bvy
+                velocity_coherent = dot >= 0.0
+
         need_switch = (
             near_anchor
             and best_score > (current_score + margin)
@@ -580,6 +589,7 @@ class TargetManager:
             and dwell_ok
             and cooldown_ok
             and geometry_separation_ok
+            and velocity_coherent
         )
 
         if need_switch:

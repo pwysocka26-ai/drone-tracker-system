@@ -1528,6 +1528,13 @@ def run_app(config):
                     display_box_smoother.reset()
                     narrow_tracker.kalman.init_state(tr.center_xy[0], tr.center_xy[1])
                     handoff_state.update_from_track(tr, zoom=handoff_state.zoom)
+    except Exception as exc:
+        import sys, traceback
+        print(f"CRASH at frame {frame_id}: {type(exc).__name__}: {exc}", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
+        if telemetry is not None:
+            telemetry.log_crash(frame_idx=frame_id, exc=exc)
+        raise
     finally:
         if telemetry is not None:
             path_obj = telemetry.path

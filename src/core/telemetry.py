@@ -63,6 +63,19 @@ class TelemetryLogger:
         except Exception:
             pass
 
+    def log_crash(self, frame_idx: int, exc: BaseException) -> None:
+        import traceback
+        rec = {
+            "event": "crash",
+            "frame_idx": int(frame_idx),
+            "time_s": float(frame_idx) / max(1.0, self.fps),
+            "exc_type": type(exc).__name__,
+            "exc_str": str(exc),
+            "traceback": traceback.format_exc(),
+        }
+        self._fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        self._fh.flush()
+
     def log_frame(
         self,
         frame_idx: int,

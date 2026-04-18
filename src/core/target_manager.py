@@ -14,10 +14,10 @@ class TargetManager:
         reacquire_radius_auto=135.0,
         reacquire_radius_manual=220.0,
         sticky_frames=22,
-        switch_margin=0.36,
-        switch_dwell=6,
-        switch_cooldown=7,
-        switch_persist=2,
+        switch_margin=0.40,
+        switch_dwell=7,
+        switch_cooldown=9,
+        switch_persist=3,
         max_select_missed=2,
         min_start_conf=0.10,
         min_start_hits=2,
@@ -25,19 +25,19 @@ class TargetManager:
         min_hold_frames=5,
         predicted_dist_px=95.0,
         raw_id_bonus=1.8,
-        current_target_bonus=4.2,
+        current_target_bonus=4.8,
         selection_freeze_frames=8,
         hard_keep_missed=1,
         hard_keep_conf=0.18,
         hard_switch_min_gain=1.10,
         owner_switch_min_gap_px=22.0,
         degraded_switch_persist=2,
-        healthy_switch_persist=4,
+        healthy_switch_persist=5,
         fallback_recover_radius=185.0,
         fallback_bbox_min_similarity=0.42,
-        same_owner_commit_persist=2,
-        stale_owner_frames=8,
-        stale_global_switch_persist=3,
+        same_owner_commit_persist=3,
+        stale_owner_frames=10,
+        stale_global_switch_persist=4,
     ):
         self.selected_id = None
         self.manual_lock = False
@@ -82,6 +82,10 @@ class TargetManager:
         self.selection_freeze_id = None
         self.selection_freeze_left = 0
         self.selected_missing_frames = 0
+        self.external_owner_hint_id = None
+        self.external_owner_hint_ttl = 0
+        self.external_owner_hint_center = None
+        self.external_owner_hint_strength = 1.0
 
     def reset(self):
         self.selected_id = None
@@ -97,6 +101,10 @@ class TargetManager:
         self.selection_freeze_id = None
         self.selection_freeze_left = 0
         self.selected_missing_frames = 0
+        self.external_owner_hint_id = None
+        self.external_owner_hint_ttl = 0
+        self.external_owner_hint_center = None
+        self.external_owner_hint_strength = 1.0
 
     def set_auto_mode(self):
         self.manual_lock = False
@@ -107,6 +115,10 @@ class TargetManager:
         self.selection_freeze_id = None
         self.selection_freeze_left = 0
         self.selected_missing_frames = 0
+        self.external_owner_hint_id = None
+        self.external_owner_hint_ttl = 0
+        self.external_owner_hint_center = None
+        self.external_owner_hint_strength = 1.0
 
     def set_manual_target(self, tid):
         self.manual_lock = True
@@ -128,6 +140,56 @@ class TargetManager:
     def clear_freeze(self):
         self.selection_freeze_id = None
         self.selection_freeze_left = 0
+
+    def set_external_owner_hint(self, tid, ttl=3, center=None, strength=1.0):
+        if tid is None:
+            self.clear_external_owner_hint()
+            return
+        self.external_owner_hint_id = int(tid)
+        self.external_owner_hint_ttl = max(0, int(ttl))
+        self.external_owner_hint_center = tuple(float(v) for v in center) if center is not None else None
+        self.external_owner_hint_strength = float(strength)
+
+    def clear_external_owner_hint(self):
+        self.external_owner_hint_id = None
+        self.external_owner_hint_ttl = 0
+        self.external_owner_hint_center = None
+        self.external_owner_hint_strength = 1.0
+
+    def _consume_external_owner_hint(self):
+        if self.external_owner_hint_ttl > 0:
+            self.external_owner_hint_ttl = max(0, int(self.external_owner_hint_ttl) - 1)
+        if self.external_owner_hint_ttl <= 0 and self.external_owner_hint_id is not None:
+            self.clear_external_owner_hint()
+
+    def _find_track_by_id(self, tracks, tid):
+        if tid is None:
+            return None
+        for tr in tracks or []:
+            if int(getattr(tr, "track_id", -1)) == int(tid):
+                return tr
+        return None
+
+    def _apply_external_owner_bias(self, tracks, predicted_center):
+        hint_id = self.external_owner_hint_id
+        if hint_id is None:
+            return predicted_center
+        hinted = self._find_track_by_id(tracks, hint_id)
+        if hinted is None:
+            return predicted_center
+        hinted_missed = int(getattr(hinted, "missed_frames", 0) or 0)
+        hinted_conf = float(getattr(hinted, "confidence", 0.0) or 0.0)
+        if hinted_missed > max(self.hard_keep_missed, 1):
+            return predicted_center
+        if hinted_conf < max(0.08, self.hard_keep_conf * 0.8):
+            return predicted_center
+        self.selected_id = int(hint_id)
+        self.lock_age = 0
+        self._store_owner_reference(hinted)
+        hint_center = self.external_owner_hint_center or self._score_center(hinted)
+        if hint_center is not None:
+            return hint_center
+        return predicted_center
 
     def _distance(self, a: Optional[Point], b: Optional[Point]) -> float:
         if a is None or b is None:
@@ -355,6 +417,7 @@ class TargetManager:
 
     def update(self, tracks, predicted_center, frame_shape):
         self.frame_id += 1
+        self._consume_external_owner_hint()
         tracks = list(tracks or [])
         if not tracks:
             self.selected_missing_frames += 1
@@ -395,6 +458,7 @@ class TargetManager:
             self.lock_age += 1
             return self.selected_id
 
+        predicted_center = self._apply_external_owner_bias(candidates, predicted_center)
         anchor = predicted_center or self.last_selected_center
 
         if self.selected_id is None:
@@ -491,7 +555,7 @@ class TargetManager:
         if current_healthy:
             if (
                 score_gap < self.hard_switch_min_gain
-                and dist_best_to_anchor >= dist_current_to_anchor * 0.92
+                and dist_best_to_anchor >= dist_current_to_anchor * 0.88
                 and center_gap < max(self.owner_switch_min_gap_px, self.predicted_dist_px * 0.35)
                 and not same_raw
             ):
@@ -503,10 +567,10 @@ class TargetManager:
         current_degraded = (current_missed >= 3) or (current_conf < 0.16)
         near_anchor = self._distance(best_center, anchor) <= min(max(self.reacquire_radius_auto, self._recovery_radius()), self.predicted_dist_px * 1.8)
 
-        margin = self.switch_margin * (0.30 if current_degraded else 1.20)
-        ratio_ok = best_score > (current_score * (1.01 if current_degraded else 1.12))
+        margin = self.switch_margin * (0.35 if current_degraded else 1.35)
+        ratio_ok = best_score > (current_score * (1.02 if current_degraded else 1.16))
         dwell_ok = self.lock_age >= (2 if current_degraded else max(self.min_hold_frames, self.switch_dwell))
-        cooldown_ok = (self.frame_id - self.last_switch_frame) >= (2 if current_degraded else max(self.switch_cooldown, 8))
+        cooldown_ok = (self.frame_id - self.last_switch_frame) >= (3 if current_degraded else max(self.switch_cooldown, 10))
         geometry_separation_ok = center_gap >= (8.0 if current_degraded else self.owner_switch_min_gap_px)
 
         need_switch = (
@@ -520,7 +584,7 @@ class TargetManager:
 
         if need_switch:
             pending = self._advance_pending(int(best.track_id))
-            required_persist = self.degraded_switch_persist if current_degraded else max(self.healthy_switch_persist, self.switch_persist)
+            required_persist = max(2, self.degraded_switch_persist) if current_degraded else max(self.healthy_switch_persist, self.switch_persist)
             if pending >= required_persist:
                 return self._commit_selected(best, freeze_extra=4)
         else:

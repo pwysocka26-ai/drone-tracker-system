@@ -59,7 +59,22 @@ class _SyntheticTrack:
 
 
 class NarrowTracker:
-    def __init__(self, hold_frames=120):
+    def __init__(
+        self,
+        hold_frames=120,
+        owner_switch_commit_frames=6,
+        owner_switch_cooldown_frames=8,
+        owner_recover_missed_frames=3,
+        owner_recover_confidence=0.10,
+        owner_recover_frames=14,
+        owner_hard_reacquire_frames=34,
+        strong_gain_healthy=1.65,
+        strong_gain_degraded=1.20,
+        reacquire_commit_frames=4,
+        lock_warmup_frames=5,
+        lock_break_confirm_frames=4,
+        reacquire_exit_confirm_frames=3,
+    ):
         self.kalman = SimpleKalman2D()
         self.smooth_center = None
         self.smooth_zoom = 2.2
@@ -74,10 +89,10 @@ class NarrowTracker:
         self.last_good_bbox = None
         self.last_owner_conf = 0.0
         self.last_owner_raw_id = None
-        self.reacquire_grace_frames = max(10, int(self.hold_frames * 0.22))
-        self.reacquire_boost_frames = max(14, int(self.hold_frames * 0.30))
-        self.terminal_hold_frames = max(18, int(self.hold_frames * 0.36))
-        self.reset_after_frames = max(72, int(self.hold_frames * 1.75))
+        self.reacquire_grace_frames = max(14, int(self.hold_frames * 0.28))
+        self.reacquire_boost_frames = max(18, int(self.hold_frames * 0.36))
+        self.terminal_hold_frames = max(28, int(self.hold_frames * 0.50))
+        self.reset_after_frames = max(96, int(self.hold_frames * 2.10))
 
         self.owner_id = None
         self.owner_track = None
@@ -86,7 +101,26 @@ class NarrowTracker:
 
         self.pending_owner_id = None
         self.pending_owner_count = 0
-        self.owner_switch_commit_frames = 3
+        self.owner_switch_commit_frames = int(owner_switch_commit_frames)
+        self.owner_switch_cooldown_frames = int(owner_switch_cooldown_frames)
+        self.owner_recover_missed_frames = int(owner_recover_missed_frames)
+        self.owner_recover_confidence = float(owner_recover_confidence)
+        self.owner_recover_frames = int(owner_recover_frames)
+        self.owner_hard_reacquire_frames = int(owner_hard_reacquire_frames)
+        self.strong_gain_healthy = float(strong_gain_healthy)
+        self.strong_gain_degraded = float(strong_gain_degraded)
+        self.reacquire_commit_frames = int(reacquire_commit_frames)
+        self.lock_warmup_frames = int(lock_warmup_frames)
+        self.lock_break_confirm_frames = int(lock_break_confirm_frames)
+        self.reacquire_exit_confirm_frames = int(reacquire_exit_confirm_frames)
+        self.frames_since_owner_switch = self.owner_switch_cooldown_frames
+
+        self.lock_phase = "UNLOCKED"
+        self.lock_measurement_count = 0
+        self.lock_break_count = 0
+        self.recovered_owner_count = 0
+        self.lock_active = False
+        self.center_lock = False
 
     def reset(self):
         self.kalman.reset()
@@ -108,6 +142,13 @@ class NarrowTracker:
         self.lock_state = "REACQUIRE"
         self.pending_owner_id = None
         self.pending_owner_count = 0
+        self.frames_since_owner_switch = self.owner_switch_cooldown_frames
+        self.lock_phase = "UNLOCKED"
+        self.lock_measurement_count = 0
+        self.lock_break_count = 0
+        self.recovered_owner_count = 0
+        self.lock_active = False
+        self.center_lock = False
 
     def desired_zoom(self, frame, track):
         h, w = frame.shape[:2]
@@ -213,58 +254,118 @@ class NarrowTracker:
         conf = max(0.02, min(0.35, self.last_owner_conf * 0.6 if self.last_owner_conf else 0.08))
         return _SyntheticTrack(self.owner_id, self.last_owner_raw_id, bbox, (cx, cy), conf)
 
+    def _should_recover_current_owner(self, current_track):
+        if current_track is None:
+            return False
+        missed = int(getattr(current_track, "missed_frames", 0) or 0)
+        conf = float(getattr(current_track, "confidence", 0.0) or 0.0)
+        if missed <= self.owner_recover_missed_frames:
+            return True
+        if self.hold_count <= self.owner_recover_frames and missed <= (self.owner_recover_missed_frames + 2):
+            return conf >= max(0.05, self.owner_recover_confidence * 0.80)
+        return missed <= (self.owner_recover_missed_frames + 1) and conf >= self.owner_recover_confidence
+
     def _resolve_owner_track(self, requested_track, tracks=None, manual_switch=False):
+        # NarrowTracker should execute the owner chosen by wide/app, not run an
+        # independent owner-commit policy in parallel. Autonomous owner changes
+        # here caused wide/narrow divergence during otherwise healthy tracking.
+        if requested_track is not None:
+            req_id = int(getattr(requested_track, "track_id", self.owner_id))
+            owner_changed = self.owner_id is not None and int(self.owner_id) != req_id
+            self.owner_id = req_id
+            self.pending_owner_id = None
+            self.pending_owner_count = 0
+            self.owner_track = requested_track
+            if manual_switch or owner_changed:
+                self.hold_count = 0
+                self.frames_since_owner_switch = 0
+            return requested_track
+
         current_track = self._find_track_by_id(tracks, self.owner_id)
-
-        if manual_switch and requested_track is not None:
-            self.owner_id = int(getattr(requested_track, "track_id", self.owner_id))
+        if self._should_recover_current_owner(current_track):
             self.pending_owner_id = None
             self.pending_owner_count = 0
-            return requested_track
-
-        if requested_track is None:
-            if current_track is not None and int(getattr(current_track, "missed_frames", 0) or 0) <= 2:
-                self.pending_owner_id = None
-                self.pending_owner_count = 0
-                return current_track
-            return None
-
-        req_id = int(getattr(requested_track, "track_id", -1))
-        if self.owner_id is None:
-            self.owner_id = req_id
-            self.pending_owner_id = None
-            self.pending_owner_count = 0
-            return requested_track
-
-        if req_id == int(self.owner_id):
-            self.pending_owner_id = None
-            self.pending_owner_count = 0
-            return requested_track
-
-        current_healthy = self._healthy(current_track)
-        requested_quality = self._track_quality(requested_track)
-        current_quality = self._track_quality(current_track)
-        required = self.owner_switch_commit_frames if current_healthy else max(1, self.owner_switch_commit_frames - 1)
-        strong_gain = requested_quality > (current_quality + (1.25 if current_healthy else 0.35))
-
-        if self.pending_owner_id == req_id:
-            self.pending_owner_count += 1
-        else:
-            self.pending_owner_id = req_id
-            self.pending_owner_count = 1
-
-        if (not current_healthy and self.pending_owner_count >= 1 and strong_gain) or self.pending_owner_count >= required:
-            self.owner_id = req_id
-            self.pending_owner_id = None
-            self.pending_owner_count = 0
-            self.hold_count = 0
-            return requested_track
-
-        if current_track is not None:
             return current_track
-        return requested_track if not current_healthy else None
+
+        self.pending_owner_id = None
+        self.pending_owner_count = 0
+        return None
+
+    def report_lock_measurement(self, center_lock_measured, geometry_score=None, edge=False):
+        geometry_score = float(geometry_score) if geometry_score is not None else None
+        owner_present = self.owner_track is not None
+        degraded_owner = self.lock_state in ("SOFT_REACQUIRE", "REACQUIRE") or self.hold_count > 0
+
+        if not owner_present:
+            self.lock_phase = "UNLOCKED"
+            self.lock_measurement_count = 0
+            self.lock_break_count = 0
+            self.recovered_owner_count = 0
+            self.lock_active = False
+            self.center_lock = False
+            self.tracking_state = "ACQUIRE"
+            return self.center_lock
+
+        stable_geom = geometry_score is None or geometry_score >= 0.55
+        measured_ok = bool(center_lock_measured) and not bool(edge) and stable_geom
+
+        if measured_ok:
+            self.lock_break_count = 0
+            self.center_lock = True
+            if self.lock_phase in ("UNLOCKED", "RECOVERING"):
+                self.lock_phase = "WARMUP"
+                self.lock_measurement_count = 1
+                self.recovered_owner_count = min(self.reacquire_exit_confirm_frames, self.recovered_owner_count + 1)
+            elif self.lock_phase == "WARMUP":
+                self.lock_measurement_count += 1
+            else:
+                self.lock_phase = "LOCKED"
+                self.lock_measurement_count = self.lock_warmup_frames
+
+            if self.lock_phase == "WARMUP" and self.lock_measurement_count >= self.lock_warmup_frames:
+                self.lock_phase = "LOCKED"
+            if self.recovered_owner_count >= self.reacquire_exit_confirm_frames and self.lock_phase in ("WARMUP", "LOCKED"):
+                self.lock_state = "TRACKING"
+                self.tracking_state = "TRACKING"
+                self.lock_active = True
+            else:
+                self.tracking_state = "TRACKING" if self.lock_phase in ("WARMUP", "LOCKED") else "ACQUIRE"
+                self.lock_active = self.lock_phase in ("WARMUP", "LOCKED")
+            return self.center_lock
+
+        self.center_lock = False
+        if degraded_owner:
+            self.recovered_owner_count = 0
+
+        if self.lock_phase in ("WARMUP", "LOCKED"):
+            self.lock_break_count += 1
+            if self.lock_break_count < self.lock_break_confirm_frames:
+                self.lock_active = True
+                self.tracking_state = "TRACKING"
+                return self.center_lock
+            self.lock_phase = "RECOVERING"
+
+        self.lock_measurement_count = 0
+        self.lock_active = False
+        self.tracking_state = "ACQUIRE"
+        if owner_present:
+            self.lock_phase = "RECOVERING"
+            self.lock_state = "SOFT_REACQUIRE" if self.lock_state != "REACQUIRE" else self.lock_state
+        else:
+            self.lock_phase = "UNLOCKED"
+            self.lock_state = "REACQUIRE"
+        return self.center_lock
+
+    def get_lock_status(self):
+        return {
+            "lock_phase": self.lock_phase,
+            "lock_active": bool(self.lock_active),
+            "center_lock": bool(self.center_lock),
+            "tracking_state": self.tracking_state,
+        }
 
     def update(self, frame, requested_track, tracks=None, manual_switch=False):
+        self.frames_since_owner_switch = min(self.owner_switch_cooldown_frames + 1, self.frames_since_owner_switch + 1)
         predicted_center = self.kalman.predict()
         desired_center = None
 
@@ -319,8 +420,11 @@ class NarrowTracker:
                     self.last_owner_raw_id = int(rid)
 
             self.zoom_mode = "TARGET_FILL"
-            self.lock_state = "TRACKING"
             self.owner_track = owner_track
+            if self.lock_phase == "UNLOCKED":
+                self.lock_phase = "RECOVERING"
+            if self.lock_state == "REACQUIRE":
+                self.lock_state = "SOFT_REACQUIRE"
 
         else:
             self.hold_count += 1
@@ -347,13 +451,29 @@ class NarrowTracker:
             self.smooth_zoom = float(np.clip(self.smooth_zoom, 1.4, 19.5))
             self.zoom_mode = "SEARCH"
 
-            if self.hold_count <= self.terminal_hold_frames and self.owner_id is not None and self.last_good_bbox is not None:
+            hard_reacquire = self.hold_count > self.owner_hard_reacquire_frames
+            owner_recoverable = self.owner_id is not None and self.last_good_bbox is not None
+            if owner_recoverable and self.hold_count <= self.owner_recover_frames:
                 synth_center = smooth_center if smooth_center is not None else self.last_good_center
                 self.owner_track = self._make_synthetic_owner(synth_center)
                 self.lock_state = "HOLD"
+                self.lock_phase = "RECOVERING"
+            elif owner_recoverable and self.hold_count <= self.terminal_hold_frames:
+                synth_center = smooth_center if smooth_center is not None else self.last_good_center
+                self.owner_track = self._make_synthetic_owner(synth_center)
+                self.lock_state = "HOLD"
+                self.lock_phase = "RECOVERING"
+            elif owner_recoverable and not hard_reacquire and self.last_good_center is not None:
+                self.owner_track = self._make_synthetic_owner(self.last_good_center)
+                self.lock_state = "SOFT_REACQUIRE"
+                self.lock_phase = "RECOVERING"
             else:
                 self.owner_track = None
                 self.lock_state = "REACQUIRE"
+                self.lock_phase = "UNLOCKED"
+                self.lock_active = False
+                self.center_lock = False
+                self.recovered_owner_count = 0
 
         return (
             predicted_center,

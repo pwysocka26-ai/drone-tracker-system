@@ -2,6 +2,7 @@ import cv2
 import numpy as np
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 import inspect
 from core.run_reporting import generate_run_reports
 from ultralytics import YOLO
@@ -10,6 +11,7 @@ from core.target_manager import TargetManager
 from core.narrow_tracker import NarrowTracker
 from core.multi_target_tracker import MultiTargetTracker
 from core.local_target_tracker import LocalTargetTracker
+from core.lock_pipeline import LockPipeline, STATE_LOCKED, STATE_REFINE, STATE_ACQUIRE, STATE_REACQUIRE, STATE_HOLD
 from core.telemetry import TelemetryLogger
 
 
@@ -739,6 +741,44 @@ def _narrow_update_compat(narrow_tracker, frame, active_track, tracks=None, manu
     raise ValueError(f"NarrowTracker.update returned unexpected tuple length: {len(result)}")
 
 
+def _make_wide_snapshot(selected_track, target_manager, frame_id):
+    if selected_track is None:
+        return SimpleNamespace(
+            valid=False,
+            track_id=None,
+            quality_score=0.0,
+            track_age=0,
+            missed_count=9999,
+            center_xy=None,
+            bbox_xyxy=None,
+            owner_changed=False,
+            reason='no_track',
+            is_large_target=False,
+            is_huge_outlier=False,
+        )
+
+    bbox = tuple(float(v) for v in getattr(selected_track, 'bbox_xyxy', (0, 0, 0, 0)))
+    x1, y1, x2, y2 = bbox
+    area = max(1.0, (x2 - x1) * (y2 - y1))
+    conf = float(getattr(selected_track, 'confidence', 0.0) or 0.0)
+    hits = int(getattr(selected_track, 'hits', 0) or 0)
+    missed = int(getattr(selected_track, 'missed_frames', 0) or 0)
+    quality_score = min(1.0, max(0.0, conf * 0.72 + min(0.28, hits * 0.04) - missed * 0.08))
+    return SimpleNamespace(
+        valid=True,
+        track_id=int(getattr(selected_track, 'track_id', -1)),
+        quality_score=quality_score,
+        track_age=hits,
+        missed_count=missed,
+        center_xy=tuple(float(v) for v in getattr(selected_track, 'center_xy', (0.0, 0.0))),
+        bbox_xyxy=bbox,
+        owner_changed=(getattr(target_manager, 'last_switch_frame', -10**9) == int(frame_id)),
+        reason='auto_tracking' if not getattr(target_manager, 'manual_lock', False) else 'manual_lock',
+        is_large_target=area >= 1100.0,
+        is_huge_outlier=False,
+    )
+
+
 class OwnerSyncGate:
     def __init__(self, sync_frames=5, max_current_missed=1, min_candidate_conf=0.16):
         self.sync_frames = int(sync_frames)
@@ -917,6 +957,7 @@ def run_app(config):
     handoff_state.last_good_zoom = float(narrow_min_zoom)
     local_tracker = LocalTargetTracker(max_lost_frames=local_tracker_max_lost) if local_tracker_enabled else None
     local_tracker_owner_id = None
+    lock_pipeline = LockPipeline(config)
 
     display_box_smoother = DisplayBoxSmoother(
         center_alpha=float(control_cfg.get('display_center_alpha', 0.78)),
@@ -947,6 +988,7 @@ def run_app(config):
     video_writer = None
     record_fps = 30.0
     record_frame_size = None
+    auto_record_pending = bool(record_on_start)
 
     telemetry_enabled = False
     telemetry = None
@@ -958,27 +1000,32 @@ def run_app(config):
     auto_keyframe_last = {}
 
     def start_recording():
-        nonlocal recording, video_writer
+        nonlocal recording, video_writer, auto_record_pending
         if recording and video_writer is not None:
-            return
+            auto_record_pending = False
+            return True
         out_name = video_dir / "tracker_analysis.mp4"
         if record_frame_size is None:
+            auto_record_pending = True
             print('REC INFO: waiting for first dashboard frame to determine output size')
-            return
-        video_writer = cv2.VideoWriter(str(out_name), cv2.VideoWriter_fourcc(*'mp4v'), record_fps, record_frame_size)
-        if not video_writer.isOpened():
+            return False
+        video_writer, codec_name = _safe_start_recording(out_name, record_fps, record_frame_size)
+        if video_writer is None:
             print('REC ERROR: cannot open output file')
-            video_writer = None
             recording = False
-            return
+            return False
         recording = True
-        print(f'REC START: {out_name}')
+        auto_record_pending = False
+        print(f'REC START [{codec_name}]: {out_name}')
+        return True
 
     def stop_recording():
-        nonlocal recording, video_writer
+        nonlocal recording, video_writer, auto_record_pending
         if not recording and video_writer is None:
+            auto_record_pending = False
             return
         recording = False
+        auto_record_pending = False
         if video_writer is not None:
             video_writer.release()
             video_writer = None
@@ -1051,7 +1098,7 @@ def run_app(config):
     last_backend = '-'
     drop_streak = 0
 
-    if record_on_start:
+    if auto_record_pending:
         start_recording()
     start_telemetry()
 
@@ -1069,6 +1116,7 @@ def run_app(config):
                 if local_tracker is not None:
                     local_tracker.reset()
                 local_tracker_owner_id = None
+                lock_pipeline.reset()
                 display_box_smoother.reset()
                 ret, frame = cap.read()
                 if not ret:
@@ -1164,7 +1212,23 @@ def run_app(config):
             target_manager.update(selection_tracks, predicted_center, frame.shape)
             selected_track = target_manager.find_active_track(selection_tracks)
 
+            lock_info = lock_pipeline.update(frame.shape, selected_track, tracks, target_manager.selected_id)
+            pipeline_soft_track = lock_info.get('soft_track')
+            pipeline_state = lock_info.get('state')
+            if lock_info.get('predicted_center') is not None:
+                predicted_center = lock_info.get('predicted_center')
+
             active_track = selected_track
+            if pipeline_soft_track is not None:
+                same_owner_soft = (
+                    selected_track is not None
+                    and int(getattr(pipeline_soft_track, 'track_id', -1)) == int(getattr(selected_track, 'track_id', -2))
+                )
+                soft_allowed_state = pipeline_state in (STATE_ACQUIRE, STATE_REFINE, STATE_REACQUIRE, STATE_HOLD)
+                if same_owner_soft:
+                    active_track = pipeline_soft_track
+                elif active_track is None and soft_allowed_state:
+                    active_track = pipeline_soft_track
             if active_track is not None and int(getattr(active_track, 'missed_frames', 0) or 0) > soft_active_max_missed:
                 active_track = None
 
@@ -1253,7 +1317,11 @@ def run_app(config):
                 manual_switch=False,
             )
 
-            effective_track = narrow_owner_track if narrow_owner_track is not None else requested_track
+            # Wide/app request stays authoritative. Narrow-owned track is only
+            # allowed as fallback during hold/reacquire when wide has no live track.
+            effective_track = requested_track
+            if effective_track is None and narrow_owner_track is not None:
+                effective_track = narrow_owner_track
 
             current_wide_track = target_manager.find_active_track(selection_tracks or tracks)
             if (
@@ -1284,7 +1352,10 @@ def run_app(config):
                     alpha = 0.12
                     cx = smooth_center[0] + alpha * pan_err
                     cy = smooth_center[1] + alpha * tilt_err
-                    if abs(pan_err) < crop_snap_deadband_px and abs(tilt_err) < crop_snap_deadband_px:
+                    refined_center = lock_info.get('refined_center')
+                    if refined_center is not None and pipeline_state in (STATE_ACQUIRE, STATE_REFINE, STATE_LOCKED):
+                        cx, cy = refined_center
+                    elif abs(pan_err) < crop_snap_deadband_px and abs(tilt_err) < crop_snap_deadband_px:
                         cx, cy = tx, ty
                     smooth_center = _apply_center_slew_limit(smooth_center, (cx, cy), max_step=crop_max_step_px)
                     pan_speed = pan_err * alpha
@@ -1337,7 +1408,9 @@ def run_app(config):
                     target_ny = (display_center[1] - cy1) * 360.0 / crop_h
                     real_pan_err = target_nx - 390.0
                     real_tilt_err = target_ny - 180.0
-                    center_lock = abs(real_pan_err) < 16 and abs(real_tilt_err) < 16
+
+                measured_center_lock = abs(real_pan_err) < 16 and abs(real_tilt_err) < 16
+                center_lock = bool(lock_info.get('ui_truthful_lock')) if pipeline_state in (STATE_REFINE, STATE_LOCKED) else measured_center_lock
 
                 cv2.putText(narrow_output, label, (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
                 cv2.putText(narrow_output, f'PAN ERR {real_pan_err:.1f}  TILT ERR {real_tilt_err:.1f}', (20, 108), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
@@ -1412,7 +1485,7 @@ def run_app(config):
             if record_frame_size is None:
                 record_frame_size = (int(dashboard.shape[1]), int(dashboard.shape[0]))
 
-            if recording and video_writer is None and record_frame_size is not None:
+            if auto_record_pending and video_writer is None and record_frame_size is not None:
                 start_recording()
 
             if recording:
@@ -1459,8 +1532,8 @@ def run_app(config):
                     drift_gate_open=(soft_track is None and smooth_center is not None),
                     wide_owner_id=target_manager.selected_id,
                     narrow_owner_id=(getattr(effective_track, 'track_id', None) if effective_track is not None else None),
-                    pending_owner_id=None,
-                    lock_state=('TRACKING' if effective_track is not None else 'REACQUIRE'),
+                    pending_owner_id=getattr(lock_pipeline.context, 'steering_target_id', None),
+                    lock_state=str(pipeline_state or ('TRACKING' if requested_track is not None else ('HOLD' if effective_track is not None else 'REACQUIRE'))),
                     wide_owner_quality=(float(getattr(effective_track, 'confidence', 0.0)) if effective_track is not None else 0.0),
                     geometry_score=(max(0.0, 1.0 - ((abs(real_pan_err) + abs(real_tilt_err)) / 260.0)) if display_center is not None else 0.0),
                     edge_active=edge_limit_active,
@@ -1469,13 +1542,17 @@ def run_app(config):
                     yolo_boxes=last_yolo_boxes,
                     yolo_dets=last_det_tracks,
                     yolo_drop=drop_streak,
-                    owner_reason='manual_lock' if target_manager.manual_lock else 'auto_tracking',
-                    handoff_reject_reason='',
+                    owner_reason='manual_lock' if target_manager.manual_lock else str(getattr(lock_pipeline.context, 'lock_loss_reason', '') or 'auto_tracking'),
+                    handoff_reject_reason=str(getattr(lock_pipeline.context, 'lock_loss_reason', '') or ''),
                     manual_lock=bool(target_manager.manual_lock),
                     active_track_bbox=active_bbox,
                     active_track_area=active_area,
                     handoff_gap_len=handoff_state.gap_len,
                     handoff_max_gap_len=handoff_state.max_gap_len,
+                    measurement_support=float(lock_info.get('measurement_support', 0.0) or 0.0),
+                    identity_desync=bool(lock_info.get('identity_desync', False)),
+                    identity_desync_frames=int(lock_info.get('identity_desync_frames', 0) or 0),
+                    ui_truthful_lock=bool(lock_info.get('ui_truthful_lock', False)),
                 )
 
             cv2.imshow(window_name, dashboard)
@@ -1484,7 +1561,11 @@ def run_app(config):
             if key in (27, ord('q')):
                 break
             elif key in (ord('r'), ord('R')):
-                stop_recording() if recording else start_recording()
+                if recording or auto_record_pending:
+                    stop_recording()
+                else:
+                    auto_record_pending = True
+                    start_recording()
             elif key in (ord('t'), ord('T')):
                 stop_telemetry() if telemetry_enabled else start_telemetry()
             elif key in (ord('s'), ord('S')):
@@ -1497,6 +1578,7 @@ def run_app(config):
                 if local_tracker is not None:
                     local_tracker.reset()
                 local_tracker_owner_id = None
+                lock_pipeline.reset()
                 display_box_smoother.reset()
             elif key in (ord('1'), ord('2'), ord('3'), ord('4'), ord('5'), ord('6'), ord('7'), ord('8'), ord('9')):
                 idx = int(chr(key)) - 1
@@ -1507,6 +1589,7 @@ def run_app(config):
                     owner_sync_gate.reset()
                     narrow_tracker.reset()
                     handoff_state.reset()
+                    lock_pipeline.reset()
                     display_box_smoother.reset()
                     narrow_tracker.kalman.init_state(tr.center_xy[0], tr.center_xy[1])
                     handoff_state.update_from_track(tr, zoom=handoff_state.zoom)
@@ -1525,6 +1608,7 @@ def run_app(config):
                     owner_sync_gate.reset()
                     narrow_tracker.reset()
                     handoff_state.reset()
+                    lock_pipeline.reset()
                     display_box_smoother.reset()
                     narrow_tracker.kalman.init_state(tr.center_xy[0], tr.center_xy[1])
                     handoff_state.update_from_track(tr, zoom=handoff_state.zoom)

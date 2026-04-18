@@ -3,6 +3,7 @@ import numpy as np
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
+from dataclasses import dataclass
 import inspect
 from core.run_reporting import generate_run_reports
 from ultralytics import YOLO
@@ -629,6 +630,28 @@ class OwnerSyncGate:
             return candidate_id
         return None
 
+
+@dataclass
+class FrameResult:
+    tracks: list
+    visible_sorted: list
+    effective_track: object
+    smooth_center: object
+    smooth_zoom: float
+    display_center: object
+    display_bbox: object
+    hold_count: int
+    pan_speed: float
+    tilt_speed: float
+    edge_limit_active: bool
+    pipeline_state: object
+    lock_info: dict
+    last_backend: str
+    last_yolo_boxes: int
+    last_det_tracks: int
+    drop_streak: int
+
+
 def run_app(config):
     mode = config.get('mode', 'video')
     if mode != 'video':
@@ -1165,35 +1188,55 @@ def run_app(config):
                     display_center = handoff_state.last_good_center
                     display_bbox = handoff_state.last_good_bbox
 
-            narrow_output, narrow_crop_rect, real_pan_err, real_tilt_err, center_lock = render_narrow_panel(
-                frame, smooth_center, smooth_zoom, display_center, display_bbox,
+            fr = FrameResult(
+                tracks=tracks,
+                visible_sorted=visible_sorted,
                 effective_track=effective_track,
-                narrow_tracker=narrow_tracker,
-                selected_id=target_manager.selected_id,
+                smooth_center=smooth_center,
+                smooth_zoom=smooth_zoom,
+                display_center=display_center,
+                display_bbox=display_bbox,
                 hold_count=hold_count,
+                pan_speed=pan_speed,
+                tilt_speed=tilt_speed,
                 edge_limit_active=edge_limit_active,
                 pipeline_state=pipeline_state,
                 lock_info=lock_info,
+                last_backend=last_backend,
+                last_yolo_boxes=last_yolo_boxes,
+                last_det_tracks=last_det_tracks,
+                drop_streak=drop_streak,
+            )
+
+            narrow_output, narrow_crop_rect, real_pan_err, real_tilt_err, center_lock = render_narrow_panel(
+                frame, fr.smooth_center, fr.smooth_zoom, fr.display_center, fr.display_bbox,
+                effective_track=fr.effective_track,
+                narrow_tracker=narrow_tracker,
+                selected_id=target_manager.selected_id,
+                hold_count=fr.hold_count,
+                edge_limit_active=fr.edge_limit_active,
+                pipeline_state=fr.pipeline_state,
+                lock_info=fr.lock_info,
                 narrow_min_zoom=narrow_min_zoom,
                 narrow_max_zoom=narrow_max_zoom,
             )
 
             wide_program, wide_debug = render_wide_panels(
-                frame, tracks, visible_sorted,
+                frame, fr.tracks, fr.visible_sorted,
                 selected_id=target_manager.selected_id,
                 manual_lock=target_manager.manual_lock,
                 lock_age=target_manager.lock_age,
-                hold_count=hold_count,
-                pan_speed=pan_speed,
-                tilt_speed=tilt_speed,
+                hold_count=fr.hold_count,
+                pan_speed=fr.pan_speed,
+                tilt_speed=fr.tilt_speed,
                 handoff_missed=handoff_state.missed,
                 handoff_max_gap=handoff_state.max_gap_len,
-                last_backend=last_backend,
+                last_backend=fr.last_backend,
                 conf=conf,
                 imgsz=imgsz,
-                last_yolo_boxes=last_yolo_boxes,
-                last_det_tracks=last_det_tracks,
-                drop_streak=drop_streak,
+                last_yolo_boxes=fr.last_yolo_boxes,
+                last_det_tracks=fr.last_det_tracks,
+                drop_streak=fr.drop_streak,
                 wide_fov_deg=wide_fov_deg,
                 narrow_min_fov_deg=narrow_min_fov_deg,
                 narrow_max_fov_deg=narrow_max_fov_deg,

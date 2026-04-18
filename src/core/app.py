@@ -7,6 +7,7 @@ import inspect
 from core.run_reporting import generate_run_reports
 from ultralytics import YOLO
 
+from core.dashboard import render_wide_panels, add_title, tighten_bbox
 from core.target_manager import TargetManager
 from core.narrow_tracker import NarrowTracker
 from core.multi_target_tracker import MultiTargetTracker
@@ -90,45 +91,6 @@ class DisplayBoxSmoother:
         scx, scy = self.center
         sw, sh = self.size
         return (scx, scy), (scx - 0.5 * sw, scy - 0.5 * sh, scx + 0.5 * sw, scy + 0.5 * sh)
-
-
-def tighten_bbox(bbox, frame_shape=None, min_size=12):
-    x1, y1, x2, y2 = bbox
-    bw = max(1.0, x2 - x1)
-    bh = max(1.0, y2 - y1)
-    area = bw * bh
-
-    if area < 250.0:
-        scale = 0.88
-    elif area < 900.0:
-        scale = 0.78
-    else:
-        scale = 0.65
-
-    cx = (x1 + x2) / 2.0
-    cy = (y1 + y2) / 2.0
-    w = max(float(min_size), bw * float(scale))
-    h = max(float(min_size), bh * float(scale))
-
-    aspect = w / max(1.0, h)
-    if aspect < 0.30:
-        w = h * 0.30
-    elif aspect > 4.50:
-        h = w / 4.50
-
-    nx1 = int(cx - w / 2.0)
-    ny1 = int(cy - h / 2.0)
-    nx2 = int(cx + w / 2.0)
-    ny2 = int(cy + h / 2.0)
-
-    if frame_shape is not None:
-        fh, fw = frame_shape[:2]
-        nx1 = max(0, min(fw - 1, nx1))
-        ny1 = max(0, min(fh - 1, ny1))
-        nx2 = max(0, min(fw - 1, nx2))
-        ny2 = max(0, min(fh - 1, ny2))
-
-    return nx1, ny1, nx2, ny2
 
 
 def clamp_box(x1, y1, x2, y2, w, h):
@@ -226,49 +188,6 @@ def crop_group(frame, tracks, out_size=(780, 360)):
     return cv2.resize(crop, out_size, interpolation=cv2.INTER_LINEAR)
 
 
-
-
-def fit_panel_full(frame, out_size):
-    """Fill the whole panel without letterboxing.
-
-    The wide source is 1920x1080, while the dashboard top panel is 780x360.
-    Preserving aspect here produces black side bars. For operator preview we
-    intentionally fill the full panel, like earlier builds.
-    """
-    out_w, out_h = out_size
-    if frame is None or frame.size == 0:
-        return np.zeros((out_h, out_w, 3), dtype=np.uint8)
-    return cv2.resize(frame, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
-
-def add_title(panel, title):
-    cv2.rectangle(panel, (0, 0), (440, 56), (0, 0, 0), -1)
-    cv2.putText(panel, title, (20, 38), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
-    return panel
-
-
-def draw_tracks(frame, tracks, selected_id):
-    out = frame.copy()
-    for tr in tracks:
-        x1, y1, x2, y2 = tighten_bbox(tr.bbox_xyxy, out.shape, min_size=12)
-        cx, cy = [int(v) for v in tr.center_xy]
-        if getattr(tr, 'is_active_target', False):
-            color = (0, 255, 0)
-        elif getattr(tr, 'is_valid_target', False):
-            color = (0, 255, 255)
-        else:
-            color = (0, 0, 255)
-        cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
-        cv2.circle(out, (cx, cy), 4, color, -1)
-        cv2.putText(
-            out,
-            f'ID {tr.track_id} {tr.confidence:.2f}',
-            (x1, max(24, y1 - 8)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.65,
-            color,
-            2,
-        )
-    return out
 
 
 def draw_target_on_narrow(narrow_frame, crop_rect, display_bbox, display_center, display_no='?'):
@@ -1383,14 +1302,6 @@ def run_app(config):
                     display_center = handoff_state.last_good_center
                     display_bbox = handoff_state.last_good_bbox
 
-            wide_program = fit_panel_full(frame, (780, 360))
-            debug_frame = draw_tracks(frame, tracks, target_manager.selected_id)
-            for idx, tr in enumerate(visible_sorted[:9], start=1):
-                x1, y1, x2, y2 = tighten_bbox(tr.bbox_xyxy, debug_frame.shape, min_size=12)
-                label = f'[{idx}] ID {tr.track_id}' if getattr(tr, 'is_confirmed', False) else f'[{idx}] ID {tr.track_id}?'
-                cv2.putText(debug_frame, label, (x1, max(30, y1 - 30)), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 0), 2)
-            wide_debug = fit_panel_full(debug_frame, (1560, 450))
-
             if smooth_center is not None:
                 smooth_zoom = max(narrow_min_zoom, min(narrow_max_zoom, float(smooth_zoom)))
                 narrow_output, narrow_crop_rect = crop_to_16_9(frame, smooth_center, smooth_zoom, (780, 360), return_meta=True)
@@ -1432,32 +1343,29 @@ def run_app(config):
                 narrow_output, narrow_crop_rect = crop_to_16_9(frame, None, 1.7, (780, 360), return_meta=True)
                 cv2.putText(narrow_output, 'BRAK CELU', (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
 
-            lock_mode = 'AUTO' if not target_manager.manual_lock else 'MANUAL'
-            cv2.putText(wide_debug, f'LOCK MODE: {lock_mode}', (20, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-            cv2.putText(wide_debug, f'SELECTED ID: {target_manager.selected_id}', (20, 136), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-            cv2.putText(wide_debug, f'HOLD COUNT: {hold_count}', (20, 172), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-            cv2.putText(wide_debug, f'LOCK AGE: {target_manager.lock_age}', (20, 208), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-            cv2.putText(wide_debug, f'PAN SPD: {pan_speed:.1f}  TILT SPD: {tilt_speed:.1f}', (20, 244), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-            confirmed_count = sum(1 for t in tracks if getattr(t, 'is_confirmed', False))
-            cv2.putText(wide_debug, f'MULTI TRACKS: {len(tracks)}  CONFIRMED: {confirmed_count}', (20, 280), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-            cv2.putText(
-                wide_debug,
-                f'YOLO [{last_backend}]  conf={conf:.2f} imgsz={imgsz}  BOXES: {last_yolo_boxes}  DETS: {last_det_tracks}  DROP: {drop_streak}',
-                (20, 316),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.62,
-                (255, 255, 255),
-                2,
+            wide_program, wide_debug = render_wide_panels(
+                frame, tracks, visible_sorted,
+                selected_id=target_manager.selected_id,
+                manual_lock=target_manager.manual_lock,
+                lock_age=target_manager.lock_age,
+                hold_count=hold_count,
+                pan_speed=pan_speed,
+                tilt_speed=tilt_speed,
+                handoff_missed=handoff_state.missed,
+                handoff_max_gap=handoff_state.max_gap_len,
+                last_backend=last_backend,
+                conf=conf,
+                imgsz=imgsz,
+                last_yolo_boxes=last_yolo_boxes,
+                last_det_tracks=last_det_tracks,
+                drop_streak=drop_streak,
+                wide_fov_deg=wide_fov_deg,
+                narrow_min_fov_deg=narrow_min_fov_deg,
+                narrow_max_fov_deg=narrow_max_fov_deg,
+                narrow_max_zoom=narrow_max_zoom,
+                narrow_target_fill=narrow_target_fill,
             )
-            cv2.putText(wide_debug, 'CORE MODE: PRIMARY TARGET', (20, 352), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-            cv2.putText(wide_debug, f'WIDE 1920x1080 FOV {wide_fov_deg:.1f}   NARROW 1920x1080 FOV {narrow_min_fov_deg:.2f}-{narrow_max_fov_deg:.1f}   MAXZ {narrow_max_zoom:.1f}x  FILL {narrow_target_fill:.0f}%', (20, 388), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255, 255, 255), 2)
-            auto_text = 'AUTO PICK ENABLED' if not target_manager.manual_lock else 'AUTO PICK DISABLED'
-            cv2.putText(wide_debug, auto_text, (20, 424), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
-            cv2.putText(wide_debug, f'HANDOFF MISS: {handoff_state.missed}  MAX GAP: {handoff_state.max_gap_len}', (20, 460), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2)
-
-            wide_program = add_title(wide_program, 'WIDE PROGRAM')
             narrow_output = add_title(narrow_output, 'NARROW OUTPUT')
-            wide_debug = add_title(wide_debug, 'WIDE DEBUG')
             dashboard = cv2.vconcat([cv2.hconcat([wide_program, narrow_output]), wide_debug])
 
             current_wide_owner_id = target_manager.selected_id

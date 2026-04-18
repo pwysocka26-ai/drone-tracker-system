@@ -4,6 +4,16 @@ import json
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, Sequence
 
+# Target-correctness validation thresholds. A reference target is established
+# only after the tracker holds a stable, isolated, well-centered identity for
+# this many frames — never immediately from first-acquire.
+_REFERENCE_WINDOW_FRAMES = 20
+_REFERENCE_GEOMETRY_MIN = 0.65
+_REFERENCE_TELEPORT_MAX_PX = 60.0
+_REFERENCE_NEIGHBOR_MIN_DIST_PX = 60.0
+_REFERENCE_RESET_LOSS_FRAMES = 60
+_WRONG_NEIGHBOR_RADIUS_PX = 100.0
+
 
 def _safe_number(x: Any) -> Any:
     if isinstance(x, (int, float, bool)) or x is None:
@@ -56,6 +66,16 @@ class TelemetryLogger:
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self.path = self.run_dir / "telemetry.jsonl"
         self._fh = self.path.open("w", encoding="utf-8")
+        # Target-correctness state (reference only locked in after validation window).
+        self._reference: Dict[str, Any] = {"raw_id": None, "area": None, "frame_idx": None, "established": False}
+        self._prev_owner_center: Optional[tuple] = None
+        self._prev_selected_id: Optional[int] = None
+        self._prev_active_raw_id: Optional[int] = None
+        self._candidate_count: int = 0
+        self._off_reference_streak: int = 0
+        self._lost_frames_count: int = 0
+        self._prev_on_reference: Optional[bool] = None
+        self._prev_nearest_distance: Optional[float] = None
 
     def close(self) -> None:
         try:
@@ -131,6 +151,139 @@ class TelemetryLogger:
             "drift_gate_open": bool(drift_gate_open),
             "tracks": items,
         }
+
+        # --- Target-correctness instrumentation (read-only, telemetry-only) ---
+        active_raw_id: Optional[int] = None
+        active_center: Optional[tuple] = None
+        active_area: Optional[float] = None
+        if active_track is not None:
+            try:
+                x1, y1, x2, y2 = (float(v) for v in active_track.bbox_xyxy)
+                active_area = max(1.0, (x2 - x1) * (y2 - y1))
+                cx, cy = active_track.center_xy
+                active_center = (float(cx), float(cy))
+                rid = getattr(active_track, "raw_id", None)
+                active_raw_id = int(rid) if rid is not None else None
+            except Exception:
+                active_raw_id = None
+                active_center = None
+                active_area = None
+
+        owner_teleport_px: Optional[float] = None
+        if active_center is not None and self._prev_owner_center is not None:
+            dx = active_center[0] - self._prev_owner_center[0]
+            dy = active_center[1] - self._prev_owner_center[1]
+            owner_teleport_px = float((dx * dx + dy * dy) ** 0.5)
+
+        neighbors: list[Dict[str, Any]] = []
+        if active_center is not None and active_area:
+            active_tid = getattr(active_track, "track_id", None)
+            for tr in tracks:
+                tid = getattr(tr, "track_id", None)
+                if tid is None or (active_tid is not None and int(tid) == int(active_tid)):
+                    continue
+                ncx, ncy = getattr(tr, "center_xy", (None, None))
+                if ncx is None or ncy is None:
+                    continue
+                nx1, ny1, nx2, ny2 = (float(v) for v in getattr(tr, "bbox_xyxy", (0, 0, 0, 0)))
+                narea = max(1.0, (nx2 - nx1) * (ny2 - ny1))
+                dx = float(ncx) - active_center[0]
+                dy = float(ncy) - active_center[1]
+                rid = getattr(tr, "raw_id", None)
+                neighbors.append({
+                    "track_id": int(tid),
+                    "raw_id": int(rid) if rid is not None else None,
+                    "conf": float(getattr(tr, "confidence", 0.0) or 0.0),
+                    "distance_px": float((dx * dx + dy * dy) ** 0.5),
+                    "area_ratio_to_owner": narea / active_area,
+                })
+        neighbors.sort(key=lambda n: n["distance_px"])
+        nearest_neighbor = neighbors[0] if neighbors else None
+
+        geom_score = float((extra or {}).get("geometry_score", 0.0) or 0.0)
+
+        identity_stable = (
+            selected_id is not None
+            and active_raw_id is not None
+            and self._prev_selected_id == selected_id
+            and self._prev_active_raw_id == active_raw_id
+        )
+        tracking_clean = (
+            bool(center_lock)
+            and geom_score >= _REFERENCE_GEOMETRY_MIN
+            and (owner_teleport_px is None or owner_teleport_px < _REFERENCE_TELEPORT_MAX_PX)
+        )
+        neighbor_clean = (
+            not neighbors
+            or neighbors[0]["distance_px"] > _REFERENCE_NEIGHBOR_MIN_DIST_PX
+        )
+
+        already_established = bool(self._reference.get("established"))
+        if identity_stable and tracking_clean and neighbor_clean:
+            self._candidate_count += 1
+            if self._candidate_count >= _REFERENCE_WINDOW_FRAMES and not already_established:
+                self._reference = {
+                    "raw_id": active_raw_id,
+                    "area": active_area,
+                    "frame_idx": int(frame_idx),
+                    "established": True,
+                }
+        else:
+            self._candidate_count = 0
+
+        if selected_id is None:
+            self._lost_frames_count += 1
+            if self._lost_frames_count >= _REFERENCE_RESET_LOSS_FRAMES:
+                self._reference = {"raw_id": None, "area": None, "frame_idx": None, "established": False}
+                self._candidate_count = 0
+                self._off_reference_streak = 0
+        else:
+            self._lost_frames_count = 0
+
+        reference_established = bool(self._reference.get("established"))
+        reference_raw_id = self._reference.get("raw_id")
+        reference_area = self._reference.get("area")
+        if reference_established and active_raw_id is not None:
+            on_reference_target: Optional[bool] = (active_raw_id == reference_raw_id)
+        else:
+            on_reference_target = None
+
+        if on_reference_target is True:
+            self._off_reference_streak = 0
+        elif on_reference_target is False:
+            self._off_reference_streak += 1
+
+        wrong_neighbor_event = bool(
+            reference_established
+            and self._prev_on_reference is True
+            and on_reference_target is False
+            and self._prev_nearest_distance is not None
+            and self._prev_nearest_distance < _WRONG_NEIGHBOR_RADIUS_PX
+        )
+
+        area_ratio_to_reference = None
+        if reference_area and active_area:
+            area_ratio_to_reference = active_area / reference_area
+
+        rec["active_raw_id"] = active_raw_id
+        rec["owner_teleport_px"] = owner_teleport_px
+        rec["neighbor_count"] = len(neighbors)
+        rec["nearest_neighbor"] = nearest_neighbor
+        rec["candidate_window_frames"] = self._candidate_count
+        rec["reference_established"] = reference_established
+        rec["reference_raw_id"] = reference_raw_id
+        rec["reference_frame_idx"] = self._reference.get("frame_idx")
+        rec["reference_bbox_area"] = reference_area
+        rec["on_reference_target"] = on_reference_target
+        rec["off_reference_streak"] = self._off_reference_streak
+        rec["wrong_neighbor_event"] = wrong_neighbor_event
+        rec["area_ratio_to_reference"] = area_ratio_to_reference
+
+        self._prev_owner_center = active_center
+        self._prev_selected_id = selected_id
+        self._prev_active_raw_id = active_raw_id
+        self._prev_on_reference = on_reference_target
+        self._prev_nearest_distance = (nearest_neighbor["distance_px"] if nearest_neighbor else None)
 
         for key, value in (extra or {}).items():
             if key == "owner_missed_frames":

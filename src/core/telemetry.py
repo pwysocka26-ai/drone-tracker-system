@@ -96,6 +96,7 @@ class TelemetryLogger:
             bbox = tuple(float(v) for v in getattr(tr, "bbox_xyxy", (0, 0, 0, 0)))
             area, aspect = _bbox_metrics(bbox)
             cx, cy = getattr(tr, "center_xy", (None, None))
+            vx, vy = getattr(tr, "velocity_xy", (None, None))
             items.append(
                 {
                     "track_id": getattr(tr, "track_id", None),
@@ -109,6 +110,8 @@ class TelemetryLogger:
                     "aspect": aspect,
                     "cx": _safe_number(cx),
                     "cy": _safe_number(cy),
+                    "vx": _safe_number(vx),
+                    "vy": _safe_number(vy),
                 }
             )
 
@@ -121,6 +124,8 @@ class TelemetryLogger:
             "active_track_id": active_track_id,
             "active_track_missed": getattr(active_track, "missed_frames", None) if active_track is not None else None,
             "active_track_conf": _safe_number(getattr(active_track, "confidence", None)) if active_track is not None else None,
+            "active_track_vx": _safe_number(getattr(active_track, "velocity_xy", (None, None))[0]) if active_track is not None else None,
+            "active_track_vy": _safe_number(getattr(active_track, "velocity_xy", (None, None))[1]) if active_track is not None else None,
             "narrow_center": list(narrow_center) if narrow_center is not None else None,
             "center_lock": bool(center_lock),
             "drift_gate_open": bool(drift_gate_open),

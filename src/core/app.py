@@ -650,6 +650,9 @@ class FrameResult:
     last_yolo_boxes: int
     last_det_tracks: int
     drop_streak: int
+    center_lock: bool = False
+    real_pan_err: float = 0.0
+    real_tilt_err: float = 0.0
 
 
 def run_app(config):
@@ -1220,6 +1223,9 @@ def run_app(config):
                 narrow_min_zoom=narrow_min_zoom,
                 narrow_max_zoom=narrow_max_zoom,
             )
+            fr.center_lock = center_lock
+            fr.real_pan_err = real_pan_err
+            fr.real_tilt_err = real_tilt_err
 
             wide_program, wide_debug = render_wide_panels(
                 frame, fr.tracks, fr.visible_sorted,
@@ -1249,7 +1255,7 @@ def run_app(config):
             current_wide_owner_id = target_manager.selected_id
             current_narrow_owner_id = getattr(effective_track, 'track_id', None) if effective_track is not None else None
             current_lock_state = 'TRACKING' if effective_track is not None else 'REACQUIRE'
-            current_center_lock = bool(center_lock)
+            current_center_lock = bool(fr.center_lock)
 
             if prev_wide_owner_id is not None and current_wide_owner_id != prev_wide_owner_id and current_wide_owner_id is not None:
                 auto_capture_keyframe('owner_switch', frame_id, dashboard, wide_debug, narrow_output)
@@ -1314,14 +1320,14 @@ def run_app(config):
                     active_track=effective_track,
                     tracks=tracks,
                     narrow_center=smooth_center,
-                    center_lock=center_lock,
+                    center_lock=fr.center_lock,
                     drift_gate_open=(soft_track is None and smooth_center is not None),
                     wide_owner_id=target_manager.selected_id,
                     narrow_owner_id=(getattr(effective_track, 'track_id', None) if effective_track is not None else None),
                     pending_owner_id=getattr(lock_pipeline.context, 'steering_target_id', None),
                     lock_state=str(pipeline_state or ('TRACKING' if requested_track is not None else ('HOLD' if effective_track is not None else 'REACQUIRE'))),
                     wide_owner_quality=(float(getattr(effective_track, 'confidence', 0.0)) if effective_track is not None else 0.0),
-                    geometry_score=(max(0.0, 1.0 - ((abs(real_pan_err) + abs(real_tilt_err)) / 260.0)) if display_center is not None else 0.0),
+                    geometry_score=(max(0.0, 1.0 - ((abs(fr.real_pan_err) + abs(fr.real_tilt_err)) / 260.0)) if fr.display_center is not None else 0.0),
                     edge_active=edge_limit_active,
                     edge_limit_active=edge_limit_active,
                     owner_missed_frames=handoff_state.missed,

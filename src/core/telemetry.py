@@ -66,6 +66,22 @@ class TelemetryLogger:
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self.path = self.run_dir / "telemetry.jsonl"
         self._fh = self.path.open("w", encoding="utf-8")
+        # End-state instrumentation state.
+        self._prev_lock_phase: Optional[str] = None
+        self._prev_lock_state: Optional[str] = None
+        self._reacquire_frames: int = 0
+        self._hold_frames: int = 0
+        self._last_narrow_owner_id: Optional[int] = None
+        self._last_lock_phase: Optional[str] = None
+        self._last_lock_state: Optional[str] = None
+        self._sum_lock_loss: int = 0
+        self._sum_reacquire_starts: int = 0
+        self._sum_reacquire_success: int = 0
+        self._sum_time_hold: int = 0
+        self._sum_time_locked: int = 0
+        self._sum_time_recovering: int = 0
+        self._reacquire_durations: list = []
+        self._session_frames: int = 0
         # Target-correctness state (reference only locked in after validation window).
         self._reference: Dict[str, Any] = {"raw_id": None, "area": None, "frame_idx": None, "established": False}
         self._prev_owner_center: Optional[tuple] = None
@@ -79,9 +95,49 @@ class TelemetryLogger:
 
     def close(self) -> None:
         try:
+            self._write_summary()
+        except Exception:
+            pass
+        try:
             self._fh.close()
         except Exception:
             pass
+
+    def _write_summary(self) -> None:
+        if self._sum_reacquire_starts > 0:
+            reacquire_success_rate = self._sum_reacquire_success / self._sum_reacquire_starts
+        else:
+            reacquire_success_rate = None
+        avg_dur = (sum(self._reacquire_durations) / len(self._reacquire_durations)) if self._reacquire_durations else None
+
+        if self._last_narrow_owner_id is None:
+            end_state = "NO_OWNER"
+        elif self._last_lock_phase == "LOCKED":
+            end_state = "LOCKED"
+        elif self._last_lock_state == "HOLD":
+            end_state = "HOLD"
+        elif self._last_lock_phase == "RECOVERING" or self._last_lock_state in ("REACQUIRE", "SOFT_REACQUIRE"):
+            end_state = "REACQUIRE"
+        else:
+            end_state = "UNKNOWN"
+
+        summary = {
+            "session_duration_frames": self._session_frames,
+            "final_narrow_owner_id": self._last_narrow_owner_id,
+            "final_lock_phase": self._last_lock_phase,
+            "final_lock_state": self._last_lock_state,
+            "end_state_verdict": end_state,
+            "total_lock_loss_events": self._sum_lock_loss,
+            "total_reacquire_starts": self._sum_reacquire_starts,
+            "total_reacquire_successes": self._sum_reacquire_success,
+            "reacquire_success_rate": reacquire_success_rate,
+            "avg_reacquire_duration_frames": avg_dur,
+            "total_time_in_hold_frames": self._sum_time_hold,
+            "total_time_in_locked_frames": self._sum_time_locked,
+            "total_time_in_recovering_frames": self._sum_time_recovering,
+        }
+        path = self.run_dir / "run_summary.json"
+        path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
 
     def log_crash(self, frame_idx: int, exc: BaseException) -> None:
         import traceback
@@ -151,6 +207,63 @@ class TelemetryLogger:
             "drift_gate_open": bool(drift_gate_open),
             "tracks": items,
         }
+
+        # --- End-state instrumentation (read-only, telemetry-only) ---
+        narrow_lock_phase = (extra or {}).get("narrow_lock_phase")
+        narrow_lock_state = (extra or {}).get("narrow_lock_state")
+        narrow_owner_id_val = (extra or {}).get("narrow_owner_id")
+        narrow_hold_count = (extra or {}).get("narrow_hold_count")
+
+        lock_loss_event = False
+        if self._prev_lock_phase in ("LOCKED", "WARMUP") and narrow_lock_phase in ("RECOVERING", "UNLOCKED"):
+            lock_loss_event = True
+            self._sum_lock_loss += 1
+
+        reacquire_start_event = False
+        reacquire_success_event = False
+        was_reacquiring = self._prev_lock_phase == "RECOVERING" or self._prev_lock_state in ("REACQUIRE", "SOFT_REACQUIRE")
+        is_reacquiring = narrow_lock_phase == "RECOVERING" or narrow_lock_state in ("REACQUIRE", "SOFT_REACQUIRE")
+        if is_reacquiring and not was_reacquiring:
+            reacquire_start_event = True
+            self._sum_reacquire_starts += 1
+            self._reacquire_frames = 1
+        elif is_reacquiring:
+            self._reacquire_frames += 1
+        elif was_reacquiring and narrow_lock_phase in ("LOCKED", "WARMUP"):
+            reacquire_success_event = True
+            self._sum_reacquire_success += 1
+            self._reacquire_durations.append(self._reacquire_frames)
+            self._reacquire_frames = 0
+        elif was_reacquiring:
+            self._reacquire_durations.append(self._reacquire_frames)
+            self._reacquire_frames = 0
+
+        if narrow_lock_state == "HOLD":
+            self._hold_frames += 1
+            self._sum_time_hold += 1
+        else:
+            self._hold_frames = 0
+
+        if narrow_lock_phase == "LOCKED":
+            self._sum_time_locked += 1
+        if narrow_lock_phase == "RECOVERING":
+            self._sum_time_recovering += 1
+
+        rec["narrow_lock_phase"] = narrow_lock_phase
+        rec["narrow_lock_state"] = narrow_lock_state
+        rec["narrow_hold_count"] = narrow_hold_count
+        rec["lock_loss_event"] = lock_loss_event
+        rec["reacquire_start_event"] = reacquire_start_event
+        rec["reacquire_success_event"] = reacquire_success_event
+        rec["reacquire_frames_in_progress"] = self._reacquire_frames
+        rec["hold_frames_in_progress"] = self._hold_frames
+
+        self._prev_lock_phase = narrow_lock_phase
+        self._prev_lock_state = narrow_lock_state
+        self._last_narrow_owner_id = narrow_owner_id_val
+        self._last_lock_phase = narrow_lock_phase
+        self._last_lock_state = narrow_lock_state
+        self._session_frames += 1
 
         # --- Target-correctness instrumentation (read-only, telemetry-only) ---
         active_raw_id: Optional[int] = None
@@ -297,6 +410,12 @@ class TelemetryLogger:
 
         self._fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
         self._fh.flush()
+
+        # Keep run_summary.json always up-to-date so we survive hard kill / crash.
+        try:
+            self._write_summary()
+        except Exception:
+            pass
 
 
 def telemetry_local_identity_state(ctx):

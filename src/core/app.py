@@ -1345,6 +1345,9 @@ def run_app(config):
                     identity_desync=bool(lock_info.get('identity_desync', False)),
                     identity_desync_frames=int(lock_info.get('identity_desync_frames', 0) or 0),
                     ui_truthful_lock=bool(lock_info.get('ui_truthful_lock', False)),
+                    narrow_lock_phase=getattr(narrow_tracker, 'lock_phase', None),
+                    narrow_lock_state=getattr(narrow_tracker, 'lock_state', None),
+                    narrow_hold_count=getattr(narrow_tracker, 'hold_count', None),
                 )
 
             cv2.imshow(window_name, dashboard)

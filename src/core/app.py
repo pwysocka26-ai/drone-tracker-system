@@ -124,7 +124,11 @@ def parse_tracks(result, frame_shape):
             continue
         if area > (w * h * 0.035):
             continue
-        if aspect < 0.20 or aspect > 5.00:
+        # Rozluźniony aspect filter — samoloty w manewrach akrobatycznych
+        # (beczki, piony) mają ekstremalny aspect. Wąski zakres 0.20–5.00
+        # wycinał detekcje gdy samoloty zbliżały się do kamery, powodując
+        # że tracker gubił owner'a (velocity=0 w klatkach 400+ runu P1).
+        if aspect < 0.10 or aspect > 10.00:
             continue
 
         tracks.append(

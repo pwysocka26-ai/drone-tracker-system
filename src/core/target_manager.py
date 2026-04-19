@@ -86,6 +86,9 @@ class TargetManager:
         self.external_owner_hint_ttl = 0
         self.external_owner_hint_center = None
         self.external_owner_hint_strength = 1.0
+        self.identity_anchor = None
+        self.identity_anchor_freshness = 0
+        self._last_update_tracks = []
 
     def reset(self):
         self.selected_id = None
@@ -105,6 +108,9 @@ class TargetManager:
         self.external_owner_hint_ttl = 0
         self.external_owner_hint_center = None
         self.external_owner_hint_strength = 1.0
+        self.identity_anchor = None
+        self.identity_anchor_freshness = 0
+        self._last_update_tracks = []
 
     def set_auto_mode(self):
         self.manual_lock = False
@@ -119,6 +125,9 @@ class TargetManager:
         self.external_owner_hint_ttl = 0
         self.external_owner_hint_center = None
         self.external_owner_hint_strength = 1.0
+        self.identity_anchor = None
+        self.identity_anchor_freshness = 0
+        self._last_update_tracks = []
 
     def set_manual_target(self, tid):
         self.manual_lock = True
@@ -396,6 +405,78 @@ class TargetManager:
 
         return score
 
+    def _compute_formation_signature(self, track, tracks):
+        center = self._score_center(track)
+        if center is None:
+            return tuple()
+        x1, y1, x2, y2 = track.bbox_xyxy
+        area = max(1.0, (float(x2) - float(x1)) * (float(y2) - float(y1)))
+        tid = int(getattr(track, "track_id", -1))
+        neighbors = []
+        for tr in tracks or []:
+            if int(getattr(tr, "track_id", -1)) == tid:
+                continue
+            nc = self._score_center(tr)
+            if nc is None:
+                continue
+            nx1, ny1, nx2, ny2 = tr.bbox_xyxy
+            narea = max(1.0, (float(nx2) - float(nx1)) * (float(ny2) - float(ny1)))
+            neighbors.append((nc[0] - center[0], nc[1] - center[1], narea / area))
+        neighbors.sort(key=lambda v: v[0] * v[0] + v[1] * v[1])
+        return tuple(neighbors[:3])
+
+    def _signature_similarity(self, a, b):
+        if not a or not b:
+            return 0.5
+        n = min(len(a), len(b))
+        if n == 0:
+            return 0.5
+        sims = []
+        for i in range(n):
+            dx_a, dy_a, ar_a = a[i]
+            dx_b, dy_b, ar_b = b[i]
+            dist_diff = math.hypot(dx_a - dx_b, dy_a - dy_b)
+            ar_diff = abs(math.log(max(0.01, ar_a) / max(0.01, ar_b)))
+            sims.append(math.exp(-dist_diff / 50.0) * math.exp(-ar_diff))
+        return sum(sims) / len(sims)
+
+    def _continuity_score(self, track, tracks):
+        if self.identity_anchor is None or track is None:
+            return None
+        center = self._score_center(track)
+        if center is None:
+            return 0.0
+        avx, avy = self.identity_anchor["velocity"]
+        velocity = getattr(track, "velocity_xy", (0.0, 0.0)) or (0.0, 0.0)
+        dv = math.hypot(velocity[0] - avx, velocity[1] - avy)
+        motion = math.exp(-(dv * dv) / (2.0 * 15.0 * 15.0))
+
+        x1, y1, x2, y2 = track.bbox_xyxy
+        area = max(1.0, (float(x2) - float(x1)) * (float(y2) - float(y1)))
+        anchor_area = max(1.0, float(self.identity_anchor["area"]))
+        log_ratio = math.log(area / anchor_area)
+        scale = math.exp(-(log_ratio * log_ratio) / (2.0 * 0.5 * 0.5))
+
+        current_sig = self._compute_formation_signature(track, tracks)
+        formation = self._signature_similarity(current_sig, self.identity_anchor["formation_sig"])
+
+        return 0.35 * motion + 0.20 * scale + 0.45 * formation
+
+    def _set_identity_anchor(self, track, tracks):
+        if track is None:
+            return
+        x1, y1, x2, y2 = track.bbox_xyxy
+        area = max(1.0, (float(x2) - float(x1)) * (float(y2) - float(y1)))
+        velocity = getattr(track, "velocity_xy", (0.0, 0.0)) or (0.0, 0.0)
+        formation_sig = self._compute_formation_signature(track, tracks)
+        self.identity_anchor = {
+            "area": float(area),
+            "velocity": (float(velocity[0]), float(velocity[1])),
+            "formation_sig": formation_sig,
+            "frame_idx": int(self.frame_id),
+        }
+        self.identity_anchor_freshness = 0
+
     def _advance_pending(self, candidate_id: int) -> int:
         if self.pending_id == int(candidate_id):
             self.pending_count += 1
@@ -413,12 +494,16 @@ class TargetManager:
         self.selected_missing_frames = 0
         self._store_owner_reference(tr)
         self.freeze_to(self.selected_id, self.selection_freeze_frames + int(freeze_extra))
+        self._set_identity_anchor(tr, self._last_update_tracks)
         return self.selected_id
 
     def update(self, tracks, predicted_center, frame_shape):
         self.frame_id += 1
         self._consume_external_owner_hint()
+        if self.identity_anchor is not None:
+            self.identity_anchor_freshness += 1
         tracks = list(tracks or [])
+        self._last_update_tracks = tracks
         if not tracks:
             self.selected_missing_frames += 1
             self.lock_age += 1
@@ -582,6 +667,18 @@ class TargetManager:
                 dot = avx * bvx + avy * bvy
                 velocity_coherent = dot >= 0.0
 
+        # Identity-continuity guard. Jeśli anchor istnieje, kandydat musi mieć
+        # porównywalny lub wyższy continuity_score niż obecny owner — chroni
+        # przed przełączeniem na geometrycznie-zbliżonego sąsiada w formacji
+        # identycznych obiektów (klasyczny scenariusz wrong-adjacent-object).
+        continuity_ok = True
+        if self.identity_anchor is not None:
+            best_cont = self._continuity_score(best, tracks)
+            active_cont = self._continuity_score(active, tracks)
+            if best_cont is not None and active_cont is not None:
+                if best_cont < active_cont * 0.9:
+                    continuity_ok = False
+
         need_switch = (
             near_anchor
             and best_score > (current_score + margin)
@@ -590,6 +687,7 @@ class TargetManager:
             and cooldown_ok
             and geometry_separation_ok
             and velocity_coherent
+            and continuity_ok
         )
 
         if need_switch:

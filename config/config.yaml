@@ -7,11 +7,13 @@ yolo:
   backend: track
   tracker: config/bytetrack_fast_acquire.yaml
   conf: 0.1
-  imgsz: 1280
+  imgsz: 960   # zmniejszone z 1280 dla szybszej inference na CPU
   classes:
-  - 4
-  inference_every: 1
-  search_fallback: true
+  - 4   # airplane
+  - 14  # bird (drones often misclassified as bird in COCO)
+  - 33  # kite (drones also often classified as kite)
+  inference_every: 2
+  search_fallback: false   # wyłączone — search_fallback podwaja inference cost
   search_conf: 0.07
   search_imgsz: 1664
   search_interval: 1
@@ -61,9 +63,9 @@ narrow_control:
   crop_max_step_px: 24.0
   crop_snap_deadband_px: 14.0
   display_center_alpha: 0.78
-  display_size_alpha: 0.82
+  display_size_alpha: 0.50   # było 0.82 - ramka adaptuje size 2.8x szybciej (dron rośnie/maleje)
   display_max_center_step: 42.0
-  display_max_size_step: 24.0
+  display_max_size_step: 50.0   # było 24.0 - pozwala szybciej rosnąć przy zbliżaniu drona
 camera:
   wide:
     width: 1920

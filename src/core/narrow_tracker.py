@@ -157,19 +157,9 @@ class NarrowTracker:
         th = max(1.0, y2 - y1)
         rel = max(tw / max(1.0, w), th / max(1.0, h))
 
-        if rel > 0.26:
-            z = 8.0
-        elif rel > 0.18:
-            z = 11.0
-        elif rel > 0.12:
-            z = 14.5
-        elif rel > 0.08:
-            z = 17.5
-        elif rel > 0.05:
-            z = 19.5
-        else:
-            z = 19.5
-
+        # Continuous zoom response. Discrete buckets caused visible zoom "swim"
+        # when `rel` oscillated across a threshold during normal detection jitter.
+        z = 0.125 / max(rel, 0.0075)
         return float(np.clip(z, 1.4, 19.5))
 
     def _step_towards(self, desired, active, degraded=False):
@@ -197,8 +187,11 @@ class NarrowTracker:
             kp = 0.18 if degraded else 0.24
             max_step = 32.0 if degraded else 46.0
         else:
-            kp = 0.08
-            max_step = 16.0
+            # Hold path: keep smooth_center nearly still during owner loss.
+            # Previous values let Kalman drift the crop up to 16 px/frame,
+            # producing a visible jerk when the target returned.
+            kp = 0.05
+            max_step = 6.0
 
         pan_speed = float(np.clip(ex * kp, -max_step, max_step))
         tilt_speed = float(np.clip(ey * kp, -max_step, max_step))
@@ -389,8 +382,18 @@ class NarrowTracker:
             reacquire_recent = 0 < self.hold_count <= self.reacquire_boost_frames
             degraded = (missed >= 1) or (conf < 0.18) or reacquire_recent
 
+            # Źródło desired_center: MultiTargetTracker.predicted_center_xy to
+            # center + LPF-filtered velocity (velocity_alpha=0.65). Pomiar jitteru
+            # per-klatka na track_id=18 w P1: mean 5.85 px, max 54.9 px. Raw
+            # center_xy jest zbyt zaszumione żeby smooth_center mogło utrzymać
+            # lock. predicted_center_xy daje jednoklatkowy feedforward + niższy
+            # jitter, bo velocity jest bardziej stabilna niż delta pozycji.
             corrected = self.kalman.correct(owner_track.center_xy[0], owner_track.center_xy[1])
-            desired_center = corrected
+            pred = getattr(owner_track, 'predicted_center_xy', None)
+            if pred is not None:
+                desired_center = tuple(float(v) for v in pred)
+            else:
+                desired_center = tuple(float(v) for v in owner_track.center_xy)
             predicted_center = corrected
 
             self.hold_count = 0
@@ -437,11 +440,6 @@ class NarrowTracker:
 
             if desired_center is not None:
                 smooth_center = self._step_towards(desired_center, False, degraded=True)
-                if self.hold_count <= self.reacquire_grace_frames and self.last_good_center is not None:
-                    gx = 0.84 * self.last_good_center[0] + 0.16 * smooth_center[0]
-                    gy = 0.84 * self.last_good_center[1] + 0.16 * smooth_center[1]
-                    smooth_center = (gx, gy)
-                    self.smooth_center = smooth_center
             else:
                 smooth_center = self.smooth_center
 

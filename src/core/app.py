@@ -1227,6 +1227,22 @@ def run_app(config):
             fr.real_pan_err = real_pan_err
             fr.real_tilt_err = real_tilt_err
 
+            # Wide→narrow contract: report measured lock quality back to the
+            # narrow tracker so it can transition RECOVERING → WARMUP → LOCKED
+            # (its lock_phase machinery was dead code until this call was wired).
+            _geom_score = (
+                max(0.0, 1.0 - ((abs(fr.real_pan_err) + abs(fr.real_tilt_err)) / 260.0))
+                if fr.display_center is not None else 0.0
+            )
+            try:
+                narrow_tracker.report_lock_measurement(
+                    center_lock_measured=bool(fr.center_lock),
+                    geometry_score=_geom_score,
+                    edge=bool(fr.edge_limit_active),
+                )
+            except Exception:
+                pass
+
             wide_program, wide_debug = render_wide_panels(
                 frame, fr.tracks, fr.visible_sorted,
                 selected_id=target_manager.selected_id,

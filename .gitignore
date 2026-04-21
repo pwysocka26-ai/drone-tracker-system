@@ -67,3 +67,13 @@ src/sim/__pycache__/
 # generated zips
 *.zip
 src.zip
+
+# v2 dataset binaries — images/labels are derived from raw video + eval logs,
+# keep only training/v2/data.yaml in git
+data/
+training/hard_negatives/
+training/v2/images/
+training/v2/labels/
+
+# model weights (pulled from Drive, reproducible)
+*.pt

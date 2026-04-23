@@ -12,9 +12,14 @@ video_test.py
 # media
 *.mp4
 
-# lokalne narzędzia
-tools/
+# lokalne narzędzia (ignore tools/ content but allow the v3 labelling/dataset
+# scripts that ship with the training flow)
+tools/*
 scripts/
+!tools/label.sh
+!tools/_label_track_init.py
+!tools/_split_train_val.py
+!tools/_build_v3_dataset.py
 
 # backupy
 *.bak
@@ -54,10 +59,6 @@ tmp*.py
 test.py
 video_test.py
 
-# local tools
-tools/
-scripts/
-
 # python cache
 __pycache__/
 */__pycache__/
@@ -68,12 +69,16 @@ src/sim/__pycache__/
 *.zip
 src.zip
 
-# v2 dataset binaries — images/labels are derived from raw video + eval logs,
-# keep only training/v2/data.yaml in git
+# v2/v3 dataset binaries -- images/labels are derived from raw video + public
+# source zips, keep only training/v*/data.yaml in git
 data/
 training/hard_negatives/
 training/v2/images/
 training/v2/labels/
+training/v2/review/
+training/v3/images/
+training/v3/labels/
+training/v3/review/
 
 # model weights (pulled from Drive, reproducible)
 *.pt

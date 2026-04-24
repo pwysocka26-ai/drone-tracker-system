@@ -39,6 +39,10 @@ tracker_shots_*/
 tracker_analysis_*.mp4
 video.mp4
 
+# C++ build artifacts and third_party dependencies (downloaded separately)
+cpp/build/
+third_party/
+
 # model files
 yolov8s.pt
 

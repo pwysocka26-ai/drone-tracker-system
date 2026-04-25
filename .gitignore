@@ -22,6 +22,7 @@ scripts/
 !tools/_build_v3_dataset.py
 !tools/export_v3_to_onnx.py
 !tools/export_v3_to_onnx_fp16.py
+!tools/compare_telemetry.py
 
 # backupy
 *.bak

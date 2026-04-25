@@ -25,7 +25,11 @@ const char* to_string(LockState s);
 
 struct LockPipelineConfig {
     int acquire_min_hits = 5;         // ile hits przed przejsciem ACQUIRE -> LOCKED
-    int hold_limit = 12;              // max missed_frames w HOLD
+    // Fix 4: hold_limit 12 -> 50 sync z TMConfig.stale_owner_frames=50.
+    // Bez tego Lock FSM rzucal w REACQUIRE po 12 klatkach mimo ze TM trzymal
+    // persistent ownera przez kolejne 38 klatek (telemetria: lock_loss_events
+    // 51 -> 100 z fix 3, oczekiwany powrót do <40).
+    int hold_limit = 50;
     int reacquire_limit = 36;         // max missed_frames w REACQUIRE
     float reacquire_min_conf = 0.15f; // min conf kandydata do reacquire
     float reacquire_max_dist = 150.0f;// max odleglosc (px) od last-known-pos

@@ -47,9 +47,10 @@ struct NarrowConfig {
 
     // Fix 1: last_good persistence -- narrow trzyma synthetic crop podczas
     // chwilowej utraty ownera (HOLD/REACQUIRE), zamiast gasic widok.
-    // Fix 3: 60 -> 100 (2 s @ 50fps) -- daje wiecej czasu na re-acquisition
-    // zanim narrow wygaszamy. Synchronizacja z TM.stale_owner_frames=50.
-    int   max_hold_frames = 100;
+    // Fix 4: 100 -> 300 (6 s @ 50fps). Visual review klatka 24s pokazala
+    // czarny narrow gdy hold_count > 100 mimo ze TM trzymal persistent #1.
+    // 6 s pokrywa wszystkie obserwowane przerwy detekcji w teście.
+    int   max_hold_frames = 300;
     float hold_zoom_decay = 0.992f;       // EMA powolne zoom out podczas hold
 };
 

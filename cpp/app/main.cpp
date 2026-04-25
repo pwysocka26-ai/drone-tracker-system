@@ -209,7 +209,9 @@ static cv::Mat draw_wide_overlays(const cv::Mat& frame, const std::vector<Track>
                       cv::Point(static_cast<int>(t.bbox.x2), static_cast<int>(t.bbox.y2)),
                       col, 2);
         std::ostringstream ss;
-        ss << "id=" << t.track_id << " c=" << std::fixed << std::setprecision(2) << t.confidence;
+        // Fix 4c: "tid=" zamiast "id=" -- disambiguation z persistent owner
+        // ID w bannerze (#X). Per-track label = raw track_id z MTT.
+        ss << "tid=" << t.track_id << " c=" << std::fixed << std::setprecision(2) << t.confidence;
         cv::putText(vis, ss.str(),
                     cv::Point(static_cast<int>(t.bbox.x1), static_cast<int>(t.bbox.y1) - 6),
                     cv::FONT_HERSHEY_SIMPLEX, 0.5, col, 1);

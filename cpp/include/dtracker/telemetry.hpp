@@ -35,6 +35,11 @@ struct FrameTelemetry {
     float narrow_crop_x2 = 0.0f;
     float narrow_crop_y2 = 0.0f;
     bool narrow_rendered = false;        // czy narrow_vis nie-empty po renderingu
+    // Lazy CSRT diagnostic
+    bool csrt_active = false;            // CSRT zainicjalizowany na owner
+    bool csrt_updated_this_frame = false; // CSRT.update(frame) wywolane (lazy: tylko gdy YOLO degraded)
+    bool csrt_synthetic_used = false;    // synthetic owner z CSRT zastapil brak YOLO ownera
+    float csrt_score = 0.0f;
     double inference_ms = 0.0;
     double tracker_ms = 0.0;
 };

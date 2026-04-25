@@ -357,6 +357,9 @@ int main(int argc, char** argv) {
         // Fallback synthetic gdy YOLO traci ownera (port src/core/app.py:1066-1095).
         Track synthetic_csrt_owner;          // wypelniany gdy CSRT da result
         bool have_synthetic_owner = false;
+        bool csrt_updated_this_frame = false;
+        bool csrt_synthetic_used = false;
+        float csrt_score_seen = 0.0f;
         bool owner_healthy = (owner && owner->missed_frames == 0 && owner->confidence >= 0.18f);
 
         // Init/re-init przy widocznym + healthy owner
@@ -377,6 +380,8 @@ int main(int argc, char** argv) {
         // moze byc N klatek stary gdy gap arrives, ale CSRT robust na to.
         if (!owner_healthy && local_tracker.is_active()) {
             LocalTrackResult lr = local_tracker.update(frame);
+            csrt_updated_this_frame = true;
+            csrt_score_seen = lr.score;
             // Synthetic fallback gdy YOLO calkiem zgubil ownera
             if (!owner && sel && lr.bbox && lr.center
                 && (lr.ok || lr.score >= local_tracker_min_score)) {
@@ -390,6 +395,7 @@ int main(int argc, char** argv) {
                 synthetic_csrt_owner.missed_frames = 0;
                 synthetic_csrt_owner.hits = 1;
                 have_synthetic_owner = true;
+                csrt_synthetic_used = true;
                 owner = &synthetic_csrt_owner;
             }
         }
@@ -443,6 +449,10 @@ int main(int argc, char** argv) {
         rec.narrow_crop_x2 = crop.x2;
         rec.narrow_crop_y2 = crop.y2;
         rec.narrow_rendered = narrow_rendered_flag;
+        rec.csrt_active = local_tracker.is_active();
+        rec.csrt_updated_this_frame = csrt_updated_this_frame;
+        rec.csrt_synthetic_used = csrt_synthetic_used;
+        rec.csrt_score = csrt_score_seen;
         rec.inference_ms = inf_ms;
         rec.tracker_ms = trk_ms;
         telemetry.write(rec);

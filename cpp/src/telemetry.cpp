@@ -51,6 +51,10 @@ void TelemetryWriter::write(const FrameTelemetry& r) {
     ofs_ << ",\"narrow_crop\":[" << r.narrow_crop_x1 << "," << r.narrow_crop_y1
          << "," << r.narrow_crop_x2 << "," << r.narrow_crop_y2 << "]";
     ofs_ << ",\"narrow_rendered\":" << (r.narrow_rendered ? "true" : "false");
+    ofs_ << ",\"csrt_active\":" << (r.csrt_active ? "true" : "false");
+    ofs_ << ",\"csrt_updated\":" << (r.csrt_updated_this_frame ? "true" : "false");
+    ofs_ << ",\"csrt_synthetic_used\":" << (r.csrt_synthetic_used ? "true" : "false");
+    ofs_ << ",\"csrt_score\":" << r.csrt_score;
     ofs_ << ",\"active_track_id\":";
     if (r.active_track) ofs_ << r.active_track->track_id; else ofs_ << "null";
     ofs_ << ",\"active_track_bbox\":";

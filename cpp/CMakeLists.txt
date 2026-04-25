@@ -32,12 +32,42 @@ if (NOT EXISTS "${ORT_LIB}")
     message(FATAL_ERROR "ONNX Runtime DirectML nie znaleziony w ${ORT_ROOT}. Pobierz z nuget.org (Microsoft.ML.OnnxRuntime.DirectML) i rozpakuj do ${ORT_ROOT}.")
 endif()
 
-# OpenCV (prebuilt Windows)
-# Domyslnie szuka w third_party/opencv/build; mozna nadpisac -DOpenCV_DIR=...
+# OpenCV: prefer opencv_contrib_install (z contrib modulami w tym tracking dla CSRT)
+# jesli zostala lokalnie zbudowana, inaczej fallback na prebuilt third_party/opencv.
+# Jesli kompilacja contrib niedostepna, kompiluj local_tracker w stub-mode.
 if (NOT OpenCV_DIR)
-    set(OpenCV_DIR "${CMAKE_SOURCE_DIR}/../third_party/opencv/build" CACHE PATH "OpenCV build dir")
+    set(_contrib_install "${CMAKE_SOURCE_DIR}/../third_party/opencv_contrib_install")
+    if (EXISTS "${_contrib_install}")
+        set(OpenCV_DIR "${_contrib_install}" CACHE PATH "OpenCV build dir")
+        message(STATUS "Using OpenCV with contrib (local build): ${_contrib_install}")
+    else()
+        set(OpenCV_DIR "${CMAKE_SOURCE_DIR}/../third_party/opencv/build" CACHE PATH "OpenCV build dir")
+        message(STATUS "Using OpenCV prebuilt (no contrib, CSRT disabled): ${OpenCV_DIR}")
+    endif()
 endif()
+
+# Probuj znalezc tracking module (z contrib). Z BUILD_opencv_world=ON nie ma
+# osobnego targetu opencv_tracking, sprawdzamy header file zamiast.
 find_package(OpenCV REQUIRED COMPONENTS core imgproc imgcodecs highgui dnn)
+set(_tracking_hdr_candidates
+    "${OpenCV_INCLUDE_DIRS}/opencv2/tracking.hpp"
+)
+foreach(_dir ${OpenCV_INCLUDE_DIRS})
+    list(APPEND _tracking_hdr_candidates "${_dir}/opencv2/tracking.hpp")
+endforeach()
+set(_tracking_found FALSE)
+foreach(_hdr ${_tracking_hdr_candidates})
+    if (EXISTS "${_hdr}")
+        set(_tracking_found TRUE)
+        break()
+    endif()
+endforeach()
+if (_tracking_found)
+    message(STATUS "OpenCV tracking module header found (CSRT enabled)")
+else()
+    message(STATUS "OpenCV tracking module NOT found -- LocalTracker compiled in stub mode")
+    add_compile_definitions(DTRACKER_NO_OPENCV_CONTRIB)
+endif()
 
 # ======== Core library ========
 
@@ -48,6 +78,7 @@ add_library(dtracker_lib STATIC
     src/target_manager.cpp
     src/narrow_tracker.cpp
     src/lock_pipeline.cpp
+    src/local_tracker.cpp
     src/dashboard.cpp
     src/telemetry.cpp
 )
@@ -81,24 +112,29 @@ function(dtracker_copy_runtime_dlls _target)
         COMMAND ${CMAKE_COMMAND} -E copy_if_different "${ORT_DLL}" $<TARGET_FILE_DIR:${_target}>
         COMMENT "Copy onnxruntime.dll -> ${_target}"
     )
-    set(_opencv_dll "${OpenCV_DIR}/x64/vc16/bin/opencv_world4100.dll")
-    if (EXISTS "${_opencv_dll}")
-        add_custom_command(TARGET ${_target} POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_opencv_dll}" $<TARGET_FILE_DIR:${_target}>
-            COMMENT "Copy opencv_world4100.dll -> ${_target}"
-        )
-    endif()
-    # OpenCV videoio pluginy (ffmpeg + media foundation) -- ladowane dynamicznie
-    # przy cv::VideoCapture / VideoWriter. Bez nich .mp4 nie otworzy.
-    foreach(_plugin opencv_videoio_ffmpeg4100_64.dll opencv_videoio_msmf4100_64.dll)
-        set(_plugin_path "${OpenCV_DIR}/x64/vc16/bin/${_plugin}")
-        if (EXISTS "${_plugin_path}")
-            add_custom_command(TARGET ${_target} POST_BUILD
-                COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_plugin_path}" $<TARGET_FILE_DIR:${_target}>
-                COMMENT "Copy ${_plugin} -> ${_target}"
-            )
+    # Auto-detect vc16 (VS 2019 prebuilt) vs vc17 (VS 2022 lokalny build).
+    set(_opencv_bin "")
+    foreach(_vc vc17 vc16)
+        if (EXISTS "${OpenCV_DIR}/x64/${_vc}/bin/opencv_world4100.dll")
+            set(_opencv_bin "${OpenCV_DIR}/x64/${_vc}/bin")
+            break()
         endif()
     endforeach()
+    if (_opencv_bin)
+        add_custom_command(TARGET ${_target} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_opencv_bin}/opencv_world4100.dll" $<TARGET_FILE_DIR:${_target}>
+            COMMENT "Copy opencv_world4100.dll -> ${_target}"
+        )
+        # OpenCV videoio pluginy (ffmpeg + msmf) -- ladowane dynamicznie
+        foreach(_plugin opencv_videoio_ffmpeg4100_64.dll opencv_videoio_msmf4100_64.dll)
+            if (EXISTS "${_opencv_bin}/${_plugin}")
+                add_custom_command(TARGET ${_target} POST_BUILD
+                    COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_opencv_bin}/${_plugin}" $<TARGET_FILE_DIR:${_target}>
+                    COMMENT "Copy ${_plugin} -> ${_target}"
+                )
+            endif()
+        endforeach()
+    endif()
     # DirectML DLL (jesli istnieje obok ORT)
     set(_dml_dll "${ORT_ROOT}/runtimes/win-x64/native/DirectML.dll")
     if (EXISTS "${_dml_dll}")

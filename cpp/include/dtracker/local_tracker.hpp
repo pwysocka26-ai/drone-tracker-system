@@ -1,13 +1,23 @@
 // LocalTargetTracker — visual CSRT fallback dla recovery.
-// UWAGA (30.04 MVP): wymaga OpenCV contrib (opencv_tracking) — prebuilt Windows OpenCV
-// nie zawiera contrib. Na demo ten modul jest DISABLED, Python pipeline mial go jako fallback.
-// Post-demo: zbudowac OpenCV z contrib (CSRT) albo zaimplementowac template-matching proxy.
+// Port src/core/local_target_tracker.py.
+//
+// Wymaga OpenCV z contrib (opencv_tracking module). Buildowane lokalnie
+// w third_party/opencv_contrib_build/. Gdy contrib niedostepny, klasa
+// kompiluje sie ale init() zawsze zwraca false (graceful degradation).
+//
+// Cel:
+// - lokalny visual lock na wybranym celu, niezalezny od YOLO detekcji
+// - mostek dla narrow podczas dropoutow YOLO (np. dron za chmurą)
+// - chroni przed switch na geometrycznie-zblizonego sasiada
 #pragma once
 
-#include <opencv2/core/mat.hpp>
+#include <memory>
 #include <optional>
 
-#include "dtracker/types.hpp"
+#include <opencv2/core/mat.hpp>
+
+#include "dtracker/kalman.hpp"   // Point2
+#include "dtracker/types.hpp"    // BBox
 
 namespace dtracker {
 
@@ -16,27 +26,38 @@ struct LocalTrackResult {
     std::optional<BBox> bbox;
     float score = 0.0f;
     const char* source = "none";
+    std::optional<Point2> center;
 };
 
 class LocalTargetTracker {
 public:
-    LocalTargetTracker() = default;
+    LocalTargetTracker(int max_lost_frames = 8);
+    ~LocalTargetTracker();
 
-    // Stub: obecnie zwraca zawsze ok=false.
-    // TODO: w OpenCV z contrib (opencv_tracking) uzyj cv::legacy::TrackerCSRT.
-    bool init(const cv::Mat& frame, const BBox& roi) {
-        (void)frame;
-        (void)roi;
-        return false;
-    }
+    // Inicjalizuje CSRT na danej klatce + ROI.
+    // Zwraca true gdy CSRT zainicjalizowal sie pomyslnie.
+    bool init(const cv::Mat& frame, const BBox& roi);
 
-    LocalTrackResult update(const cv::Mat& frame) {
-        (void)frame;
-        return {};
-    }
+    // Update: tracker sledzi cel w nowej klatce.
+    // Zwraca LocalTrackResult z bbox (jesli ok=true) i score.
+    LocalTrackResult update(const cv::Mat& frame);
 
-    void reset() {}
-    bool is_active() const { return false; }
+    void reset();
+    bool is_active() const { return active_; }
+    int lost_frames() const { return lost_frames_; }
+    float score() const { return score_; }
+    std::optional<BBox> last_bbox() const { return last_bbox_; }
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+
+    bool active_ = false;
+    int lost_frames_ = 0;
+    int max_lost_frames_;
+    std::optional<BBox> last_bbox_;
+    std::optional<Point2> last_center_;
+    float score_ = 0.0f;
 };
 
 }  // namespace dtracker

@@ -155,6 +155,8 @@ add_executable(dtracker_tests
     tests/test_kalman.cpp
     tests/test_mtt.cpp
     tests/test_target_manager.cpp
+    tests/test_lock_pipeline.cpp
+    tests/test_narrow_tracker.cpp
 )
 target_include_directories(dtracker_tests PRIVATE tests)
 target_link_libraries(dtracker_tests PRIVATE dtracker_lib)

@@ -352,10 +352,14 @@ int main(int argc, char** argv) {
         bool is_locked = (lock_state == LockState::LOCKED);
 
         // ---------- LocalTargetTracker (CSRT) lifecycle ----------
-        // Init/re-init gdy zdrowy real owner. Update co klatka. Fallback gdy YOLO
-        // traci ownera (port src/core/app.py:1066-1095).
+        // Init/re-init gdy zdrowy real owner. Lazy update: skip gdy YOLO ma
+        // zdrowego ownera (missed=0, conf>=0.18). Inaczej update co klatka.
+        // Fallback synthetic gdy YOLO traci ownera (port src/core/app.py:1066-1095).
         Track synthetic_csrt_owner;          // wypelniany gdy CSRT da result
         bool have_synthetic_owner = false;
+        bool owner_healthy = (owner && owner->missed_frames == 0 && owner->confidence >= 0.18f);
+
+        // Init/re-init przy widocznym + healthy owner
         if (owner && owner->missed_frames <= 1) {
             int sid = owner->track_id;
             if (!local_tracker.is_active() || local_tracker_owner_id != sid) {
@@ -368,10 +372,14 @@ int main(int argc, char** argv) {
             local_tracker_owner_id = -1;
         }
 
-        // Gdy YOLO traci real ownera, sprobuj CSRT jako synthetic owner.
-        if (!owner && local_tracker.is_active() && sel) {
+        // Lazy CSRT: update tylko gdy YOLO degraded/missing (oszczedza ~28 ms/klatka
+        // gdy YOLO trzyma zdrowego ownera). Trade-off: appearance model CSRT
+        // moze byc N klatek stary gdy gap arrives, ale CSRT robust na to.
+        if (!owner_healthy && local_tracker.is_active()) {
             LocalTrackResult lr = local_tracker.update(frame);
-            if (lr.bbox && lr.center && (lr.ok || lr.score >= local_tracker_min_score)) {
+            // Synthetic fallback gdy YOLO calkiem zgubil ownera
+            if (!owner && sel && lr.bbox && lr.center
+                && (lr.ok || lr.score >= local_tracker_min_score)) {
                 synthetic_csrt_owner.track_id = *sel;
                 synthetic_csrt_owner.raw_id = local_tracker_owner_id;
                 synthetic_csrt_owner.bbox = *lr.bbox;
@@ -384,10 +392,8 @@ int main(int argc, char** argv) {
                 have_synthetic_owner = true;
                 owner = &synthetic_csrt_owner;
             }
-        } else if (owner && local_tracker.is_active()) {
-            // Update CSRT na bieżąco zeby tracker nie ślepł podczas widocznego ownera
-            local_tracker.update(frame);
         }
+        // owner_healthy == true: pomijamy update -- CSRT model zostaje ostatnio init'owany
 
         narrow.update(owner, is_locked);
         auto t_trk1 = std::chrono::steady_clock::now();

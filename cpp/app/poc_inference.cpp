@@ -16,12 +16,19 @@ int main(int argc, char** argv) {
     std::string image_path = "../../artifacts/cvat_import/obj_train_data/frame_000050.jpg";
     bool use_directml = true;
 
+    int imgsz = 960;
     if (argc > 1) image_path = argv[1];
     if (argc > 2) model_path = argv[2];
-    if (argc > 3 && std::string(argv[3]) == "cpu") use_directml = false;
+    if (argc > 3) {
+        std::string a3 = argv[3];
+        if (a3 == "cpu") use_directml = false;
+        else imgsz = std::atoi(argv[3]);
+    }
+    if (argc > 4 && std::string(argv[4]) == "cpu") use_directml = false;
 
     std::cout << "Model:   " << model_path << "\n";
     std::cout << "Image:   " << image_path << "\n";
+    std::cout << "imgsz:   " << imgsz << "\n";
     std::cout << "DirectML: " << (use_directml ? "TAK" : "NIE") << "\n";
 
     cv::Mat img = cv::imread(image_path);
@@ -33,7 +40,7 @@ int main(int argc, char** argv) {
 
     YoloConfig cfg;
     cfg.model_path = model_path;
-    cfg.imgsz = 960;
+    cfg.imgsz = imgsz;
     cfg.conf_threshold = 0.01f;  // very low dla debug
     cfg.nms_iou_threshold = 0.45f;
     cfg.use_directml = use_directml;

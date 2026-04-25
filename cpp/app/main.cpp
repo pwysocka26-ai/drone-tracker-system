@@ -37,7 +37,9 @@ using namespace dtracker;
 
 struct CliArgs {
     std::string video = "../../../artifacts/test_videos/video_test_wide_short.mp4";
-    std::string model = "../../../data/weights/v3_best.onnx";
+    // Default: FP16 ONNX (1.48x szybszy vs FP32 z zerowa utrata accuracy na v3).
+    // Patrz tools/export_v3_to_onnx_fp16.py + raport benchmarka 2026-04-25.
+    std::string model = "../../../data/weights/v3_best_fp16_imgsz960.onnx";
     std::string out_dir = "../../../artifacts/runs";
     bool gui = true;
     bool record = true;

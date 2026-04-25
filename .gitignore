@@ -45,6 +45,12 @@ video.mp4
 cpp/build/
 third_party/
 
+# Claude Code local settings (user-specific)
+.claude/
+
+# poc_inference benchmark artifacts (regenerated per run)
+poc_inference_out*.jpg
+
 # model files
 yolov8s.pt
 

@@ -120,7 +120,7 @@ def parse_tracks(result, frame_shape):
             continue
         if bw < 8.0 or bh < 8.0:
             continue
-        if area < 60.0:
+        if area < 200.0:  # było 60 — odrzuca noise < ~14x14 px
             continue
         if area > (w * h * 0.035):
             continue
@@ -131,12 +131,23 @@ def parse_tracks(result, frame_shape):
         if aspect < 0.10 or aspect > 10.00:
             continue
 
+        # Drone bbox padding: YOLO przy conf>=0.2 wykrywa solidny korpus drona
+        # (wysoki conf), ale propellery mają niski conf i są wycinane z bbox.
+        # Padding ~15% horizontal + ~20% vertical obejmuje propellery wokół
+        # korpusu. Center pozostaje ten sam (symetryczne padding).
+        pad_w = (x2 - x1) * 0.15
+        pad_h = (y2 - y1) * 0.20
+        x1p = max(0.0, x1 - pad_w)
+        y1p = max(0.0, y1 - pad_h)
+        x2p = min(float(w), x2 + pad_w)
+        y2p = min(float(h), y2 + pad_h)
+
         tracks.append(
             Track(
                 track_id=int(raw_id),
                 raw_id=int(raw_id),
-                bbox_xyxy=(x1, y1, x2, y2),
-                center_xy=((x1 + x2) / 2.0, (y1 + y2) / 2.0),
+                bbox_xyxy=(x1p, y1p, x2p, y2p),
+                center_xy=((x1p + x2p) / 2.0, (y1p + y2p) / 2.0),
                 confidence=float(conf),
             )
         )

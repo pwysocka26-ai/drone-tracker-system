@@ -382,18 +382,24 @@ class NarrowTracker:
             reacquire_recent = 0 < self.hold_count <= self.reacquire_boost_frames
             degraded = (missed >= 1) or (conf < 0.18) or reacquire_recent
 
-            # Źródło desired_center: MultiTargetTracker.predicted_center_xy to
-            # center + LPF-filtered velocity (velocity_alpha=0.65). Pomiar jitteru
-            # per-klatka na track_id=18 w P1: mean 5.85 px, max 54.9 px. Raw
-            # center_xy jest zbyt zaszumione żeby smooth_center mogło utrzymać
-            # lock. predicted_center_xy daje jednoklatkowy feedforward + niższy
-            # jitter, bo velocity jest bardziej stabilna niż delta pozycji.
+            # Adaptacyjny velocity feedforward: pełny dla szybkich celów
+            # (gdzie feedforward kompensuje steady-state lag), minimalny dla
+            # wolnych (gdzie velocity noise z Kalmana LPF powoduje overshoot).
+            # - |v| < 2 px/frame: scale=0.2 (drone stacjonarny, mały feedforward)
+            # - |v| >= 5 px/frame: scale=1.0 (szybki manewr, pełny feedforward)
+            # - między: liniowa interpolacja
             corrected = self.kalman.correct(owner_track.center_xy[0], owner_track.center_xy[1])
-            pred = getattr(owner_track, 'predicted_center_xy', None)
-            if pred is not None:
-                desired_center = tuple(float(v) for v in pred)
+            raw_cx, raw_cy = float(owner_track.center_xy[0]), float(owner_track.center_xy[1])
+            vx, vy = getattr(owner_track, 'velocity_xy', (0.0, 0.0)) or (0.0, 0.0)
+            vx, vy = float(vx), float(vy)
+            v_mag = (vx * vx + vy * vy) ** 0.5
+            if v_mag < 2.0:
+                ff_scale = 0.2
+            elif v_mag >= 5.0:
+                ff_scale = 1.0
             else:
-                desired_center = tuple(float(v) for v in owner_track.center_xy)
+                ff_scale = 0.2 + (v_mag - 2.0) / 3.0 * 0.8
+            desired_center = (raw_cx + ff_scale * vx, raw_cy + ff_scale * vy)
             predicted_center = corrected
 
             self.hold_count = 0

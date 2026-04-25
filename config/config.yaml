@@ -1,17 +1,15 @@
 mode: video
 video:
-  source: video.mp4
+  source: artifacts/test_videos/video_test_wide_short.mp4
   record_on_start: true
 yolo:
-  model: yolov8s.pt
+  model: data/weights/best.pt   # v3 custom drone model (yolov8m, imgsz=960, mAP@0.5=0.956)
   backend: track
   tracker: config/bytetrack_fast_acquire.yaml
-  conf: 0.1
-  imgsz: 960   # zmniejszone z 1280 dla szybszej inference na CPU
+  conf: 0.20
+  imgsz: 960
   classes:
-  - 4   # airplane
-  - 14  # bird (drones often misclassified as bird in COCO)
-  - 33  # kite (drones also often classified as kite)
+  - 0   # drone (single-class custom model)
   inference_every: 2
   search_fallback: false   # wyłączone — search_fallback podwaja inference cost
   search_conf: 0.07

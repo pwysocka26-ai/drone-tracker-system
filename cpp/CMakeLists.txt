@@ -68,21 +68,46 @@ target_link_libraries(dtracker_lib
 add_executable(poc_inference app/poc_inference.cpp)
 target_link_libraries(poc_inference PRIVATE dtracker_lib)
 
-# Windows: skopiuj ONNX Runtime DLL + OpenCV DLL do output dir
-if (WIN32)
-    add_custom_command(TARGET poc_inference POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${ORT_DLL}" $<TARGET_FILE_DIR:poc_inference>
-        COMMENT "Copy onnxruntime.dll"
+add_executable(dtracker_main app/main.cpp)
+target_link_libraries(dtracker_main PRIVATE dtracker_lib)
+
+# Windows: skopiuj ONNX Runtime DLL + OpenCV DLL do output dir kazdego exe.
+# Funkcja, zeby nie duplikowac.
+function(dtracker_copy_runtime_dlls _target)
+    if (NOT WIN32)
+        return()
+    endif()
+    add_custom_command(TARGET ${_target} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${ORT_DLL}" $<TARGET_FILE_DIR:${_target}>
+        COMMENT "Copy onnxruntime.dll -> ${_target}"
     )
-    # OpenCV World DLL
-    foreach(_cfg Debug Release)
-        set(_opencv_dll "${OpenCV_DIR}/x64/vc16/bin/opencv_world4100.dll")
-        if (EXISTS "${_opencv_dll}")
-            add_custom_command(TARGET poc_inference POST_BUILD
-                COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_opencv_dll}" $<TARGET_FILE_DIR:poc_inference>
-                COMMENT "Copy opencv_world4100.dll"
+    set(_opencv_dll "${OpenCV_DIR}/x64/vc16/bin/opencv_world4100.dll")
+    if (EXISTS "${_opencv_dll}")
+        add_custom_command(TARGET ${_target} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_opencv_dll}" $<TARGET_FILE_DIR:${_target}>
+            COMMENT "Copy opencv_world4100.dll -> ${_target}"
+        )
+    endif()
+    # OpenCV videoio pluginy (ffmpeg + media foundation) -- ladowane dynamicznie
+    # przy cv::VideoCapture / VideoWriter. Bez nich .mp4 nie otworzy.
+    foreach(_plugin opencv_videoio_ffmpeg4100_64.dll opencv_videoio_msmf4100_64.dll)
+        set(_plugin_path "${OpenCV_DIR}/x64/vc16/bin/${_plugin}")
+        if (EXISTS "${_plugin_path}")
+            add_custom_command(TARGET ${_target} POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_plugin_path}" $<TARGET_FILE_DIR:${_target}>
+                COMMENT "Copy ${_plugin} -> ${_target}"
             )
-            break()
         endif()
     endforeach()
-endif()
+    # DirectML DLL (jesli istnieje obok ORT)
+    set(_dml_dll "${ORT_ROOT}/runtimes/win-x64/native/DirectML.dll")
+    if (EXISTS "${_dml_dll}")
+        add_custom_command(TARGET ${_target} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_dml_dll}" $<TARGET_FILE_DIR:${_target}>
+            COMMENT "Copy DirectML.dll -> ${_target}"
+        )
+    endif()
+endfunction()
+
+dtracker_copy_runtime_dlls(poc_inference)
+dtracker_copy_runtime_dlls(dtracker_main)

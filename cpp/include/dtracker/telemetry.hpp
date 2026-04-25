@@ -27,6 +27,14 @@ struct FrameTelemetry {
     bool center_lock = false;
     bool narrow_synthetic_hold = false;  // Fix 1: narrow renderuje z last_good
     int narrow_hold_count = 0;
+    // Fix 5 diagnostic: dlaczego narrow czerni mimo has_owner=true
+    bool narrow_has_owner = false;
+    float narrow_smooth_size = 0.0f;
+    float narrow_crop_x1 = 0.0f;
+    float narrow_crop_y1 = 0.0f;
+    float narrow_crop_x2 = 0.0f;
+    float narrow_crop_y2 = 0.0f;
+    bool narrow_rendered = false;        // czy narrow_vis nie-empty po renderingu
     double inference_ms = 0.0;
     double tracker_ms = 0.0;
 };

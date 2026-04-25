@@ -46,6 +46,11 @@ void TelemetryWriter::write(const FrameTelemetry& r) {
     if (r.persistent_owner_id >= 0) ofs_ << r.persistent_owner_id; else ofs_ << "null";
     ofs_ << ",\"narrow_synthetic_hold\":" << (r.narrow_synthetic_hold ? "true" : "false");
     ofs_ << ",\"narrow_hold_count\":" << r.narrow_hold_count;
+    ofs_ << ",\"narrow_has_owner\":" << (r.narrow_has_owner ? "true" : "false");
+    ofs_ << ",\"narrow_smooth_size\":" << r.narrow_smooth_size;
+    ofs_ << ",\"narrow_crop\":[" << r.narrow_crop_x1 << "," << r.narrow_crop_y1
+         << "," << r.narrow_crop_x2 << "," << r.narrow_crop_y2 << "]";
+    ofs_ << ",\"narrow_rendered\":" << (r.narrow_rendered ? "true" : "false");
     ofs_ << ",\"active_track_id\":";
     if (r.active_track) ofs_ << r.active_track->track_id; else ofs_ << "null";
     ofs_ << ",\"active_track_bbox\":";

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <limits>
 #include <optional>
 
 namespace dtracker {
@@ -94,15 +95,19 @@ float MultiTargetTracker::motion_penalty_(const Track& tr, const Detection& det)
     return static_cast<float>(std::min(2.0, mag));
 }
 
+// Sentinel for "no match" -- valid scores can be negative (lower=better).
+// Greedy_match filtruje to przez `s < NO_MATCH_SCORE`.
+static constexpr float NO_MATCH_SCORE = std::numeric_limits<float>::max();
+
 float MultiTargetTracker::match_score_(const Track& tr, const Point2& predicted, const Detection& det) const {
     double det_cx = 0.5 * (det.bbox.x1 + det.bbox.x2);
     double det_cy = 0.5 * (det.bbox.y1 + det.bbox.y2);
     float dist = static_cast<float>(std::hypot(predicted.x - det_cx, predicted.y - det_cy));
-    if (dist > cfg_.max_center_distance) return -1.0f;
+    if (dist > cfg_.max_center_distance) return NO_MATCH_SCORE;
     float iou = iou_(tr.bbox, det.bbox);
     float size_pen = size_penalty_(tr.bbox, det.bbox);
     float motion_pen = motion_penalty_(tr, det);
-    if (iou < cfg_.min_iou_for_match && size_pen > 0.75f) return -1.0f;
+    if (iou < cfg_.min_iou_for_match && size_pen > 0.75f) return NO_MATCH_SCORE;
     float score = dist + 60.0f * size_pen + 30.0f * motion_pen - 25.0f * iou - 10.0f * det.conf;
     // raw_id bonus -- tutaj Detection nie ma raw_id z ByteTrack; pomijam w MVP
     return score;
@@ -119,7 +124,9 @@ MultiTargetTracker::greedy_match_(const std::vector<Track>& tracks,
     for (size_t ti = 0; ti < tracks.size(); ++ti) {
         for (size_t di = 0; di < dets.size(); ++di) {
             float s = match_score_(tracks[ti], predicted_centers[ti], dets[di]);
-            if (s >= 0.0f) pairs.push_back({s, static_cast<int>(ti), static_cast<int>(di)});
+            // Bug fix 2026-04-25: score moze byc ujemny (lower=better, IoU bonus
+            // moze przewazyc dist). NO_MATCH_SCORE jest jedynym sentinelem.
+            if (s < NO_MATCH_SCORE) pairs.push_back({s, static_cast<int>(ti), static_cast<int>(di)});
         }
     }
     std::sort(pairs.begin(), pairs.end(), [](const Pair& a, const Pair& b) { return a.score < b.score; });

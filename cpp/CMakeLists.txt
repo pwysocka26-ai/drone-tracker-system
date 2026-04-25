@@ -111,3 +111,15 @@ endfunction()
 
 dtracker_copy_runtime_dlls(poc_inference)
 dtracker_copy_runtime_dlls(dtracker_main)
+
+# ======== Tests ========
+# Self-contained test runner (test_framework.hpp). Brak zewnetrznych deps.
+add_executable(dtracker_tests
+    tests/test_main.cpp
+    tests/test_kalman.cpp
+    tests/test_mtt.cpp
+    tests/test_target_manager.cpp
+)
+target_include_directories(dtracker_tests PRIVATE tests)
+target_link_libraries(dtracker_tests PRIVATE dtracker_lib)
+dtracker_copy_runtime_dlls(dtracker_tests)

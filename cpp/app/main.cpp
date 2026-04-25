@@ -349,6 +349,18 @@ int main(int argc, char** argv) {
         BBox crop = narrow.narrow_crop();
         int sel_id = sel ? *sel : -1;
 
+        // Fix 5 diagnostic: czy crop bedzie renderowalny
+        bool narrow_rendered_flag = false;
+        {
+            int dx1 = std::max(0, static_cast<int>(crop.x1));
+            int dy1 = std::max(0, static_cast<int>(crop.y1));
+            int dx2 = std::min(frame_w, static_cast<int>(crop.x2));
+            int dy2 = std::min(frame_h, static_cast<int>(crop.y2));
+            if (dx2 > dx1 && dy2 > dy1 && narrow.state().has_owner) {
+                narrow_rendered_flag = true;
+            }
+        }
+
         // GUI render (cv::imshow + key)
         int key = -1;
         if (a.gui) {
@@ -370,6 +382,13 @@ int main(int argc, char** argv) {
         rec.center_lock = is_locked;
         rec.narrow_synthetic_hold = narrow.state().is_synthetic;  // Fix 1
         rec.narrow_hold_count = narrow.state().hold_count;
+        rec.narrow_has_owner = narrow.state().has_owner;
+        rec.narrow_smooth_size = narrow.state().smooth_size;
+        rec.narrow_crop_x1 = crop.x1;
+        rec.narrow_crop_y1 = crop.y1;
+        rec.narrow_crop_x2 = crop.x2;
+        rec.narrow_crop_y2 = crop.y2;
+        rec.narrow_rendered = narrow_rendered_flag;
         rec.inference_ms = inf_ms;
         rec.tracker_ms = trk_ms;
         telemetry.write(rec);

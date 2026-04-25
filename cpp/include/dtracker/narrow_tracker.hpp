@@ -44,13 +44,20 @@ struct NarrowConfig {
     float ff_v_high = 5.0f;               // powyzej ff_scale=1.0
     float ff_scale_low = 0.2f;
     float ff_scale_high = 1.0f;
+
+    // Fix 1: last_good persistence -- narrow trzyma synthetic crop podczas
+    // chwilowej utraty ownera (HOLD/REACQUIRE), zamiast gasic widok.
+    // Fix 3: 60 -> 100 (2 s @ 50fps) -- daje wiecej czasu na re-acquisition
+    // zanim narrow wygaszamy. Synchronizacja z TM.stale_owner_frames=50.
+    int   max_hold_frames = 100;
+    float hold_zoom_decay = 0.992f;       // EMA powolne zoom out podczas hold
 };
 
 struct NarrowState {
     std::optional<Point2> smooth_center;
     float smooth_size = 200.0f;        // aktualny rozmiar narrow crop (px)
     float zoom = 1.0f;
-    bool has_owner = false;
+    bool has_owner = false;            // realny owner LUB synthetic-hold (Fix 1)
 
     // D3 PID state (across frames)
     double last_pan_speed = 0.0;
@@ -60,6 +67,15 @@ struct NarrowState {
     double last_ff_scale = 0.0;
     double last_velocity_magnitude = 0.0;
     bool last_degraded = false;
+
+    // Fix 1: last_good persistence -- gdy real owner zniknal, trzymamy
+    // ostatni dobry crop przez max_hold_frames klatek, zeby narrow nie czernial.
+    std::optional<Point2> last_good_center;
+    std::optional<BBox>   last_good_bbox;
+    float last_good_size = 200.0f;
+    float last_good_zoom = 1.0f;
+    int   hold_count = 0;          // ile klatek bez real ownera
+    bool  is_synthetic = false;    // true gdy aktualnie renderujemy z last_good
 };
 
 class NarrowTracker {

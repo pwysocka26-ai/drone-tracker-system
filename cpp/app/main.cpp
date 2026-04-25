@@ -191,7 +191,9 @@ static void write_run_summary(const fs::path& path, int frames,
 // Wide frame z overlays (per-track bbox, narrow crop rect, status banner) -- na
 // recording. Dashboard::render robi wlasne imshow, my potrzebujemy "to-Mat" wersji.
 static cv::Mat draw_wide_overlays(const cv::Mat& frame, const std::vector<Track>& tracks,
-                                   int sel_id, LockState lock_state, const BBox& crop) {
+                                   int sel_id, int persistent_id,
+                                   LockState lock_state, const BBox& crop,
+                                   const NarrowState& nstate) {
     cv::Mat vis = frame.clone();
     cv::Scalar lock_color(0, 255, 0);
     if (lock_state == LockState::ACQUIRE)        lock_color = cv::Scalar(0, 200, 255);
@@ -212,14 +214,21 @@ static cv::Mat draw_wide_overlays(const cv::Mat& frame, const std::vector<Track>
                     cv::Point(static_cast<int>(t.bbox.x1), static_cast<int>(t.bbox.y1) - 6),
                     cv::FONT_HERSHEY_SIMPLEX, 0.5, col, 1);
     }
+    // Narrow crop rectangle: bialy gdy real owner, bialy przerywany gdy synthetic hold
+    cv::Scalar crop_color = nstate.is_synthetic ? cv::Scalar(0, 255, 255) : cv::Scalar(255, 255, 255);
     cv::rectangle(vis,
                   cv::Point(static_cast<int>(crop.x1), static_cast<int>(crop.y1)),
                   cv::Point(static_cast<int>(crop.x2), static_cast<int>(crop.y2)),
-                  cv::Scalar(255, 255, 255), 1);
+                  crop_color, 1);
 
     std::ostringstream banner;
-    banner << "lock=" << to_string(lock_state) << "  owner=" << sel_id
+    banner << "lock=" << to_string(lock_state)
+           << "  owner=#" << persistent_id   // Fix 2: persistent ID, nie raw track_id
+           << " (tid=" << sel_id << ")"
            << "  tracks=" << tracks.size();
+    if (nstate.is_synthetic) {
+        banner << "  HOLD " << nstate.hold_count;
+    }
     cv::putText(vis, banner.str(), cv::Point(10, 30),
                 cv::FONT_HERSHEY_SIMPLEX, 0.7, lock_color, 2);
     return vis;
@@ -350,26 +359,40 @@ int main(int argc, char** argv) {
         rec.frame_idx = frame_idx;
         rec.time_s = static_cast<double>(frame_idx) / fps;
         rec.selected_id = sel;
+        rec.persistent_owner_id = tm.persistent_owner_id();    // Fix 2
         if (owner) rec.active_track = owner->clone();
         rec.lock_state = lock_state;
         rec.multi_tracks.reserve(tracks.size());
         for (const auto& t : tracks) rec.multi_tracks.push_back(t.clone());
         if (narrow.state().smooth_center) rec.narrow_center = narrow.state().smooth_center;
         rec.center_lock = is_locked;
+        rec.narrow_synthetic_hold = narrow.state().is_synthetic;  // Fix 1
+        rec.narrow_hold_count = narrow.state().hold_count;
         rec.inference_ms = inf_ms;
         rec.tracker_ms = trk_ms;
         telemetry.write(rec);
 
         // VideoWriter — composite wide + narrow crop
         if (video_writer.isOpened()) {
-            cv::Mat wide_vis = draw_wide_overlays(frame, tracks, sel_id, lock_state, crop);
+            cv::Mat wide_vis = draw_wide_overlays(frame, tracks, sel_id,
+                                                    tm.persistent_owner_id(),
+                                                    lock_state, crop, narrow.state());
             cv::Mat narrow_vis;
             int nx1 = std::max(0, static_cast<int>(crop.x1));
             int ny1 = std::max(0, static_cast<int>(crop.y1));
             int nx2 = std::min(frame_w, static_cast<int>(crop.x2));
             int ny2 = std::min(frame_h, static_cast<int>(crop.y2));
+            // Fix 1: narrow.state().has_owner pozostaje true podczas synthetic hold
+            // -> renderujemy crop z ostatniej dobrej pozycji zamiast czarnego ekranu
             if (nx2 > nx1 && ny2 > ny1 && narrow.state().has_owner) {
                 narrow_vis = frame(cv::Rect(nx1, ny1, nx2 - nx1, ny2 - ny1)).clone();
+                if (narrow.state().is_synthetic) {
+                    // Zolty banner "HOLD N/max" zeby uzytkownik widzial ze to synthetic
+                    std::ostringstream syn;
+                    syn << "HOLD " << narrow.state().hold_count;
+                    cv::putText(narrow_vis, syn.str(), cv::Point(10, 30),
+                                cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 255, 255), 2);
+                }
             }
             cv::Mat composite = make_composite(wide_vis, narrow_vis,
                                                 composite_w, composite_h);

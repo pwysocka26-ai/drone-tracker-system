@@ -12,6 +12,8 @@ void TargetManager::set_manual_lock(int track_id) {
     state_.manual_lock_id = track_id;
     state_.selected_id = track_id;
     state_.frames_since_switch = 0;
+    // Fix 2: manual lock = fresh logical owner (uzytkownik wybral inny cel)
+    state_.current_persistent_id = ++state_.next_persistent_id;
 }
 
 void TargetManager::clear_manual_lock() {
@@ -109,13 +111,18 @@ void TargetManager::store_owner_reference_(const Track& tr) {
     state_.last_selected_bbox = tr.bbox;
 }
 
-void TargetManager::commit_owner_(const Track& tr, const std::vector<Track>& tracks) {
+void TargetManager::commit_owner_(const Track& tr, const std::vector<Track>& tracks,
+                                    bool fresh_persistent) {
     state_.selected_id = tr.track_id;
     state_.frames_since_switch = 0;
     state_.candidate_id = -1;
     state_.candidate_dwell = 0;
     set_identity_anchor_(tr, tracks);
     store_owner_reference_(tr);
+    // Fix 2: nowy logical ID dla fizycznie nowego ownera, keep dla re-acquisition.
+    if (fresh_persistent || state_.current_persistent_id < 0) {
+        state_.current_persistent_id = ++state_.next_persistent_id;
+    }
 }
 
 float TargetManager::score_candidate_(const Track& tr, bool is_current) const {
@@ -297,7 +304,8 @@ std::optional<int> TargetManager::select(const std::vector<Track>& tracks) {
         state_.selected_missing_frames = 0;
         state_.reacquire_pending_id = -1;
         state_.reacquire_pending_count = 0;
-        commit_owner_(best, tracks);
+        // Fix 2: fresh persistent ID -- nowy fizyczny obiekt (start lub stale escape).
+        commit_owner_(best, tracks, /*fresh_persistent=*/true);
         return state_.selected_id;
     }
 
@@ -361,7 +369,9 @@ std::optional<int> TargetManager::select(const std::vector<Track>& tracks) {
     }
 
     // Switch! Update anchor do nowego ownera.
-    commit_owner_(best, tracks);
+    // Fix 2: fresh persistent ID -- dwell-based switch oznacza ze wygral inny
+    // fizyczny kandydat (continuity guard mial szanse zablokowac, ale przepuscil).
+    commit_owner_(best, tracks, /*fresh_persistent=*/true);
     return state_.selected_id;
 }
 

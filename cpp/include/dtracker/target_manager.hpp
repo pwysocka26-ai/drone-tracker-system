@@ -36,8 +36,12 @@ struct TMConfig {
     float reacquire_radius_auto = 135.0f;  // promien search wokol anchora
     float reacquire_radius_growth = 0.08f; // 8% wzrostu / klatkę bez ownera
     float reacquire_radius_max_growth = 0.80f;
-    int   stale_owner_frames = 10;          // po N klatkach bez ownera -> escape do best global
-    int   reacquire_persist = 2;            // ile klatek kandydat musi trwac przed adopt
+    // Fix 3: stale_owner zwiekszony 10 -> 50 dla synchronizacji z narrow
+    // max_hold_frames=100. Bez tego TM dropuje persistent ownera po 10 klatkach
+    // missed mimo ze narrow trzyma synthetic crop przez kolejne 50.
+    int   stale_owner_frames = 50;
+    // Fix 3: reacquire_persist 2 -> 4 (kandydat musi wygrac 4 klatki)
+    int   reacquire_persist = 4;
     double reacquire_min_continuity = 0.35; // continuity_score min do adopt
 };
 
@@ -75,6 +79,12 @@ struct TargetState {
     int reacquire_pending_id = -1;
     int reacquire_pending_count = 0;
 
+    // Fix 2: persistent owner ID -- niezalezny od raw track_id z MTT.
+    // Inkrementowany przy fresh selection / dwell-switch / stale-escape.
+    // Zachowywany przy re-acquisition adopt (ten sam fizyczny obiekt).
+    int next_persistent_id = 0;
+    int current_persistent_id = -1;
+
     // Diag: ostatni continuity score (na potrzeby telemetrii / debug)
     std::optional<double> last_continuity_score_active;
     std::optional<double> last_continuity_score_best;
@@ -95,6 +105,10 @@ public:
 
     const TargetState& state() const { return state_; }
 
+    // Fix 2: persistent owner ID (logical, niezalezny od raw track_id).
+    // -1 gdy brak ownera, inaczej rosnacy licznik nadanego logical ID.
+    int persistent_owner_id() const { return state_.current_persistent_id; }
+
 private:
     float score_candidate_(const Track& tr, bool is_current) const;
 
@@ -108,7 +122,10 @@ private:
         const Track& tr, const std::vector<Track>& tracks) const;
     void set_identity_anchor_(const Track& tr, const std::vector<Track>& tracks);
     void store_owner_reference_(const Track& tr);
-    void commit_owner_(const Track& tr, const std::vector<Track>& tracks);
+    // fresh_persistent=true -> nowy persistent_owner_id (rozne fizycznie obiekty)
+    // fresh_persistent=false -> zachowaj current_persistent_id (re-acquisition adopt)
+    void commit_owner_(const Track& tr, const std::vector<Track>& tracks,
+                       bool fresh_persistent);
 
     TMConfig cfg_;
     TargetState state_;

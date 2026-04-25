@@ -19,11 +19,14 @@ struct FrameTelemetry {
     int frame_idx = 0;
     double time_s = 0.0;
     std::optional<int> selected_id;
+    int persistent_owner_id = -1;        // Fix 2: logical owner (independent of track_id)
     std::optional<Track> active_track;
     LockState lock_state = LockState::UNLOCKED;
     std::vector<Track> multi_tracks;
     std::optional<Point2> narrow_center;
     bool center_lock = false;
+    bool narrow_synthetic_hold = false;  // Fix 1: narrow renderuje z last_good
+    int narrow_hold_count = 0;
     double inference_ms = 0.0;
     double tracker_ms = 0.0;
 };

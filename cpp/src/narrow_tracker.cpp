@@ -79,12 +79,34 @@ void NarrowTracker::step_towards_(const Point2& desired, bool active, bool degra
 
 void NarrowTracker::update(const Track* owner, bool is_locked) {
     (void)is_locked;
+
+    // Fix 1: gdy nie ma real ownera, sprawdz czy trzymac synthetic z last_good.
     if (!owner) {
+        ++s_.hold_count;
+
+        // Hold path: jest last_good_center i nie przekroczylismy budzetu.
+        if (s_.last_good_center && s_.hold_count <= cfg_.max_hold_frames) {
+            s_.is_synthetic = true;
+            s_.has_owner = true;  // narrow renderuje sie dalej
+
+            // Desired = last_good_center (zalozenie: dron zatrzymal sie / mozliwa
+            // ekstrapolacja z last velocity). Tu trzymamy stale, bezpieczniej.
+            Point2 desired = *s_.last_good_center;
+            // Hold path: low gain, EMA wytlumia speed do 0 (anti-jerk powrot)
+            step_towards_(desired, false, true);
+
+            // Zoom drift powolnie out (na wypadek gdyby dron zaraz wrocil dalej):
+            float target_zoom = s_.last_good_zoom;
+            s_.zoom = cfg_.hold_zoom_decay * s_.zoom + (1.0f - cfg_.hold_zoom_decay) * target_zoom;
+            // smooth_size pozostaje stable
+            return;
+        }
+
+        // Budzet hold przekroczony albo nie ma last_good -- czerni narrow.
         s_.has_owner = false;
-        // Hold drift: PID step bez ownera, low-gain (kp=0.05). Bez desired
-        // (smooth_center bez zmiany pozycji ale speed wytlumiony EMA do 0).
+        s_.is_synthetic = false;
+        // Wytlumiamy speed do 0
         if (s_.smooth_center) {
-            // Brak desired -> tylko EMA wygasza last_*_speed do 0
             double smooth_alpha = cfg_.pid_smooth_alpha_degraded;
             s_.last_pan_speed = smooth_alpha * s_.last_pan_speed;
             s_.last_tilt_speed = smooth_alpha * s_.last_tilt_speed;
@@ -94,7 +116,10 @@ void NarrowTracker::update(const Track* owner, bool is_locked) {
         return;
     }
 
+    // Real owner is back -- reset hold counter, zapisz last_good na koniec.
     s_.has_owner = true;
+    s_.is_synthetic = false;
+    s_.hold_count = 0;
 
     // Adaptive velocity feedforward
     double ff_scale, v_mag;
@@ -122,6 +147,14 @@ void NarrowTracker::update(const Track* owner, bool is_locked) {
     // Zoom = frame_size / crop_size (proxy)
     s_.zoom = std::clamp(static_cast<float>(std::min(frame_w_, frame_h_)) / s_.smooth_size,
                           cfg_.zoom_min, cfg_.zoom_max);
+
+    // Fix 1: zapisz last_good po obliczeniu smooth state (na wypadek przyszlej utraty)
+    if (s_.smooth_center) {
+        s_.last_good_center = s_.smooth_center;
+        s_.last_good_zoom = s_.zoom;
+        s_.last_good_size = s_.smooth_size;
+        s_.last_good_bbox = owner->bbox;
+    }
 }
 
 BBox NarrowTracker::narrow_crop() const {

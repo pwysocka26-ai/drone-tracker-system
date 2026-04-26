@@ -21,6 +21,9 @@ scripts/
 !tools/_split_train_val.py
 !tools/_build_v3_dataset.py
 !tools/_build_v4_dataset.py
+!tools/_v4_validation_png.py
+!tools/_antiuav_diag.py
+!tools/_migrate_pack.ps1
 !tools/export_v3_to_onnx.py
 !tools/export_v3_to_onnx_fp16.py
 !tools/compare_telemetry.py
@@ -38,6 +41,7 @@ select_result.txt
 
 # helper scripts
 *.ps1
+!tools/_migrate_pack.ps1
 
 # artifacts / outputs
 artifacts/

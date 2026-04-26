@@ -5,8 +5,15 @@ Cel: przeniesienie pełnego środowiska `drone-tracker-system` na nowy komputer
 działać: Python pipeline, C++ port build + inference na ONNX/DirectML, CVAT
 Docker, trening v4 lokalnie/Colab.
 
-**Snapshot stanu: 2026-04-24.** Weryfikowane wersje są konkretne — nie używaj
+**Snapshot stanu: 2026-04-26.** Weryfikowane wersje są konkretne — nie używaj
 "latest", bo cicho łamią się eksporty ONNX i CSRT.
+
+**Co się zmieniło od 2026-04-24:**
+- C++ port DONE (full parity z Python: TM identity anchor, Narrow PID+FF, Lock 5-state FSM, CSRT recovery, ROI search reacquire, R/T toggles, dual-camera HAL Phase 1+2+3) — 57/57 testów pass
+- v4 yolov8s @ 640 FP16 wytrenowany na Colab Pro (Twoje 1898 CVAT klatek + v3 merge = 4032 obrazki) — **DEFAULT model** w `cpp/app/main.cpp`
+- OpenCV rebuilt z contrib (CSRT), w `third_party/opencv_contrib_install/`
+- Memory: ~25 plików (od 20)
+- `cpp/` zacommitowany na branch (nie jest już untracked)
 
 ---
 
@@ -178,10 +185,16 @@ ls third_party\opencv\build\x64\vc16\bin\
 
 | Plik | Rozmiar | Skąd | Zastosowanie |
 |---|---|---|---|
-| `data/weights/best.pt` | 52 MB | Google Drive `drone_tracker/runs/v3_drone_m_imgsz960/best.pt` | v3 YOLOv8m custom drone detector |
-| `data/weights/v3_best.onnx` | 104 MB | generowany przez `python tools/export_v3_to_onnx.py` | Inference w C++ przez DirectML |
-| `artifacts/test_videos/video_test_wide.mp4` | ~180 MB | Google Drive `drone_tracker/videos/CSTN-*.mp4` | Testy pipeline |
-| `artifacts/cvat_import.zip` | 152 MB | wygenerowany przez `tools/prelabel_v3_for_cvat.py` | Import do CVAT dla labellowania v4 |
+| **`data/weights/v4_best_fp16_imgsz640.onnx`** | **22 MB** | Drive `drone_tracker/training/runs/yolov8s_img640_v4/weights/` | **DEFAULT** v4 detector (87% LOCKED, 36 ms) |
+| `data/weights/v4_best_fp16_imgsz960.onnx` | 22 MB | Drive `drone_tracker/training/runs/yolov8s_img960_v4/weights/` | v4 accuracy variant (84% LOCKED, 78 ms) |
+| `data/weights/v3_best_fp16_imgsz960.onnx` | 53 MB | Drive `drone_tracker/runs/v3_drone_m_imgsz960/weights/` | v3 reference (do regression test) |
+| `data/weights/v3_best.pt` | 52 MB | Drive `drone_tracker/runs/v3_drone_m_imgsz960/weights/best.pt` | v3 PyTorch source |
+| `artifacts/test_videos/video_test_wide_short.mp4` | ~210 MB | Drive `drone_tracker/videos/` | **Default test video** (8800 klatek, 50 fps) |
+| `artifacts/test_videos/video_test_wide.mp4` | ~2 GB | Drive `drone_tracker/videos/CSTN-*.mp4` | Pełny test (94894 klatek) |
+| `data/test.mp4` | ~9 MB | Drive `drone_tracker/videos/test.mp4` | Drone-over-sea (KNOWN HARD) |
+| `video.mp4` | ~10 MB | Drive `drone_tracker/videos/` | Drone Mavic nad łąką |
+| `data/cvat_exports/cvat_v4_export.zip` | 175 MB | (źródło v4 dataset) | Re-build datasetu v4 jeśli trzeba |
+| `training/v4_dataset.zip` | 1.26 GB | wygenerowane lokalnie | Upload na Drive dla re-train |
 
 ### 5.2 Opcjonalne (dla trenowania v4)
 
@@ -247,26 +260,13 @@ i spytaj "Co wiesz o tym projekcie?" — powinno wyciągnąć MEMORY.md.
 
 Po Sekcjach 2-5 masz repo + third_party + dane. Teraz build.
 
-### 7.1 Jeśli przeniosłeś `cpp/` z Opcji A
+### 7.1 `cpp/` jest już w git (od 2026-04-25)
 
-Katalog już jest, przejdź do **7.3**.
+Branch `feature/velocity-tracking` ma pełny C++ port: ~5000 LOC, 57/57 testów pass,
+HAL Phase 1+2+3, full parity z Python. Po `git checkout feature/velocity-tracking`
+masz wszystko.
 
-### 7.2 Jeśli `cpp/` nie istnieje
-
-`cpp/` jest obecnie nietknięty w git (untracked). Musi być skopiowane ręcznie
-z obecnego komputera (z `C:\Users\pwyso\drone-tracker-system\cpp\`).
-
-**Alternatywa** — zcommituj `cpp/` na branch `feature/velocity-tracking` **przed**
-przesiadką (nie jest `.gitignore`, tylko untracked, więc `git add cpp/` zadziała):
-
-```bash
-# na obecnym komputerze przed przeprowadzką:
-git add cpp/
-git commit -m "Snapshot C++ port for laptop migration"
-git push origin feature/velocity-tracking
-```
-
-Wtedy na nowym komputerze `git pull` wciągnie `cpp/`.
+**`cpp/build/`** jest gitignored — wygenerowany lokalnie przez CMake build.
 
 ### 7.3 CMake configure + build
 
@@ -277,47 +277,50 @@ cd C:\Users\pwyso\drone-tracker-system\cpp
 
 set CMAKE=C:\Users\pwyso\drone-tracker-system\third_party\cmake-3.31.2-windows-x86_64\bin\cmake.exe
 
-%CMAKE% -S . -B build -G "Visual Studio 17 2022" -A x64 ^
-  -DOpenCV_DIR="C:/Users/pwyso/drone-tracker-system/third_party/opencv/build"
+REM Auto-detect: jeśli istnieje opencv_contrib_install/, CMake użyje contrib (CSRT enabled)
+REM Inaczej fallback na opencv/ prebuilt (CSRT disabled, local_tracker w stub mode)
+%CMAKE% -S . -B build -G "Visual Studio 17 2022" -A x64
 
 %CMAKE% --build build --config Release
 ```
 
 Build produkuje `cpp/build/Release/`:
-- `poc_inference.exe`
+- `dtracker_main.exe` — pełen pipeline (default exe do uruchamiania)
+- `dtracker_tests.exe` — test suite (57 testów, all pass)
+- `poc_inference.exe` — proste benchmark
 - `dtracker_lib.lib`
-- `onnxruntime.dll` (copy z third_party)
-- `opencv_world4100.dll` (copy z third_party)
+- DLL: `onnxruntime.dll`, `opencv_world4100.dll`, `opencv_videoio_ffmpeg4100_64.dll`, `DirectML.dll`
 
-### 7.4 Smoke test — uruchomienie POC
+### 7.4 Smoke test — uruchomienie pełnego pipeline'u
 
 ```bat
 cd C:\Users\pwyso\drone-tracker-system\cpp\build\Release
 
-poc_inference.exe ^
-  C:\Users\pwyso\drone-tracker-system\artifacts\cvat_import\obj_train_data\frame_000150.jpg ^
-  C:\Users\pwyso\drone-tracker-system\data\weights\v3_best.onnx
+REM Default: v4 yolov8s @ 640 FP16 + video_test_wide_short.mp4
+dtracker_main.exe --max-frames 30 --no-gui --no-record
 ```
 
-**Oczekiwane output**:
+**Oczekiwane output (v4 default)**:
 ```
-Model:   ...v3_best.onnx
-Image:   ...frame_000150.jpg
-DirectML: TAK
-Image size: 1920x1080
-Init detector... OK
-Warmup... OK
+Wide:   1920x1080 @ 50 fps, 8800 frames (codec=h264)
+MODE:   single-camera (narrow = virtual crop wide)
+Run: ../../../artifacts/runs\<ts>
+Init detector (DirectML=yes)... OK
+frame 30/8800  lock=LOCKED  owner=1  tracks=1  inf=37ms
 
-=== BENCHMARK ===
-Avg inference time: ~140 ms (~7 fps)   # GMKtec Radeon 8060S
-
-=== DETECTIONS (1) ===
-  [0] cls=0 conf=0.076 bbox=(870,480,892,492) area=~260
-
-Zapisano: poc_inference_out.jpg
+=== DONE ===
+Frames: 30 / 1.5s = 20 fps
+Avg inference: 37 ms
 ```
 
-Jeśli `DirectML: NIE` albo CPU-only — sprawdź czy `third_party/onnxruntime-directml/runtimes/win-x64/native/DirectML.dll` jest obok exe (powinien być skopiowany przez post-build).
+Test suite:
+```bat
+dtracker_tests.exe
+REM Oczekiwane: === 57 passed, 0 failed ===
+```
+
+Jeśli `DirectML=no` albo inference >100 ms — sprawdź `DirectML.dll` obok exe
+i sterownik AMD/Intel/NVIDIA.
 
 ---
 
@@ -369,26 +372,40 @@ Import `artifacts/cvat_import.zip` jako nowy task — pre-labels z v3 się wczyt
 
 ## 10. Lista rzeczy do fizycznego przeniesienia
 
-**Rozmiar łączny: ~7 GB**. Plan transferu (USB / network):
+**Auto pakowanie**: `powershell -File tools\_migrate_pack.ps1` → tworzy
+`migration_bundle/` z minimum stackiem (~800 MB w 4 ZIP-ach). Dla pełnego transferu
+(z trening data + opcv prebuilt fallback): `powershell -File tools\_migrate_pack.ps1 -Full`.
+
+**Rozmiar łączny: ~5-9 GB** (snapshot 2026-04-26, real measurements). Plan transferu (USB / network):
 
 | Źródło na obecnym kompie | Rozmiar | Metoda transferu |
 |---|---|---|
-| `drone-tracker-system/` (cały) | 78 MB (bez .gitignore) + 7 GB z .gitignore | git clone (dla wersji lean) + zip cała reszta |
-| `cpp/` | ~5 MB src + 78 MB build | `git add cpp/ && git push` przed przesiadką **ALBO** zip ręcznie |
-| `third_party/` | 2.8 GB | zip + USB / wypakować na docelu |
-| `data/` | 3.1 GB | zip + USB **ALBO** Google Drive sync |
-| `artifacts/` | 533 MB | zip + USB (zawiera test videos i cvat_import) |
-| `C:\Users\pwyso\.claude\projects\...\memory\` | ~100 KB | zip + USB — krytyczne dla kontynuacji pracy z Claude |
+| `drone-tracker-system/` (git clone) | ~80 MB | `git clone` + `git checkout feature/velocity-tracking` |
+| `cpp/build/` | ~150 MB | NIE przenoś — odbuduj lokalnie przez CMake |
+| `third_party/opencv_contrib_install/` | **101 MB** | zip + USB — gotowy build z CSRT, oszczędza 1-2h rebuild |
+| `third_party/onnxruntime-directml/` | **43 MB** | zip + USB |
+| `third_party/cmake-3.31.2-windows-x86_64/` | ~80 MB | zip + USB (jeśli nie chcesz instalować systemowo) |
+| `third_party/opencv/` (prebuilt) | **887 MB** | tylko fallback gdy contrib_install zawiedzie — pomiń jeśli masz contrib |
+| `data/weights/` | **312 MB** | zip + USB (v4 + v3 ONNX+PT) |
+| `data/test.mp4` + `video.mp4` | ~20 MB | zip + USB (drone-over-sea + Mavic) |
+| `data/cvat_exports/` | 175 MB | zip + USB (jeśli planujesz re-train v4) |
+| `data/ext_rgb_drone/`, `data/ext_sea/`, `data/roboflow_drone_v1/` | ~1.4 GB | tylko jeśli re-train; inaczej zostaw |
+| `artifacts/test_videos/` | **341 MB** | zip + USB (test + train videos) |
+| `artifacts/runs/` | ~500 MB-2 GB | NIE PRZENOŚ — historyczne wyniki, regenerowalne |
+| `training/v4/` (4032 obrazki) | 1.2 GB | tylko jeśli re-train; inaczej zostaw |
+| `C:\Users\pwyso\.claude\projects\...\memory\` | ~150 KB (~25 plików) | zip + USB — KRYTYCZNE dla kontynuacji z Claude |
 
-**Minimum absolutne** (żeby coś odpalić):
+**Minimum absolutne** (~800 MB, żeby uruchomić tracker — automat przez `_migrate_pack.ps1`):
 - repo (`git clone`)
-- memory (`memory_backup.zip`)
-- `data/weights/best.pt` + `v3_best.onnx`
-- `third_party/onnxruntime-directml/` + `third_party/opencv/`
-- 1 test video
+- memory (`memory_backup.zip` ~150 KB)
+- `data/weights/` (~312 MB, v4 + v3)
+- `third_party/onnxruntime-directml/` (43 MB) + `third_party/opencv_contrib_install/` (101 MB)
+- `artifacts/test_videos/` (~341 MB) — można obciąć do 1 video jeśli zależy
 
-Reszta (ext_rgb_drone, roboflow, antiuav_probe) — potrzebne tylko do trenowania,
-można zostawić i pobrać z Google Drive na nowym komputerze według potrzeby.
+**Pełny stack do re-train + dev** (~5-9 GB): + opencv prebuilt + ext_* + cvat_exports + training/v4/.
+
+Reszta (`ext_rgb_drone`, `roboflow`, `antiuav_probe`) — potrzebne tylko do re-train,
+można pobrać z Google Drive na nowym komputerze według potrzeby.
 
 ---
 
@@ -412,26 +429,26 @@ Python `local_target_tracker.py` używa `cv2.legacy.TrackerCSRT_create()` — do
 tylko w **opencv-contrib-python** wariancie. Zwykły `opencv-python` cicho nie ma.
 Zrzut z pip freeze weryfikuje: `opencv-contrib-python==4.13.0.92`.
 
-### 11.4 OpenCV C++ prebuilt bez contrib
+### 11.4 OpenCV C++ contrib — RESOLVED 2026-04-25
 
-C++ `cpp/src/local_target_tracker.cpp` — stub, bo OpenCV prebuilt nie ma modułu
-`opencv_tracking`. Rozwiązanie (post-demo): rebuild OpenCV z contrib z source:
+OpenCV rebuilt z contrib (CSRT/KCF tracking) — `third_party/opencv_contrib_install/`
+zawiera gotowy build. CMakeLists auto-detect: jeśli `opencv_contrib_install/` istnieje,
+użyje go; inaczej fallback na `opencv/` prebuilt (z `DTRACKER_NO_OPENCV_CONTRIB` define
+= `local_tracker` w stub mode).
+
+**Jeśli musisz rebuild od zera** (nowy komputer bez `opencv_contrib_install/`):
 
 ```powershell
 cd third_party
 git clone https://github.com/opencv/opencv.git opencv_src
 git clone https://github.com/opencv/opencv_contrib.git
-cd opencv_src
-git checkout 4.10.0
-cd ..\opencv_contrib
-git checkout 4.10.0
-cd ..
+cd opencv_src && git checkout 4.10.0 && cd ..
+cd opencv_contrib && git checkout 4.10.0 && cd ..
 
-mkdir opencv_contrib_build
-cd opencv_contrib_build
+mkdir opencv_contrib_build && cd opencv_contrib_build
 cmake -G "Visual Studio 17 2022" -A x64 `
   -DOPENCV_EXTRA_MODULES_PATH=../opencv_contrib/modules `
-  -DBUILD_LIST=core,imgproc,imgcodecs,highgui,dnn,tracking,video `
+  -DBUILD_LIST=core,imgproc,imgcodecs,highgui,dnn,tracking,video,videoio `
   -DBUILD_opencv_world=ON `
   -DCMAKE_INSTALL_PREFIX=../opencv_contrib_install `
   ../opencv_src
@@ -439,7 +456,8 @@ cmake --build . --config Release --target INSTALL
 # 1-2h kompilacji
 ```
 
-Potem w `cpp/CMakeLists.txt` zmień `OpenCV_DIR` na `third_party/opencv_contrib_install/`.
+Czas oszczędności: na nowym komputerze **przenieś `third_party/opencv_contrib_install/`**
+(~1.2 GB) zamiast rebuilować.
 
 ### 11.5 Docker Desktop WSL backend
 
@@ -473,30 +491,41 @@ Wykonaj po kolei na nowym komputerze. Wszystkie musza zwrócić ✓:
 - [ ] `git log --oneline -1` w repo → ostatni commit z `feature/velocity-tracking`
 - [ ] `ls third_party/onnxruntime-directml/runtimes/win-x64/native/onnxruntime.dll` istnieje
 - [ ] `ls third_party/opencv/build/x64/vc16/bin/opencv_world4100.dll` istnieje
-- [ ] `ls data/weights/best.pt` istnieje
-- [ ] `ls data/weights/v3_best.onnx` istnieje
-- [ ] `ls artifacts/test_videos/video_test_wide.mp4` istnieje
+- [ ] `ls data/weights/v4_best_fp16_imgsz640.onnx` istnieje (default model)
+- [ ] `ls data/weights/v3_best_fp16_imgsz960.onnx` istnieje (regression test)
+- [ ] `ls artifacts/test_videos/video_test_wide_short.mp4` istnieje
+- [ ] `ls third_party/opencv_contrib_install/` istnieje (CSRT enabled)
 - [ ] `ls cpp/CMakeLists.txt` istnieje
 - [ ] `ls ~/.claude/projects/C--Users-*-drone-tracker-system/memory/MEMORY.md` istnieje
 - [ ] `docker ps` → bez errora (daemon up)
-- [ ] `cmake --build cpp/build --config Release` → succeeds
-- [ ] `cpp/build/Release/poc_inference.exe <jpg> <onnx>` → znajduje 1 detekcję, `DirectML: TAK`
-- [ ] `PYTHONPATH=src python src/main.py --config config/config.yaml` → otwiera okna, klatki lecą
+- [ ] `cmake --build cpp/build --config Release` → succeeds, message "OpenCV tracking module header found (CSRT enabled)"
+- [ ] `cpp/build/Release/dtracker_tests.exe` → `=== 57 passed, 0 failed ===`
+- [ ] `cpp/build/Release/dtracker_main.exe --max-frames 30 --no-gui --no-record` → LOCKED, ~37 ms inference
+- [ ] `PYTHONPATH=src python src/main.py --config config/config.yaml` → otwiera okna (Python pipeline jako reference)
 - [ ] Claude Code → "Co wiesz o tym projekcie?" → wyciąga MEMORY.md (projekt anti-drone, deadline 2026-06-01, branch feature/velocity-tracking itd.)
 
 ---
 
-## 13. Po przeniesieniu — plan kontynuacji
+## 13. Po przeniesieniu — plan kontynuacji (snapshot 2026-04-26)
 
-Zgodnie z memory `project_cpp_port_plan.md` i `feedback_cpp_ambitious_plan.md`:
+C++ port + v4 model **DONE**. Zostaje:
 
-Priorytet dzisiaj (wieczór 2026-04-24 / D0):
-1. `cpp/app/main.cpp` — end-to-end pipeline
-2. Upgrade TargetManager do identity anchor + continuity guard
-3. Upgrade NarrowTracker do PID + adaptive velocity feedforward
-4. Upgrade LockPipeline do 5-state FSM z REFINE
-5. `cpp/tests/` parity testy vs Python
-6. OpenCV rebuild z contrib → LocalTargetTracker real (zamiast stub)
+### Track A — model fine-tune (jeśli realne nagrania z klienta)
+1. Dolabelowanie real-world footage z głowicy (CVAT, jak v4)
+2. v5 fine-tune: yolov8s @ 640 + dodatkowe domain data
+3. Re-export ONNX FP16, podmień `data/weights/v4_*` w `cpp/app/main.cpp`
 
-Plan 6-dniowy do demo 30.04 w memory `project_cpp_port_plan.md`. Po przesiadce
-zaczynamy od 1.
+### Track B — production hardware migration
+1. Jetson Orin cross-compile (ARM build, TensorRT export ONNX → engine)
+2. Performance push do ≤19 ms/klatka (DirectML diagnoza, lazy CSRT już jest)
+3. Vendor adapter Phase 4 (PelcoD/ONVIF/VISCA — gdy znamy konkretny PTZ + kamera)
+
+### Track C — demo 30.04 prep (T-3 dni)
+1. Multi-video script (przełączanie scenariuszy klawiszem)
+2. README runbook dla operatora
+3. Real-world walidacja na nowych nagraniach z klienta (jeśli są)
+
+Memory current state — zobacz `MEMORY.md` w `~/.claude/projects/.../memory/`.
+Najświeższe wpisy:
+- `project_v4_training_results.md` (87% LOCKED, 4.4× speedup)
+- `project_v4_real_world_validation.md` (sea+Mavic > v3, Anti-UAV gap expected)

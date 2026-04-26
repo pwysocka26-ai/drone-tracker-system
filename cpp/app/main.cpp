@@ -22,6 +22,8 @@
 
 #include "dtracker/dashboard.hpp"
 #include "dtracker/inference.hpp"
+#include "dtracker/io/file_frame_source.hpp"
+#include "dtracker/io/frame_source.hpp"
 #include "dtracker/local_tracker.hpp"
 #include "dtracker/lock_pipeline.hpp"
 #include "dtracker/multi_target_tracker.hpp"
@@ -244,18 +246,23 @@ static cv::Mat draw_wide_overlays(const cv::Mat& frame, const std::vector<Track>
 int main(int argc, char** argv) {
     CliArgs a = parse_args(argc, argv);
 
-    cv::VideoCapture cap(a.video);
-    if (!cap.isOpened()) {
+    // Phase 2 HAL refactor: zamiast bezposrednio cv::VideoCapture, uzywamy
+    // IFrameSource interface. FileFrameSource jest reference impl (cienka
+    // otoczka na cv::VideoCapture). Vendor moze podmienic na RtspFrameSource,
+    // CameraLinkFrameSource, etc. -- bez zmian w main loop.
+    auto source = std::make_shared<dtracker::io::FileFrameSource>();
+    if (!source->open(a.video)) {
         std::cerr << "FATAL: cannot open video: " << a.video << "\n";
         return 1;
     }
-    int frame_w = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_WIDTH));
-    int frame_h = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_HEIGHT));
-    double fps = cap.get(cv::CAP_PROP_FPS);
+    const auto& src_info = source->info();
+    int frame_w = src_info.width;
+    int frame_h = src_info.height;
+    double fps = src_info.fps;
     if (fps <= 0.0 || fps > 240.0) fps = 30.0;
-    int total = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_COUNT));
+    long total = src_info.total_frames;
     std::cout << "Video: " << frame_w << "x" << frame_h << " @ " << fps
-              << " fps, " << total << " frames\n";
+              << " fps, " << total << " frames (codec=" << src_info.codec << ")\n";
 
     std::string run_id = ts_now();
     fs::path run_dir = fs::path(a.out_dir) / run_id;
@@ -320,13 +327,15 @@ int main(int argc, char** argv) {
 
     int frame_idx = 0;
     cv::Mat frame;
+    dtracker::io::Frame io_frame;
     auto t_start = std::chrono::steady_clock::now();
     double total_inf_ms = 0.0;
     double total_track_ms = 0.0;
     bool quit = false;
 
     while (!quit) {
-        if (!cap.read(frame) || frame.empty()) break;
+        if (!source->read(io_frame) || io_frame.image.empty()) break;
+        frame = io_frame.image;
         if (a.max_frames > 0 && frame_idx >= a.max_frames) break;
         ++frame_idx;
 
@@ -559,7 +568,7 @@ int main(int argc, char** argv) {
     }
 
     if (video_writer.isOpened()) video_writer.release();
-    cap.release();
+    source->close();
     cv::destroyAllWindows();
     telemetry.close();
 

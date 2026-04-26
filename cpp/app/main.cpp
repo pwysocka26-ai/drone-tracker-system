@@ -44,13 +44,15 @@ struct CliArgs {
     // Backward-compat: tylko --video -> narrow generowany jako virtual crop wide.
     std::string video_wide;     // empty = use --video
     std::string video_narrow;   // empty = use virtual crop z wide
-    // Default: FP16 ONNX (1.48x szybszy vs FP32 z zerowa utrata accuracy na v3).
-    // Patrz tools/export_v3_to_onnx_fp16.py + raport benchmarka 2026-04-25.
-    std::string model = "../../../data/weights/v3_best_fp16_imgsz960.onnx";
+    // Default: v4 yolov8s @ imgsz=640 FP16 (milestone 2026-04-26).
+    // Empiryczny dowod (full 8800 klatek): 87.1% LOCKED (vs v3 41%), 5 lock_loss
+    // (vs v3 43), 36.7 ms inference (vs v3 160 ms = 4.4x szybsze).
+    // Patrz memory/project_v4_training_results.md.
+    std::string model = "../../../data/weights/v4_best_fp16_imgsz640.onnx";
     std::string out_dir = "../../../artifacts/runs";
     bool gui = true;
     bool record = true;
-    int imgsz = 960;
+    int imgsz = 640;
     float conf = 0.20f;
     int max_frames = -1;
     bool use_directml = true;

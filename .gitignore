@@ -95,6 +95,9 @@ training/v2/review/
 training/v3/images/
 training/v3/labels/
 training/v3/review/
+training/v4/images/
+training/v4/labels/
+training/v4/review/
 
 # model weights (pulled from Drive, reproducible)
 *.pt

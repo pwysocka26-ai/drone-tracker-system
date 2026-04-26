@@ -30,6 +30,11 @@ public:
     // Zwraca detekcje w kordynatach ORYGINALNEJ klatki.
     Detections detect(const cv::Mat& frame) override;
 
+    // ROI search wariant: nizszy conf threshold dla "widmowych" detekcji
+    // podczas reacquire. Wywolanie z crop'em z oryginalnej klatki -- mapping
+    // back do globalnych wspolrzednych zostaje na callerze (offset x1, y1).
+    Detections detect_with_conf(const cv::Mat& frame, float conf_override);
+
     int imgsz() const override { return cfg_.imgsz; }
 
     // Diagnostyka: czas ostatniego inference w ms.

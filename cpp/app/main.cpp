@@ -127,6 +127,106 @@ static Detections filter_and_pad(const Detections& raw, int frame_w, int frame_h
     return out;
 }
 
+// ====================== ROI search (reacquire fallback) ======================
+//
+// Port src/core/app.py:_build_reacquire_roi + _predict_tracks_in_roi +
+// _merge_track_lists. Cel: gdy YOLO traci ownera, robimy drugi inference
+// na ROI 5x wokol last_good_center z nizszym conf -- znacznie wiekszy szans
+// zlapania drona w trakcie HOLD/REACQUIRE.
+
+struct RoiRect {
+    int x1, y1, x2, y2;
+    bool valid;
+};
+
+static RoiRect build_reacquire_roi(int frame_w, int frame_h,
+                                    const Point2& ref_center,
+                                    const std::optional<BBox>& ref_bbox,
+                                    float expand,
+                                    int min_size, int max_size) {
+    float bw = 0.0f, bh = 0.0f;
+    if (ref_bbox) {
+        bw = ref_bbox->x2 - ref_bbox->x1;
+        bh = ref_bbox->y2 - ref_bbox->y1;
+    } else {
+        bw = bh = std::max(40.0f, static_cast<float>(min_size) * 0.20f);
+    }
+    float roi_w = std::max(static_cast<float>(min_size), bw * expand);
+    float roi_h = std::max(static_cast<float>(min_size), bh * expand);
+    const float aspect = 16.0f / 9.0f;
+    if (roi_w / std::max(1.0f, roi_h) < aspect) {
+        roi_w = roi_h * aspect;
+    } else {
+        roi_h = roi_w / aspect;
+    }
+    roi_w = std::min(static_cast<float>(max_size), std::max(120.0f, roi_w));
+    roi_h = std::min(static_cast<float>(max_size), std::max(120.0f, roi_h));
+
+    int x1 = static_cast<int>(ref_center.x - roi_w * 0.5f);
+    int y1 = static_cast<int>(ref_center.y - roi_h * 0.5f);
+    int x2 = static_cast<int>(ref_center.x + roi_w * 0.5f);
+    int y2 = static_cast<int>(ref_center.y + roi_h * 0.5f);
+    x1 = std::max(0, std::min(x1, frame_w - 1));
+    y1 = std::max(0, std::min(y1, frame_h - 1));
+    x2 = std::max(0, std::min(x2, frame_w));
+    y2 = std::max(0, std::min(y2, frame_h));
+    if (x2 - x1 < 32 || y2 - y1 < 32) return {0, 0, 0, 0, false};
+    return {x1, y1, x2, y2, true};
+}
+
+// Detect na crop, potem mapuj bboxy z powrotem do globalnych wspolrzednych.
+static Detections detect_in_roi(YoloOnnxDetector& detector, const cv::Mat& frame,
+                                 const RoiRect& roi, float conf_override) {
+    if (!roi.valid) return {};
+    cv::Mat crop = frame(cv::Rect(roi.x1, roi.y1, roi.x2 - roi.x1, roi.y2 - roi.y1));
+    Detections crop_dets = detector.detect_with_conf(crop, conf_override);
+    Detections mapped;
+    mapped.reserve(crop_dets.size());
+    for (auto& d : crop_dets) {
+        Detection m = d;
+        m.bbox.x1 += roi.x1;
+        m.bbox.y1 += roi.y1;
+        m.bbox.x2 += roi.x1;
+        m.bbox.y2 += roi.y1;
+        mapped.push_back(m);
+    }
+    return mapped;
+}
+
+// Merge: dodaj kandydata gdy nie duplikuje istniejacej detekcji (IoU < thresh
+// AND center distance > thresh_px). Gdy duplikuje, zachowaj wyzszy conf.
+static float bbox_iou_local(const BBox& a, const BBox& b) {
+    float ix1 = std::max(a.x1, b.x1);
+    float iy1 = std::max(a.y1, b.y1);
+    float ix2 = std::min(a.x2, b.x2);
+    float iy2 = std::min(a.y2, b.y2);
+    float iw = std::max(0.0f, ix2 - ix1);
+    float ih = std::max(0.0f, iy2 - iy1);
+    float inter = iw * ih;
+    float uni = a.area() + b.area() - inter;
+    return uni > 0.0f ? inter / uni : 0.0f;
+}
+
+static Detections merge_detection_lists(const Detections& primary, const Detections& secondary,
+                                         float iou_thresh, float center_thresh_px) {
+    Detections merged = primary;
+    for (const auto& cand : secondary) {
+        int dup_idx = -1;
+        for (size_t i = 0; i < merged.size(); ++i) {
+            if (bbox_iou_local(merged[i].bbox, cand.bbox) >= iou_thresh) { dup_idx = static_cast<int>(i); break; }
+            float dx = merged[i].bbox.cx() - cand.bbox.cx();
+            float dy = merged[i].bbox.cy() - cand.bbox.cy();
+            if (std::sqrt(dx * dx + dy * dy) <= center_thresh_px) { dup_idx = static_cast<int>(i); break; }
+        }
+        if (dup_idx < 0) {
+            merged.push_back(cand);
+        } else if (cand.conf > merged[dup_idx].conf) {
+            merged[dup_idx] = cand;
+        }
+    }
+    return merged;
+}
+
 // ====================== composite for video ======================
 
 // Wide left + narrow crop right, hconcat do 1920x1080.
@@ -360,6 +460,22 @@ int main(int argc, char** argv) {
     double total_track_ms = 0.0;
     bool quit = false;
 
+    // ROI search (port src/core/app.py:roi_search): sekundarny YOLO inference
+    // na ROI 4.8x wokol last_good_center gdy primary detection traci ownera.
+    // Conf=0.06 (vs primary 0.20) -- znacznie szersza siec dla reacquire.
+    int drop_streak = 0;
+    const int   roi_required_drop = 1;
+    const float roi_expand = 4.8f;
+    const int   roi_min_size = 280;
+    const int   roi_max_size = 1200;
+    const float roi_conf = 0.06f;
+    const float roi_merge_iou = 0.16f;
+    const float roi_merge_center_px = 48.0f;
+
+    // Runtime toggles (R = recording, T = telemetry). Domyslny stan z CLI flag.
+    bool recording_active = a.record;
+    bool telemetry_active = true;
+
     while (!quit) {
         if (!source->read(io_frame) || io_frame.image.empty()) break;
         frame = io_frame.image;
@@ -384,8 +500,36 @@ int main(int argc, char** argv) {
 
         Detections filtered = filter_and_pad(raw, frame_w, frame_h);
 
+        // ROI search fallback: gdy primary YOLO traci wszystkie targety LUB
+        // jest drop_streak >= 1, a narrow ma last_good_center, robimy 2-gi
+        // inference na ROI 4.8x wokol last_good. Wyniki merge'owane z primary
+        // BEFORE MTT update (zeby track lifecycle dalej dzialal naturalnie).
+        bool roi_search_used = false;
+        int  roi_search_added = 0;
+        if (filtered.empty() || drop_streak >= roi_required_drop) {
+            const auto& nstate = narrow.state();
+            if (nstate.last_good_center) {
+                float dyn_expand = roi_expand * (1.0f + std::min(1.2f, 0.10f * static_cast<float>(std::max(0, drop_streak))));
+                RoiRect roi = build_reacquire_roi(frame_w, frame_h, *nstate.last_good_center,
+                                                   nstate.last_good_bbox, dyn_expand,
+                                                   roi_min_size, roi_max_size);
+                if (roi.valid) {
+                    Detections roi_dets = detect_in_roi(detector, frame, roi, roi_conf);
+                    Detections roi_filtered = filter_and_pad(roi_dets, frame_w, frame_h);
+                    if (!roi_filtered.empty()) {
+                        Detections merged = merge_detection_lists(filtered, roi_filtered,
+                                                                   roi_merge_iou, roi_merge_center_px);
+                        roi_search_added = static_cast<int>(merged.size()) - static_cast<int>(filtered.size());
+                        filtered = merged;
+                        roi_search_used = true;
+                    }
+                }
+            }
+        }
+
         auto t_trk0 = std::chrono::steady_clock::now();
         std::vector<Track> tracks = mtt.update(filtered, frame);  // CMC enabled
+        drop_streak = filtered.empty() ? (drop_streak + 1) : 0;
         std::optional<int> sel = tm.select(tracks);
         LockState lock_state = lock.step(sel, tracks);
 
@@ -505,10 +649,10 @@ int main(int argc, char** argv) {
         rec.cmc_inliers = mtt.last_camera_motion_inliers();
         rec.inference_ms = inf_ms;
         rec.tracker_ms = trk_ms;
-        telemetry.write(rec);
+        if (telemetry_active) telemetry.write(rec);
 
         // VideoWriter — composite wide + narrow crop
-        if (video_writer.isOpened()) {
+        if (video_writer.isOpened() && recording_active) {
             cv::Mat wide_vis = draw_wide_overlays(frame, tracks, sel_id,
                                                     tm.persistent_owner_id(),
                                                     lock_state, crop, narrow.state());
@@ -557,6 +701,12 @@ int main(int argc, char** argv) {
                 fs::path snap_path = images_dir / snap.str();
                 cv::imwrite(snap_path.string(), frame);
                 std::cout << "SHOT: " << snap_path.string() << "\n";
+            } else if (key == 'r' || key == 'R') {
+                recording_active = !recording_active;
+                std::cout << "RECORDING " << (recording_active ? "ON" : "OFF") << "\n";
+            } else if (key == 't' || key == 'T') {
+                telemetry_active = !telemetry_active;
+                std::cout << "TELEMETRY " << (telemetry_active ? "ON" : "OFF") << "\n";
             } else if (key == '0') {
                 tm.clear_manual_lock();
                 std::cout << "MANUAL LOCK CLEARED\n";

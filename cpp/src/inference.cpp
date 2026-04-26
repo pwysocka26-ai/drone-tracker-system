@@ -171,7 +171,12 @@ static Detections decode_yolov8(const float* data, const std::vector<int64_t>& s
 }
 
 Detections YoloOnnxDetector::detect(const cv::Mat& frame) {
+    return detect_with_conf(frame, -1.0f);
+}
+
+Detections YoloOnnxDetector::detect_with_conf(const cv::Mat& frame, float conf_override) {
     if (frame.empty()) return {};
+    float conf = (conf_override > 0.0f) ? conf_override : cfg_.conf_threshold;
 
     // Preprocess
     cv::Mat blob;
@@ -199,7 +204,7 @@ Detections YoloOnnxDetector::detect(const cv::Mat& frame) {
     if (outputs.empty()) return {};
     auto shape = outputs[0].GetTensorTypeAndShapeInfo().GetShape();
     const float* data = outputs[0].GetTensorData<float>();
-    Detections raw = decode_yolov8(data, shape, cfg_.imgsz, cfg_.conf_threshold);
+    Detections raw = decode_yolov8(data, shape, cfg_.imgsz, conf);
 
     // NMS
     Detections nmsed = nms(raw, cfg_.nms_iou_threshold);

@@ -25,6 +25,7 @@ scripts/
 !tools/export_v3_to_onnx_fp16.py
 !tools/compare_telemetry.py
 !tools/bench_cpu_vs_dml.py
+!tools/_synth_camera_motion.py
 
 # backupy
 *.bak

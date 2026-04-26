@@ -6,21 +6,41 @@
 #include <limits>
 #include <optional>
 
+#include <opencv2/core.hpp>
+#include <opencv2/imgproc.hpp>
+#include <opencv2/video/tracking.hpp>          // calcOpticalFlowPyrLK
+#include <opencv2/calib3d.hpp>                  // estimateAffinePartial2D
+
 namespace dtracker {
 
 static constexpr float RAW_ID_BONUS = 0.60f;
 static constexpr float BBOX_ALPHA = 0.72f;
 static constexpr float SIZE_JUMP_LIMIT = 1.35f;
 
+// ---------- CMC (Camera Motion Compensation) ----------
+struct MultiTargetTracker::CmcState {
+    cv::Mat prev_gray;
+    std::vector<cv::Point2f> prev_features;
+};
+
 static Point2 bbox_center(const BBox& b) {
     return {0.5 * (b.x1 + b.x2), 0.5 * (b.y1 + b.y2)};
 }
 
-MultiTargetTracker::MultiTargetTracker(MTTConfig cfg) : cfg_(cfg) {}
+MultiTargetTracker::MultiTargetTracker(MTTConfig cfg)
+    : cfg_(cfg), cmc_(std::make_unique<CmcState>()) {}
+
+MultiTargetTracker::~MultiTargetTracker() = default;
 
 void MultiTargetTracker::reset() {
     tracks_.clear();
     next_id_ = 1;
+    if (cmc_) {
+        cmc_->prev_gray.release();
+        cmc_->prev_features.clear();
+    }
+    camera_motion_ = Point2{0.0, 0.0};
+    camera_motion_inliers_ = 0;
 }
 
 std::vector<Track> MultiTargetTracker::tracks() const {
@@ -31,12 +51,21 @@ std::vector<Track> MultiTargetTracker::tracks() const {
 }
 
 Point2 MultiTargetTracker::predict_center_(Track& tr) const {
+    Point2 p;
     if (cfg_.use_kalman && tr.kalman) {
-        Point2 p = tr.kalman->predict();
-        tr.predicted_center = p;
-        return p;
+        p = tr.kalman->predict();
+    } else {
+        p = {tr.center.x + tr.velocity.x, tr.center.y + tr.velocity.y};
     }
-    Point2 p = {tr.center.x + tr.velocity.x, tr.center.y + tr.velocity.y};
+    // CMC soft correction: dodaj globalny camera motion vector (jesli zmierzony).
+    // NIE modyfikuje track.center/bbox/kalman -- tylko predicted_center
+    // dla potrzeb matching. Po matching, normalny correct Kalman z measured
+    // center (absolutne pixel coords) -- velocity over time absorbuje srednia
+    // ego-motion, ale CMC daje per-frame correction dla zmian kierunku PTZ.
+    if (camera_motion_inliers_ >= 15) {
+        p.x += camera_motion_.x;
+        p.y += camera_motion_.y;
+    }
     tr.predicted_center = p;
     return p;
 }
@@ -241,11 +270,139 @@ Track MultiTargetTracker::spawn_(const Detection& det) {
     return t;
 }
 
+// CMC: szacuj globalny ruch kamery z optical flow background features
+// (LK na features wyciagnietych poza pobliscym detected tracks). Wstrzykuj
+// w predicted_center kazdego tracka aby match score nie 'pełzł' za scena.
+void MultiTargetTracker::estimate_camera_motion_(const cv::Mat& frame_bgr,
+                                                  const Detections& dets) {
+    camera_motion_ = Point2{0.0, 0.0};
+    camera_motion_inliers_ = 0;
+    if (!cfg_.cmc_enabled || !cmc_ || frame_bgr.empty()) return;
+
+    cv::Mat gray;
+    cv::cvtColor(frame_bgr, gray, cv::COLOR_BGR2GRAY);
+
+    // Pierwsza klatka -- tylko zapisz, bez motion estimate
+    if (cmc_->prev_gray.empty()) {
+        cmc_->prev_gray = gray;
+        cmc_->prev_features.clear();
+        // Wyciagnij background features z pierwszej klatki -- pomijaj te w pobliżu detekcji
+        cv::Mat mask = cv::Mat::ones(gray.size(), CV_8UC1) * 255;
+        for (const auto& d : dets) {
+            int x1 = std::max(0, static_cast<int>(d.bbox.x1) - cfg_.cmc_grid_step);
+            int y1 = std::max(0, static_cast<int>(d.bbox.y1) - cfg_.cmc_grid_step);
+            int x2 = std::min(gray.cols, static_cast<int>(d.bbox.x2) + cfg_.cmc_grid_step);
+            int y2 = std::min(gray.rows, static_cast<int>(d.bbox.y2) + cfg_.cmc_grid_step);
+            if (x2 > x1 && y2 > y1) {
+                mask(cv::Rect(x1, y1, x2 - x1, y2 - y1)).setTo(0);
+            }
+        }
+        cv::goodFeaturesToTrack(gray, cmc_->prev_features,
+                                 cfg_.cmc_max_features, cfg_.cmc_quality_level,
+                                 cfg_.cmc_min_distance, mask);
+        return;
+    }
+
+    // Mam prev_gray + prev_features. Track LK.
+    if (cmc_->prev_features.size() < 8) {
+        // Za malo features w prev klatce -- zlap nowe
+        cmc_->prev_gray = gray;
+        cv::Mat mask = cv::Mat::ones(gray.size(), CV_8UC1) * 255;
+        for (const auto& d : dets) {
+            int x1 = std::max(0, static_cast<int>(d.bbox.x1) - cfg_.cmc_grid_step);
+            int y1 = std::max(0, static_cast<int>(d.bbox.y1) - cfg_.cmc_grid_step);
+            int x2 = std::min(gray.cols, static_cast<int>(d.bbox.x2) + cfg_.cmc_grid_step);
+            int y2 = std::min(gray.rows, static_cast<int>(d.bbox.y2) + cfg_.cmc_grid_step);
+            if (x2 > x1 && y2 > y1) mask(cv::Rect(x1, y1, x2 - x1, y2 - y1)).setTo(0);
+        }
+        cv::goodFeaturesToTrack(gray, cmc_->prev_features,
+                                 cfg_.cmc_max_features, cfg_.cmc_quality_level,
+                                 cfg_.cmc_min_distance, mask);
+        return;
+    }
+
+    std::vector<cv::Point2f> next_features;
+    std::vector<unsigned char> status;
+    std::vector<float> err;
+    try {
+        cv::calcOpticalFlowPyrLK(cmc_->prev_gray, gray, cmc_->prev_features,
+                                  next_features, status, err,
+                                  cv::Size(21, 21), 3);
+    } catch (const cv::Exception&) {
+        cmc_->prev_gray = gray;
+        cmc_->prev_features.clear();
+        return;
+    }
+
+    std::vector<cv::Point2f> good_prev, good_next;
+    good_prev.reserve(cmc_->prev_features.size());
+    good_next.reserve(next_features.size());
+    for (size_t i = 0; i < status.size(); ++i) {
+        if (status[i]) {
+            good_prev.push_back(cmc_->prev_features[i]);
+            good_next.push_back(next_features[i]);
+        }
+    }
+
+    if (good_prev.size() >= 8) {
+        std::vector<unsigned char> inliers;
+        cv::Mat aff = cv::estimateAffinePartial2D(good_prev, good_next,
+                                                   inliers, cv::RANSAC, 3.0);
+        if (!aff.empty()) {
+            // Affine 2x3 prev->next: [a, b, tx; -b, a, ty].
+            // Empirycznie tx, ty = jak prev_features przesunęły sie do next.
+            // To jest DOKLADNIE motion ze obiekt stat. zrobil w window coords:
+            // gdy kamera pan w prawo, obiekty przesuwaja sie w LEWO w window (-tx).
+            // Track predicted_center powinien byc PRZESUNIETY zgodnie z tx
+            // (bo track sie tez przesunal w window coords). NIE negate.
+            // Plus: clamp outliers (estimateAffine sometimes daje numeric escape)
+            double tx = aff.at<double>(0, 2);
+            double ty = aff.at<double>(1, 2);
+            int n_inliers = 0;
+            for (auto v : inliers) if (v) ++n_inliers;
+            // Sanity clamp: realistyczny max camera motion ~200 px/frame
+            const double CLAMP = 200.0;
+            if (std::abs(tx) > CLAMP || std::abs(ty) > CLAMP || n_inliers < 15) {
+                // Outlier estimate -- ignore tej klatki
+                camera_motion_ = Point2{0.0, 0.0};
+                camera_motion_inliers_ = 0;
+            } else {
+                camera_motion_ = Point2{tx, ty};
+                camera_motion_inliers_ = n_inliers;
+            }
+        }
+    }
+
+    // Setup dla nastepnej klatki -- nowe features (re-detect kazda klatka)
+    cv::Mat mask = cv::Mat::ones(gray.size(), CV_8UC1) * 255;
+    for (const auto& d : dets) {
+        int x1 = std::max(0, static_cast<int>(d.bbox.x1) - cfg_.cmc_grid_step);
+        int y1 = std::max(0, static_cast<int>(d.bbox.y1) - cfg_.cmc_grid_step);
+        int x2 = std::min(gray.cols, static_cast<int>(d.bbox.x2) + cfg_.cmc_grid_step);
+        int y2 = std::min(gray.rows, static_cast<int>(d.bbox.y2) + cfg_.cmc_grid_step);
+        if (x2 > x1 && y2 > y1) mask(cv::Rect(x1, y1, x2 - x1, y2 - y1)).setTo(0);
+    }
+    cmc_->prev_gray = gray;
+    cv::goodFeaturesToTrack(gray, cmc_->prev_features,
+                             cfg_.cmc_max_features, cfg_.cmc_quality_level,
+                             cfg_.cmc_min_distance, mask);
+}
+
+// Stub kept for ABI -- noop (CMC stosujemy w predict_center_ zamiast).
+void MultiTargetTracker::apply_camera_motion_to_predictions_() {}
+
+std::vector<Track> MultiTargetTracker::update(const Detections& dets,
+                                                const cv::Mat& frame_bgr) {
+    estimate_camera_motion_(frame_bgr, dets);
+    return update(dets);
+}
+
 std::vector<Track> MultiTargetTracker::update(const Detections& dets) {
     for (auto& tr : tracks_) tr.updated_this_frame = false;
 
     std::vector<Point2> predicted;
     predicted.reserve(tracks_.size());
+    // predict_center_ aplikuje CMC correction soft (tylko predicted, nie state)
     for (auto& tr : tracks_) predicted.push_back(predict_center_(tr));
 
     std::vector<int> unmatched_tracks, unmatched_dets;

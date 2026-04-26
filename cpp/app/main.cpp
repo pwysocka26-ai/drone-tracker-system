@@ -339,7 +339,7 @@ int main(int argc, char** argv) {
         Detections filtered = filter_and_pad(raw, frame_w, frame_h);
 
         auto t_trk0 = std::chrono::steady_clock::now();
-        std::vector<Track> tracks = mtt.update(filtered);
+        std::vector<Track> tracks = mtt.update(filtered, frame);  // CMC enabled
         std::optional<int> sel = tm.select(tracks);
         LockState lock_state = lock.step(sel, tracks);
 
@@ -453,6 +453,10 @@ int main(int argc, char** argv) {
         rec.csrt_updated_this_frame = csrt_updated_this_frame;
         rec.csrt_synthetic_used = csrt_synthetic_used;
         rec.csrt_score = csrt_score_seen;
+        Point2 cm = mtt.last_camera_motion();
+        rec.cmc_dx = static_cast<float>(cm.x);
+        rec.cmc_dy = static_cast<float>(cm.y);
+        rec.cmc_inliers = mtt.last_camera_motion_inliers();
         rec.inference_ms = inf_ms;
         rec.tracker_ms = trk_ms;
         telemetry.write(rec);

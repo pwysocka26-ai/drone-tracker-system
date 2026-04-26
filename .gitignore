@@ -20,6 +20,7 @@ scripts/
 !tools/_label_track_init.py
 !tools/_split_train_val.py
 !tools/_build_v3_dataset.py
+!tools/_build_v4_dataset.py
 !tools/export_v3_to_onnx.py
 !tools/export_v3_to_onnx_fp16.py
 !tools/compare_telemetry.py

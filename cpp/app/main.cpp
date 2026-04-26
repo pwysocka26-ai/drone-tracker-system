@@ -39,6 +39,11 @@ using namespace dtracker;
 
 struct CliArgs {
     std::string video = "../../../artifacts/test_videos/video_test_wide_short.mp4";
+    // Phase 3: dual-camera support. Jesli --video-wide + --video-narrow podane,
+    // pipeline pracuje z 2 osobnymi streamami (wide=detection, narrow=refinement).
+    // Backward-compat: tylko --video -> narrow generowany jako virtual crop wide.
+    std::string video_wide;     // empty = use --video
+    std::string video_narrow;   // empty = use virtual crop z wide
     // Default: FP16 ONNX (1.48x szybszy vs FP32 z zerowa utrata accuracy na v3).
     // Patrz tools/export_v3_to_onnx_fp16.py + raport benchmarka 2026-04-25.
     std::string model = "../../../data/weights/v3_best_fp16_imgsz960.onnx";
@@ -68,6 +73,8 @@ static CliArgs parse_args(int argc, char** argv) {
             return false;
         };
         if (take("--video", a.video)) continue;
+        if (take("--video-wide", a.video_wide)) continue;
+        if (take("--video-narrow", a.video_narrow)) continue;
         if (take("--model", a.model)) continue;
         if (take("--out-dir", a.out_dir)) continue;
         if (take_int("--imgsz", a.imgsz)) continue;
@@ -246,13 +253,14 @@ static cv::Mat draw_wide_overlays(const cv::Mat& frame, const std::vector<Track>
 int main(int argc, char** argv) {
     CliArgs a = parse_args(argc, argv);
 
-    // Phase 2 HAL refactor: zamiast bezposrednio cv::VideoCapture, uzywamy
-    // IFrameSource interface. FileFrameSource jest reference impl (cienka
-    // otoczka na cv::VideoCapture). Vendor moze podmienic na RtspFrameSource,
-    // CameraLinkFrameSource, etc. -- bez zmian w main loop.
-    auto source = std::make_shared<dtracker::io::FileFrameSource>();
-    if (!source->open(a.video)) {
-        std::cerr << "FATAL: cannot open video: " << a.video << "\n";
+    // Phase 2 HAL: IFrameSource zamiast cv::VideoCapture (vendor-pluggable).
+    // Phase 3 dual-camera: source_wide + source_narrow (opcjonalny). Sync per
+    // frame index. Backward-compat: --video (single) --> source_narrow=null,
+    // narrow generowany przez virtual crop wide (legacy behavior).
+    std::string wide_uri = a.video_wide.empty() ? a.video : a.video_wide;
+    auto source = std::make_shared<dtracker::io::FileFrameSource>();  // wide
+    if (!source->open(wide_uri)) {
+        std::cerr << "FATAL: cannot open wide video: " << wide_uri << "\n";
         return 1;
     }
     const auto& src_info = source->info();
@@ -261,8 +269,25 @@ int main(int argc, char** argv) {
     double fps = src_info.fps;
     if (fps <= 0.0 || fps > 240.0) fps = 30.0;
     long total = src_info.total_frames;
-    std::cout << "Video: " << frame_w << "x" << frame_h << " @ " << fps
+    std::cout << "Wide:   " << frame_w << "x" << frame_h << " @ " << fps
               << " fps, " << total << " frames (codec=" << src_info.codec << ")\n";
+
+    // Phase 3: opcjonalny narrow stream (osobna kamera vs virtual crop)
+    std::shared_ptr<dtracker::io::IFrameSource> narrow_source;
+    bool dual_camera_mode = !a.video_narrow.empty();
+    if (dual_camera_mode) {
+        narrow_source = std::make_shared<dtracker::io::FileFrameSource>();
+        if (!narrow_source->open(a.video_narrow)) {
+            std::cerr << "FATAL: cannot open narrow video: " << a.video_narrow << "\n";
+            return 1;
+        }
+        const auto& ninfo = narrow_source->info();
+        std::cout << "Narrow: " << ninfo.width << "x" << ninfo.height << " @ " << ninfo.fps
+                  << " fps, " << ninfo.total_frames << " frames (codec=" << ninfo.codec << ")\n";
+        std::cout << "MODE:   dual-camera (wide+narrow physical streams)\n";
+    } else {
+        std::cout << "MODE:   single-camera (narrow = virtual crop wide)\n";
+    }
 
     std::string run_id = ts_now();
     fs::path run_dir = fs::path(a.out_dir) / run_id;
@@ -327,7 +352,9 @@ int main(int argc, char** argv) {
 
     int frame_idx = 0;
     cv::Mat frame;
+    cv::Mat narrow_frame;  // Phase 3: dual-camera physical narrow stream
     dtracker::io::Frame io_frame;
+    dtracker::io::Frame io_frame_narrow;
     auto t_start = std::chrono::steady_clock::now();
     double total_inf_ms = 0.0;
     double total_track_ms = 0.0;
@@ -336,6 +363,16 @@ int main(int argc, char** argv) {
     while (!quit) {
         if (!source->read(io_frame) || io_frame.image.empty()) break;
         frame = io_frame.image;
+        // Phase 3 dual-camera: czytaj narrow stream sync per frame index. Jesli
+        // narrow short-circuits (EOF wczesniej niz wide), zatrzymaj caly pipeline
+        // -- inaczej rozjedzie sie sync.
+        if (dual_camera_mode) {
+            if (!narrow_source->read(io_frame_narrow) || io_frame_narrow.image.empty()) {
+                std::cout << "Narrow EOF at frame " << frame_idx << " -- stopping\n";
+                break;
+            }
+            narrow_frame = io_frame_narrow.image;
+        }
         if (a.max_frames > 0 && frame_idx >= a.max_frames) break;
         ++frame_idx;
 
@@ -476,20 +513,33 @@ int main(int argc, char** argv) {
                                                     tm.persistent_owner_id(),
                                                     lock_state, crop, narrow.state());
             cv::Mat narrow_vis;
-            int nx1 = std::max(0, static_cast<int>(crop.x1));
-            int ny1 = std::max(0, static_cast<int>(crop.y1));
-            int nx2 = std::min(frame_w, static_cast<int>(crop.x2));
-            int ny2 = std::min(frame_h, static_cast<int>(crop.y2));
-            // Fix 1: narrow.state().has_owner pozostaje true podczas synthetic hold
-            // -> renderujemy crop z ostatniej dobrej pozycji zamiast czarnego ekranu
-            if (nx2 > nx1 && ny2 > ny1 && narrow.state().has_owner) {
-                narrow_vis = frame(cv::Rect(nx1, ny1, nx2 - nx1, ny2 - ny1)).clone();
-                if (narrow.state().is_synthetic) {
-                    // Zolty banner "HOLD N/max" zeby uzytkownik widzial ze to synthetic
+            if (dual_camera_mode) {
+                // Phase 3: narrow = physical stream z osobnej kamery (np. PTZ
+                // optical zoom). Wysylamy go bezposrednio na panel, nadal pokazujac
+                // synthetic-hold banner gdy narrow tracker nie ma swiezej detekcji.
+                narrow_vis = narrow_frame.clone();
+                if (narrow.state().has_owner && narrow.state().is_synthetic) {
                     std::ostringstream syn;
                     syn << "HOLD " << narrow.state().hold_count;
                     cv::putText(narrow_vis, syn.str(), cv::Point(10, 30),
                                 cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 255, 255), 2);
+                }
+            } else {
+                int nx1 = std::max(0, static_cast<int>(crop.x1));
+                int ny1 = std::max(0, static_cast<int>(crop.y1));
+                int nx2 = std::min(frame_w, static_cast<int>(crop.x2));
+                int ny2 = std::min(frame_h, static_cast<int>(crop.y2));
+                // Fix 1: narrow.state().has_owner pozostaje true podczas synthetic hold
+                // -> renderujemy crop z ostatniej dobrej pozycji zamiast czarnego ekranu
+                if (nx2 > nx1 && ny2 > ny1 && narrow.state().has_owner) {
+                    narrow_vis = frame(cv::Rect(nx1, ny1, nx2 - nx1, ny2 - ny1)).clone();
+                    if (narrow.state().is_synthetic) {
+                        // Zolty banner "HOLD N/max" zeby uzytkownik widzial ze to synthetic
+                        std::ostringstream syn;
+                        syn << "HOLD " << narrow.state().hold_count;
+                        cv::putText(narrow_vis, syn.str(), cv::Point(10, 30),
+                                    cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 255, 255), 2);
+                    }
                 }
             }
             cv::Mat composite = make_composite(wide_vis, narrow_vis,
@@ -569,6 +619,7 @@ int main(int argc, char** argv) {
 
     if (video_writer.isOpened()) video_writer.release();
     source->close();
+    if (narrow_source) narrow_source->close();
     cv::destroyAllWindows();
     telemetry.close();
 

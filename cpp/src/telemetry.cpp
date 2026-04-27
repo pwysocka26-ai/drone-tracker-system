@@ -54,6 +54,7 @@ void TelemetryWriter::write(const FrameTelemetry& r) {
     ofs_ << ",\"csrt_active\":" << (r.csrt_active ? "true" : "false");
     ofs_ << ",\"csrt_updated\":" << (r.csrt_updated_this_frame ? "true" : "false");
     ofs_ << ",\"csrt_synthetic_used\":" << (r.csrt_synthetic_used ? "true" : "false");
+    ofs_ << ",\"csrt_refresh\":" << (r.csrt_refresh_event ? "true" : "false");
     ofs_ << ",\"csrt_score\":" << r.csrt_score;
     ofs_ << ",\"cmc_dx\":" << r.cmc_dx;
     ofs_ << ",\"cmc_dy\":" << r.cmc_dy;

@@ -423,7 +423,14 @@ int main(int argc, char** argv) {
     // Init przy zdrowej detekcji ownera, update co klatka, fallback przy gapie.
     LocalTargetTracker local_tracker(/*max_lost_frames=*/20);
     int local_tracker_owner_id = -1;  // raw track_id na ktorym CSRT byl init'owany
+    int local_tracker_init_frame = -10000;  // klatka ostatniego init (anti-drift refresh)
     const float local_tracker_min_score = 0.55f;
+    // Anti-drift: forced re-init co N klatek na zdrowym ownerze. Empirycznie
+    // (memory: project_csrt_drift_diagnosis_2026_04_27) gap >= 60 klatek bez
+    // update'u podnosi fail rate first-update z 4% (baseline) do 11%. Refresh
+    // co ~3s przy stabilnym ownerze odswieza appearance model bez kosztu lazy.
+    constexpr int CSRT_REFRESH_INTERVAL = 90;
+    constexpr float CSRT_REFRESH_MIN_CONF = 0.50f;
 
     NarrowConfig narrow_cfg;
     narrow_cfg.display_center_alpha = 0.78f;
@@ -551,20 +558,31 @@ int main(int argc, char** argv) {
         bool have_synthetic_owner = false;
         bool csrt_updated_this_frame = false;
         bool csrt_synthetic_used = false;
+        bool csrt_refresh_event = false;
         float csrt_score_seen = 0.0f;
         bool owner_healthy = (owner && owner->missed_frames == 0 && owner->confidence >= 0.18f);
 
-        // Init/re-init przy widocznym + healthy owner
+        // Init/re-init przy widocznym + healthy owner. Refresh przy stabilnym
+        // ownerze co CSRT_REFRESH_INTERVAL klatek (anti-drift: appearance model
+        // CSRT zostaje swiezy nawet gdy YOLO trzyma owner_id przez setki klatek).
         if (owner && owner->missed_frames <= 1) {
             int sid = owner->track_id;
-            if (!local_tracker.is_active() || local_tracker_owner_id != sid) {
+            bool need_init = !local_tracker.is_active() || local_tracker_owner_id != sid;
+            bool need_refresh = local_tracker.is_active()
+                                && local_tracker_owner_id == sid
+                                && owner->confidence >= CSRT_REFRESH_MIN_CONF
+                                && (frame_idx - local_tracker_init_frame) >= CSRT_REFRESH_INTERVAL;
+            if (need_init || need_refresh) {
                 if (local_tracker.init(frame, owner->bbox)) {
                     local_tracker_owner_id = sid;
+                    local_tracker_init_frame = frame_idx;
+                    if (need_refresh && !need_init) csrt_refresh_event = true;
                 }
             }
         } else if (!sel && !tm.state().last_selected_center) {
             local_tracker.reset();
             local_tracker_owner_id = -1;
+            local_tracker_init_frame = -10000;
         }
 
         // Lazy CSRT: update tylko gdy YOLO degraded/missing (oszczedza ~28 ms/klatka
@@ -644,6 +662,7 @@ int main(int argc, char** argv) {
         rec.csrt_active = local_tracker.is_active();
         rec.csrt_updated_this_frame = csrt_updated_this_frame;
         rec.csrt_synthetic_used = csrt_synthetic_used;
+        rec.csrt_refresh_event = csrt_refresh_event;
         rec.csrt_score = csrt_score_seen;
         Point2 cm = mtt.last_camera_motion();
         rec.cmc_dx = static_cast<float>(cm.x);

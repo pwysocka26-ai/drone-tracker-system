@@ -39,6 +39,7 @@ struct FrameTelemetry {
     bool csrt_active = false;            // CSRT zainicjalizowany na owner
     bool csrt_updated_this_frame = false; // CSRT.update(frame) wywolane (lazy: tylko gdy YOLO degraded)
     bool csrt_synthetic_used = false;    // synthetic owner z CSRT zastapil brak YOLO ownera
+    bool csrt_refresh_event = false;     // forced re-init na zdrowym ownerze (anti-drift)
     float csrt_score = 0.0f;
     // CMC diagnostic
     float cmc_dx = 0.0f;

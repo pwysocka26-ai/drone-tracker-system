@@ -394,6 +394,8 @@ void MultiTargetTracker::apply_camera_motion_to_predictions_() {}
 std::vector<Track> MultiTargetTracker::update(const Detections& dets,
                                                 const cv::Mat& frame_bgr) {
     estimate_camera_motion_(frame_bgr, dets);
+    last_frame_w_ = frame_bgr.cols;
+    last_frame_h_ = frame_bgr.rows;
     return update(dets);
 }
 
@@ -414,10 +416,25 @@ std::vector<Track> MultiTargetTracker::update(const Detections& dets) {
     for (int ti : unmatched_tracks) mark_missed_(tracks_[ti]);
     for (int di : unmatched_dets) tracks_.push_back(spawn_(dets[di]));
 
-    // Usuń martwe
+    // Usuń martwe + Kalman ghosts ktore wyjechaly calkowicie poza klatke.
+    // Off-screen kill (anti-ghost) — empiryka: project_ghost_tracks_legit_signal_2026_04_27
+    // pokazala ze np. id=40 dryfowal do y=-245 przez 23 klatki, niewidoczny w
+    // runtime ale brudzil track lifecycle. Tylko Kalman-propagowane (missed>0):
+    // swieza detekcja na krawedzi to legit (drone wlatujacy/wylatujacy z YOLO).
+    const int fw = last_frame_w_;
+    const int fh = last_frame_h_;
     tracks_.erase(
         std::remove_if(tracks_.begin(), tracks_.end(),
-                       [this](const Track& t) { return t.missed_frames > cfg_.max_missed_frames; }),
+                       [this, fw, fh](const Track& t) {
+                           if (t.missed_frames > cfg_.max_missed_frames) return true;
+                           if (t.missed_frames > 0 && fw > 0) {
+                               if (t.bbox.x2 < 0 || t.bbox.y2 < 0
+                                   || t.bbox.x1 > fw || t.bbox.y1 > fh) {
+                                   return true;
+                               }
+                           }
+                           return false;
+                       }),
         tracks_.end());
 
     std::sort(tracks_.begin(), tracks_.end(),

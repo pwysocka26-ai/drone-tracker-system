@@ -97,6 +97,11 @@ private:
     std::unique_ptr<CmcState> cmc_;
     Point2 camera_motion_{0.0, 0.0};       // ostatni global dx, dy
     int    camera_motion_inliers_ = 0;     // ile features inliers w affine
+
+    // Off-screen kill (anti-ghost): ostatnie znane wymiary klatki, ustawiane
+    // w update(dets, frame_bgr). 0 = disabled (legacy update bez frame'u).
+    int last_frame_w_ = 0;
+    int last_frame_h_ = 0;
 };
 
 }  // namespace dtracker

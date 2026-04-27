@@ -1,6 +1,7 @@
 #include "dtracker/dashboard.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <iomanip>
 #include <sstream>
 
@@ -8,6 +9,45 @@
 #include <opencv2/imgproc.hpp>
 
 namespace dtracker {
+
+// Helper: kropkowany prostokat dla wizualizacji Kalman-drift trackow.
+// Sygnalizuje operatorowi "MTT propaguje pozycje, nie ma swiezej detekcji".
+// Empiryka: project_ghost_tracks_legit_signal_2026_04_27 — agresywny filter
+// ukrylby legit small-drone targets (id=42 case), wiec rysujemy z roznym
+// stylem zamiast ukrywac.
+static void draw_dashed_rect(cv::Mat& img, cv::Point p1, cv::Point p2,
+                              const cv::Scalar& color, int thickness,
+                              int dash_len = 6, int gap_len = 4) {
+    auto draw_dashed_line = [&](cv::Point a, cv::Point b) {
+        const double dx_total = static_cast<double>(b.x - a.x);
+        const double dy_total = static_cast<double>(b.y - a.y);
+        const double len = std::sqrt(dx_total * dx_total + dy_total * dy_total);
+        if (len < 1.0) return;
+        const double dx = dx_total / len;
+        const double dy = dy_total / len;
+        double pos = 0.0;
+        bool draw = true;
+        while (pos < len) {
+            const double seg = draw ? dash_len : gap_len;
+            const double end = std::min(pos + seg, len);
+            if (draw) {
+                cv::Point sa(a.x + static_cast<int>(pos * dx),
+                             a.y + static_cast<int>(pos * dy));
+                cv::Point sb(a.x + static_cast<int>(end * dx),
+                             a.y + static_cast<int>(end * dy));
+                cv::line(img, sa, sb, color, thickness);
+            }
+            pos = end;
+            draw = !draw;
+        }
+    };
+    cv::Point tr(p2.x, p1.y);
+    cv::Point bl(p1.x, p2.y);
+    draw_dashed_line(p1, tr);
+    draw_dashed_line(tr, p2);
+    draw_dashed_line(p2, bl);
+    draw_dashed_line(bl, p1);
+}
 
 Dashboard::Dashboard(DashboardConfig cfg) : cfg_(cfg) {
     if (cfg_.show_gui) {
@@ -47,18 +87,45 @@ int Dashboard::render(const cv::Mat& frame_bgr,
 
     cv::Mat wide = frame_bgr.clone();
 
-    // Wszystkie tracki — szare bboxy
+    // Wszystkie tracki — wizualne rozroznienie wg stanu (anti-ghost UX):
+    //   owner             -> kolor lock_state, solid grubsza
+    //   confirmed swieza  -> szara solid (klasyczny "candidate")
+    //   confirmed missed  -> szara KROPKOWANA (Kalman propaguje, brak detekcji)
+    //   unconfirmed       -> ciemnoszara cienka (niepewny single-hit)
+    // Empiryka: project_ghost_tracks_legit_signal_2026_04_27 — NIE filtrujemy
+    // unconfirmed bo czesto sa to legit small-drone targets z YOLO blindness.
     for (const auto& t : tracks) {
-        cv::Scalar col(120, 120, 120);
-        if (t.track_id == selected_id) col = color_for_state(lock_state);
-        cv::rectangle(wide,
-                      cv::Point(static_cast<int>(t.bbox.x1), static_cast<int>(t.bbox.y1)),
-                      cv::Point(static_cast<int>(t.bbox.x2), static_cast<int>(t.bbox.y2)),
-                      col, 2);
+        const bool is_owner = (t.track_id == selected_id);
+        const bool is_kalman_drift = (!is_owner && t.is_confirmed && t.missed_frames > 0);
+        const bool is_unconfirmed = (!is_owner && !t.is_confirmed);
+
+        cv::Scalar col;
+        int thickness;
+        if (is_owner) {
+            col = color_for_state(lock_state);
+            thickness = 2;
+        } else if (is_unconfirmed) {
+            col = cv::Scalar(90, 90, 90);
+            thickness = 1;
+        } else {
+            col = cv::Scalar(140, 140, 140);
+            thickness = is_kalman_drift ? 1 : 2;
+        }
+
+        cv::Point p1(static_cast<int>(t.bbox.x1), static_cast<int>(t.bbox.y1));
+        cv::Point p2(static_cast<int>(t.bbox.x2), static_cast<int>(t.bbox.y2));
+        if (is_kalman_drift) {
+            draw_dashed_rect(wide, p1, p2, col, thickness);
+        } else {
+            cv::rectangle(wide, p1, p2, col, thickness);
+        }
+
         std::ostringstream ss;
         ss << "id=" << t.track_id << " c=" << std::setprecision(2) << t.confidence;
+        if (is_kalman_drift) ss << " K" << t.missed_frames;
+        else if (is_unconfirmed) ss << " ?";
         cv::putText(wide, ss.str(),
-                    cv::Point(static_cast<int>(t.bbox.x1), static_cast<int>(t.bbox.y1) - 6),
+                    cv::Point(p1.x, p1.y - 6),
                     cv::FONT_HERSHEY_SIMPLEX, 0.5, col, 1);
     }
 

@@ -4,6 +4,7 @@
 // Parity z Python src/main.py + src/core/app.py (D6 plan).
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
@@ -302,8 +303,51 @@ static void write_run_summary(const fs::path& path, int frames,
     o << "}\n";
 }
 
+// Helper: dashed rectangle dla wizualizacji Kalman-drift trackow w recording
+// (parity z dashboard.cpp draw_dashed_rect — anti-ghost UX).
+static void draw_dashed_rect_local(cv::Mat& img, cv::Point p1, cv::Point p2,
+                                    const cv::Scalar& color, int thickness,
+                                    int dash_len = 6, int gap_len = 4) {
+    auto draw_dashed_line = [&](cv::Point a, cv::Point b) {
+        const double dx_total = static_cast<double>(b.x - a.x);
+        const double dy_total = static_cast<double>(b.y - a.y);
+        const double len = std::sqrt(dx_total * dx_total + dy_total * dy_total);
+        if (len < 1.0) return;
+        const double dx = dx_total / len;
+        const double dy = dy_total / len;
+        double pos = 0.0;
+        bool draw = true;
+        while (pos < len) {
+            const double seg = draw ? dash_len : gap_len;
+            const double end = std::min(pos + seg, len);
+            if (draw) {
+                cv::Point sa(a.x + static_cast<int>(pos * dx),
+                             a.y + static_cast<int>(pos * dy));
+                cv::Point sb(a.x + static_cast<int>(end * dx),
+                             a.y + static_cast<int>(end * dy));
+                cv::line(img, sa, sb, color, thickness);
+            }
+            pos = end;
+            draw = !draw;
+        }
+    };
+    cv::Point tr(p2.x, p1.y);
+    cv::Point bl(p1.x, p2.y);
+    draw_dashed_line(p1, tr);
+    draw_dashed_line(tr, p2);
+    draw_dashed_line(p2, bl);
+    draw_dashed_line(bl, p1);
+}
+
 // Wide frame z overlays (per-track bbox, narrow crop rect, status banner) -- na
 // recording. Dashboard::render robi wlasne imshow, my potrzebujemy "to-Mat" wersji.
+//
+// Anti-ghost wizualne rozroznienie (parity z dashboard.cpp, ref. memory
+// project_ghost_tracks_legit_signal_2026_04_27):
+//   owner             -> kolor lock_state, solid grubsza
+//   confirmed swieza  -> szara solid (klasyczny "candidate")
+//   confirmed missed  -> szara KROPKOWANA (Kalman propaguje, brak detekcji)
+//   unconfirmed       -> ciemnoszara cienka (niepewny single-hit)
 static cv::Mat draw_wide_overlays(const cv::Mat& frame, const std::vector<Track>& tracks,
                                    int sel_id, int persistent_id,
                                    LockState lock_state, const BBox& crop,
@@ -317,17 +361,39 @@ static cv::Mat draw_wide_overlays(const cv::Mat& frame, const std::vector<Track>
     else                                          lock_color = cv::Scalar(120, 120, 120);
 
     for (const auto& t : tracks) {
-        cv::Scalar col = (t.track_id == sel_id) ? lock_color : cv::Scalar(120, 120, 120);
-        cv::rectangle(vis,
-                      cv::Point(static_cast<int>(t.bbox.x1), static_cast<int>(t.bbox.y1)),
-                      cv::Point(static_cast<int>(t.bbox.x2), static_cast<int>(t.bbox.y2)),
-                      col, 2);
+        const bool is_owner = (t.track_id == sel_id);
+        const bool is_kalman_drift = (!is_owner && t.is_confirmed && t.missed_frames > 0);
+        const bool is_unconfirmed = (!is_owner && !t.is_confirmed);
+
+        cv::Scalar col;
+        int thickness;
+        if (is_owner) {
+            col = lock_color;
+            thickness = 2;
+        } else if (is_unconfirmed) {
+            col = cv::Scalar(90, 90, 90);
+            thickness = 1;
+        } else {
+            col = cv::Scalar(140, 140, 140);
+            thickness = is_kalman_drift ? 1 : 2;
+        }
+
+        cv::Point p1(static_cast<int>(t.bbox.x1), static_cast<int>(t.bbox.y1));
+        cv::Point p2(static_cast<int>(t.bbox.x2), static_cast<int>(t.bbox.y2));
+        if (is_kalman_drift) {
+            draw_dashed_rect_local(vis, p1, p2, col, thickness);
+        } else {
+            cv::rectangle(vis, p1, p2, col, thickness);
+        }
+
         std::ostringstream ss;
         // Fix 4c: "tid=" zamiast "id=" -- disambiguation z persistent owner
         // ID w bannerze (#X). Per-track label = raw track_id z MTT.
         ss << "tid=" << t.track_id << " c=" << std::fixed << std::setprecision(2) << t.confidence;
+        if (is_kalman_drift) ss << " K" << t.missed_frames;
+        else if (is_unconfirmed) ss << " ?";
         cv::putText(vis, ss.str(),
-                    cv::Point(static_cast<int>(t.bbox.x1), static_cast<int>(t.bbox.y1) - 6),
+                    cv::Point(p1.x, p1.y - 6),
                     cv::FONT_HERSHEY_SIMPLEX, 0.5, col, 1);
     }
     // Narrow crop rectangle: bialy gdy real owner, bialy przerywany gdy synthetic hold

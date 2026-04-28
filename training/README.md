@@ -1,5 +1,71 @@
 # Training YOLOv8 dla drone detection
 
+## Schemat training vN (uniwersalny dla v3/v4/v5+)
+
+Spojny, powtarzalny flow dla kazdej iteracji modelu. Ta sama konwencja sciezek
+i komend, tylko inny `N`.
+
+### Konwencja sciezek
+
+| Element | Sciezka |
+|---|---|
+| Build script | `tools/_build_vN_dataset.py` |
+| Local dataset dir | `training/vN/` (`images/{train,val}` + `labels/{train,val}` + `data.yaml`) |
+| Local zip (gitignored) | `training/vN_dataset.zip` |
+| Drive zip (upload target) | `MyDrive/drone_tracker/vN_dataset.zip` |
+| Colab notebook | `training/colab_vN_train.ipynb` |
+| Colab unpack dir | `/content/vN_work/training/vN/` |
+| Colab run output | `/content/runs/<run_name>/` |
+| Drive run output (po treningu) | `MyDrive/drone_tracker/vN/<run_name>/` (caly folder) |
+| Local download dir | `data/weights/<run_name>/` |
+| Pipeline runtime model | `data/weights/<run_name>/weights/<modelname>_fp16_imgszN.onnx` |
+
+### Flow (zawsze ten sam)
+
+```bash
+# 1. LOKALNIE: build dataset + zip
+python tools/_build_vN_dataset.py
+
+# 2. UPLOAD: drag&drop training/vN_dataset.zip -> MyDrive/drone_tracker/
+
+# 3. COLAB:
+#    File -> Open notebook -> training/colab_vN_train.ipynb
+#    Runtime -> Change runtime type -> GPU (A100/V100/T4)
+#    Run all cells
+
+# 4. DOWNLOAD: Drive -> MyDrive/drone_tracker/vN/<run_name>/
+#    -> data/weights/<run_name>/
+
+# 5. USE:
+./cpp/build/Release/dtracker_main.exe \
+    --model data/weights/<run_name>/weights/<modelname>_fp16_imgszN.onnx \
+    --imgsz N
+```
+
+### Konkrety per wersja
+
+| Wersja | Source | run_name | Base | imgsz | Epochs | Zip name |
+|---|---|---|---|---|---|---|
+| v3 | Roboflow + v2 | `v3_drone_m_imgsz960` | yolov8m | 960 | 40 | `v3_dataset.zip` |
+| v4 | CVAT + v3 | `v4_drone_s_imgsz640`, `v4_drone_s_imgsz960` | yolov8s | 640, 960 | 50 | `v4_dataset.zip` |
+| v5 | v4 (kopia) | `v5_drone_m_imgsz1280` | yolov8m | 1280 | 60 | `v5_dataset.zip` |
+
+### Reguly
+
+1. **Jeden zip per wersja**. Nie reuse'uj `vN_dataset.zip` dla `vN+1`. Nawet jak data identyczna —
+   buduj nowy `vN+1_dataset.zip`. Powod: czytelnosc i debug — Drive sciezka jednoznacznie wskazuje wersje.
+
+2. **Caly folder runu na Drive**, nie tylko ONNX. `best.pt` potrzebny do re-export
+   (INT8, inny imgsz) bez powtarzania kilkugodzinnego treningu. `results.csv` + plots
+   do post-mortem analizy konwergencji.
+
+3. **`data.yaml` zawsze pisany przez build script**. Nie kopiowany — z poprawnym `path: training/vN`.
+
+4. **Walidacja przed treningiem**: build script printuje `train=N val=M total=X`. Sprawdz
+   ze liczby zgadzaja sie z oczekiwaniami (porownaj z poprzednia wersja).
+
+---
+
 ## GPU infrastructure
 
 Potrzebny GPU dla fine-tune. Opcje:

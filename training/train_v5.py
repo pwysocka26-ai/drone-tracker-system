@@ -61,9 +61,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--epochs", type=int, default=60)
     p.add_argument("--batch", type=int, default=16,
                    help="Batch size; reduce to 8 if OOM (T4 16 GB / 3060 12 GB)")
-    p.add_argument("--data", default="training/v4/data.yaml",
-                   help="Dataset yaml — uzywamy v4 dataset (4032 obrazki, "
-                        "64.5% bboxow <30 px wystarczy dla v5)")
+    p.add_argument("--data", default="training/v5/data.yaml",
+                   help="Dataset yaml. v5 layout = kopia v4 (4032 obrazki, "
+                        "64.5% bboxow <30 px wystarczy dla v5). "
+                        "Generowane przez tools/_build_v5_dataset.py")
     p.add_argument("--base", default="yolov8m.pt",
                    help="Base checkpoint (yolov8m=28M, yolov8l=44M, yolov8x=68M)")
     p.add_argument("--device", default="0",

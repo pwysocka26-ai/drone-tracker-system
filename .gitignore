@@ -21,6 +21,7 @@ scripts/
 !tools/_split_train_val.py
 !tools/_build_v3_dataset.py
 !tools/_build_v4_dataset.py
+!tools/_build_v5_dataset.py
 !tools/_v4_validation_png.py
 !tools/_antiuav_diag.py
 !tools/_migrate_pack.ps1
@@ -102,6 +103,9 @@ training/v3/review/
 training/v4/images/
 training/v4/labels/
 training/v4/review/
+training/v5/images/
+training/v5/labels/
+training/v5/review/
 
 # model weights (pulled from Drive, reproducible)
 *.pt

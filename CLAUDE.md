@@ -80,7 +80,10 @@ pad_w = (x2 - x1) * 0.15   # ~15% horizontal
 pad_h = (y2 - y1) * 0.20   # ~20% vertical (propellery głównie po bokach)
 ```
 
-Również area filter: `if area < 200.0: continue` (~14x14 px) — odrzuca noise.
+Również area filter: `if area < 200.0: continue` (~14x14 px) — odrzuca noise
+w python pipeline. **C++ pipeline (`cpp/app/main.cpp`) ma to konfigurowalne**:
+defaulty `--min-area 25 --min-side 4` dla v5@1280 (drony 5-15 px). Dla v4@640
+fallback: `--min-area 200 --min-side 8`.
 
 ### Tracker
 
@@ -307,6 +310,23 @@ Gotowy notebook z 11 krokami:
 Problemowy — YOLO widzi drona + odbicie jako dwa airplane. Wymaga custom
 YOLO z odfiltrowaniem odbić lub dedykowanej klasy "water reflection".
 
+### Video test wide (small-drone EO/IR, 25000 klatek z 94894 @ 50 fps)
+
+Pełny A/B v4@640 vs v5@1280 (2026-04-29):
+
+| Metryka | v4@640 | **v5@1280** | Δ |
+|---|---:|---:|---:|
+| LOCKED frames | 24.8% | **95.1%** | +70.3 pp |
+| lock_loss events | 406 | **2** | 200× |
+| reacquire success | 5.4% | **50.0%** | +44.6 pp |
+| end_state | ACQUIRE | **LOCKED** | ✅ |
+| REACQUIRE time | 57.7% | 0.16% | −57.5 pp |
+| inference avg (DirectML iGPU) | — | 26.1 ms (37 fps) | — |
+
+Drone median 14 px na 1920×1080 (5-17 px szerokości). Walidacja wizualna
+6/6 klatek: czerwony bbox precyzyjnie na małym ciemnym dronie, conf
+0.60-0.73, brak fałszywych lock'ów na chmury.
+
 ---
 
 ## Custom YOLO milestone — v3 (2026-04-23)
@@ -370,6 +390,58 @@ Merge + split robi `tools/_build_v3_dataset.py`. Trening `training/train_v3.py`.
 - `drone_tracker/datasets/v3_dataset.zip` (1.1 GB, 2134 obrazków)
 - `drone_tracker/runs/v2_drone_m_imgsz960/` (best.pt + metrics)
 - `drone_tracker/runs/v3_drone_m_imgsz960/` (best.pt + metrics)
+
+---
+
+## Custom YOLO milestone — v5 (2026-04-29)
+
+Tydzień 3 planu delivery dostarczony — **small-objects fix**. Wytrenowany
+yolov8m @ imgsz=1280 specjalnie dla małych dronów 5-15 px (v3/v4 @ imgsz=640
+nie łapały tej skali — drone 12 px → 4 px po scale, poniżej yolov8 stride 8).
+
+### Trening v5
+
+- Dataset: `training/v5/` (kopia v4 4032 obrazki, dataset OK od początku —
+  problem był w `imgsz`, nie w danych). Run wybrany:
+  `v5_yolov8m_1280_a100_b16_clean` z 28.04 (4 warianty trenowane, "_clean"
+  finalny). Trening na A100, batch=16.
+- Export: `data/weights/v5_best.pt` (52 MB) + `v5_best_fp16_imgsz1280.onnx`
+  (52 MB, FP16 wagi, 167/167 initializers fp16, opset=12).
+- Single class: `dron_maly`.
+
+### A/B vs v4@640 (full 25000 klatek video_test_wide.mp4)
+
+| Metryka | v4@640 | **v5@1280** | Δ |
+|---|---:|---:|---:|
+| LOCKED frames | 24.8% | **95.1%** | +70.3 pp |
+| lock_loss events | 406 | **2** | 200× |
+| reacquire success | 5.4% | **50.0%** | +44.6 pp |
+| end_state | ACQUIRE | **LOCKED** | ✅ |
+| REACQUIRE time | 57.7% | 0.16% | −57.5 pp |
+| inference avg (DirectML iGPU 8060S) | — | 26.1 ms (37 fps) | — |
+
+Cele post-v5 z continuity memory (`>60% LOCKED, <100 lock_loss, >25% reacq`)
+**przekroczone wszystkie**.
+
+### Lessons learned
+
+1. **Model był OK od początku** — Python ORT na frame 100 dawał
+   conf=0.6147. Pipeline cpp jednak dawał 0 detekcji przez 3000 klatek.
+2. **Root cause: `cpp/app/main.cpp:filter_and_pad` hardcoded `area<200`
+   i `side<8`** — drony 9×5 px (area 45 px²) były wycinane przed dotarciem
+   do MTT. Filter był sensowny dla v4@640 (drone tam większy w ramach scale)
+   ale zabija małe drony z v5@1280.
+3. **Fix: CLI flagi `--min-area F` / `--min-side F`** (commit a30cccf)
+   z defaultami zachowującymi v4 (200/8). Default v5 (commit fbce3f6):
+   25/4.
+4. **DirectML iGPU Radeon 8060S** robi 26 ms inference dla yolov8m@1280 —
+   1.3× wolniej niż v4@640 (28.3 ms na innym sprzęcie z poprzednich sesji),
+   ale model jest 3× cięższy. Bardzo dobry stosunek jakość/koszt.
+
+### Artefakty na Google Drive
+
+- `drone_tracker/datasets/v5_dataset.zip` (1.2 GB)
+- `drone_tracker/runs/v5_yolov8m_1280_a100_b16_clean/` (best.pt + args.yaml)
 
 ---
 

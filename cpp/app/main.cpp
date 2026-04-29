@@ -55,6 +55,11 @@ struct CliArgs {
     bool record = true;
     int imgsz = 640;
     float conf = 0.20f;
+    // Min bbox area (px^2) post-NMS, pre-MTT. Default 200 (~14x14) historycznie
+    // odrzuca noise dla v4@640. v5@1280 lapie drony 5-15 px (area 25-225 px^2)
+    // -- wymaga --min-area 25 + --min-side 4 zeby maly drone signal przeszedl.
+    float min_area = 200.0f;
+    float min_side = 8.0f;  // min bw/bh w px; razem z min_area filtruje noise.
     int max_frames = -1;
     bool use_directml = true;
 };
@@ -82,13 +87,15 @@ static CliArgs parse_args(int argc, char** argv) {
         if (take("--out-dir", a.out_dir)) continue;
         if (take_int("--imgsz", a.imgsz)) continue;
         if (take_float("--conf", a.conf)) continue;
+        if (take_float("--min-area", a.min_area)) continue;
+        if (take_float("--min-side", a.min_side)) continue;
         if (take_int("--max-frames", a.max_frames)) continue;
         if (s == "--no-gui") { a.gui = false; continue; }
         if (s == "--no-record") { a.record = false; continue; }
         if (s == "--cpu") { a.use_directml = false; continue; }
         if (s == "-h" || s == "--help") {
             std::cout << "Usage: dtracker_main [--video PATH] [--model PATH] [--out-dir PATH]"
-                      << " [--imgsz N] [--conf F] [--max-frames N] [--no-gui] [--no-record] [--cpu]\n";
+                      << " [--imgsz N] [--conf F] [--min-area F] [--min-side F] [--max-frames N] [--no-gui] [--no-record] [--cpu]\n";
             std::exit(0);
         }
     }
@@ -100,7 +107,8 @@ static CliArgs parse_args(int argc, char** argv) {
 // Filter z app.py:parse_tracks. Drops noise + maly drone padding.
 // area>200, aspect 0.10..10, drop bottom 18% (samolot/dron rzadko leci nisko),
 // padding 15% horizontal + 20% vertical (propellery YOLO odcina).
-static Detections filter_and_pad(const Detections& raw, int frame_w, int frame_h) {
+static Detections filter_and_pad(const Detections& raw, int frame_w, int frame_h,
+                                  float min_area, float min_side) {
     Detections out;
     out.reserve(raw.size());
     const float bottom_y = static_cast<float>(frame_h) * 0.82f;
@@ -113,8 +121,8 @@ static Detections filter_and_pad(const Detections& raw, int frame_w, int frame_h
         float aspect = bw / std::max(1.0f, bh);
         if (d.conf < 0.08f) continue;
         if (cy > bottom_y) continue;
-        if (bw < 8.0f || bh < 8.0f) continue;
-        if (area < 200.0f) continue;
+        if (bw < min_side || bh < min_side) continue;
+        if (area < min_area) continue;
         if (area > max_area) continue;
         if (aspect < 0.10f || aspect > 10.0f) continue;
 
@@ -573,7 +581,7 @@ int main(int argc, char** argv) {
         double inf_ms = std::chrono::duration<double, std::milli>(t_inf1 - t_inf0).count();
         total_inf_ms += inf_ms;
 
-        Detections filtered = filter_and_pad(raw, frame_w, frame_h);
+        Detections filtered = filter_and_pad(raw, frame_w, frame_h, a.min_area, a.min_side);
 
         // ROI search fallback: gdy primary YOLO traci wszystkie targety LUB
         // jest drop_streak >= 1, a narrow ma last_good_center, robimy 2-gi
@@ -590,7 +598,7 @@ int main(int argc, char** argv) {
                                                    roi_min_size, roi_max_size);
                 if (roi.valid) {
                     Detections roi_dets = detect_in_roi(detector, frame, roi, roi_conf);
-                    Detections roi_filtered = filter_and_pad(roi_dets, frame_w, frame_h);
+                    Detections roi_filtered = filter_and_pad(roi_dets, frame_w, frame_h, a.min_area, a.min_side);
                     if (!roi_filtered.empty()) {
                         Detections merged = merge_detection_lists(filtered, roi_filtered,
                                                                    roi_merge_iou, roi_merge_center_px);

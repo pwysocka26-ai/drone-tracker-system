@@ -45,21 +45,25 @@ struct CliArgs {
     // Backward-compat: tylko --video -> narrow generowany jako virtual crop wide.
     std::string video_wide;     // empty = use --video
     std::string video_narrow;   // empty = use virtual crop z wide
-    // Default: v4 yolov8s @ imgsz=640 FP16 (milestone 2026-04-26).
-    // Empiryczny dowod (full 8800 klatek): 87.1% LOCKED (vs v3 41%), 5 lock_loss
-    // (vs v3 43), 36.7 ms inference (vs v3 160 ms = 4.4x szybsze).
-    // Patrz memory/project_v4_training_results.md.
-    std::string model = "../../../data/weights/v4_best_fp16_imgsz640.onnx";
+    // Default: v5 yolov8m @ imgsz=1280 FP16 (milestone 2026-04-29 small-drone).
+    // A/B vs v4@640 (full 25000 klatek video_test_wide.mp4):
+    //   LOCKED   24.8% -> 95.1% (+70.3 pp)
+    //   lock_loss   406 -> 2    (200x lepiej)
+    //   reacq succ  5.4% -> 50%
+    //   inference   -    -> 26.1 ms (37 fps na DirectML iGPU Radeon 8060S)
+    // v4 fallback: --model data/weights/v4_best_fp16_imgsz640.onnx --imgsz 640
+    //              --min-area 200 --min-side 8.
+    std::string model = "../../../data/weights/v5_best_fp16_imgsz1280.onnx";
     std::string out_dir = "../../../artifacts/runs";
     bool gui = true;
     bool record = true;
-    int imgsz = 640;
+    int imgsz = 1280;
     float conf = 0.20f;
-    // Min bbox area (px^2) post-NMS, pre-MTT. Default 200 (~14x14) historycznie
-    // odrzuca noise dla v4@640. v5@1280 lapie drony 5-15 px (area 25-225 px^2)
-    // -- wymaga --min-area 25 + --min-side 4 zeby maly drone signal przeszedl.
-    float min_area = 200.0f;
-    float min_side = 8.0f;  // min bw/bh w px; razem z min_area filtruje noise.
+    // Min bbox area (px^2) / side (px) post-NMS, pre-MTT. Defaults 25 / 4
+    // dopuszczaja drony 5-15 px (area 25-225 px^2) -- niezbedne dla v5@1280.
+    // Dla v4@640: 200 / 8 (legacy threshold).
+    float min_area = 25.0f;
+    float min_side = 4.0f;
     int max_frames = -1;
     bool use_directml = true;
 };

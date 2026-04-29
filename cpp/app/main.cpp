@@ -22,6 +22,7 @@
 #include <opencv2/videoio.hpp>
 
 #include "dtracker/angular.hpp"
+#include "dtracker/gimbal_source.hpp"
 #include "dtracker/dashboard.hpp"
 #include "dtracker/inference.hpp"
 #include "dtracker/io/file_frame_source.hpp"
@@ -74,6 +75,8 @@ struct CliArgs {
     float fov_h_deg = 0.0f;
     float axis_az_mrad = 0.0f;
     float axis_el_mrad = 0.0f;
+    // Per-frame gimbal source (CSV). Priorytet: --gimbal-csv > --fov-h-deg/--axis-* > OFF.
+    std::string gimbal_csv;
 };
 
 static CliArgs parse_args(int argc, char** argv) {
@@ -104,6 +107,7 @@ static CliArgs parse_args(int argc, char** argv) {
         if (take_float("--fov-h-deg", a.fov_h_deg)) continue;
         if (take_float("--axis-az-mrad", a.axis_az_mrad)) continue;
         if (take_float("--axis-el-mrad", a.axis_el_mrad)) continue;
+        if (take("--gimbal-csv", a.gimbal_csv)) continue;
         if (take_int("--max-frames", a.max_frames)) continue;
         if (s == "--no-gui") { a.gui = false; continue; }
         if (s == "--no-record") { a.record = false; continue; }
@@ -111,7 +115,7 @@ static CliArgs parse_args(int argc, char** argv) {
         if (s == "-h" || s == "--help") {
             std::cout << "Usage: dtracker_main [--video PATH] [--model PATH] [--out-dir PATH]"
                       << " [--imgsz N] [--conf F] [--min-area F] [--min-side F]"
-                      << " [--fov-h-deg F] [--axis-az-mrad F] [--axis-el-mrad F]"
+                      << " [--fov-h-deg F] [--axis-az-mrad F] [--axis-el-mrad F] [--gimbal-csv PATH]"
                       << " [--max-frames N] [--no-gui] [--no-record] [--cpu]\n";
             std::exit(0);
         }
@@ -500,6 +504,22 @@ int main(int argc, char** argv) {
     YoloOnnxDetector detector(ycfg);
     std::cout << " OK\n";
 
+    // Gimbal source: CSV per-frame (priorytet) lub statyczne args.
+    std::optional<GimbalCsvSource> gimbal_csv_source;
+    if (!a.gimbal_csv.empty()) {
+        try {
+            gimbal_csv_source.emplace(a.gimbal_csv);
+            std::cout << "Gimbal CSV: " << a.gimbal_csv << " ("
+                      << gimbal_csv_source->size() << " entries)\n";
+        } catch (const std::exception& e) {
+            std::cerr << "FATAL: gimbal CSV load failed: " << e.what() << "\n";
+            return 1;
+        }
+    } else if (a.fov_h_deg > 0.0f) {
+        std::cout << "Gimbal STATIC: fov_h=" << a.fov_h_deg << " deg, axis_az="
+                  << a.axis_az_mrad << " mrad, axis_el=" << a.axis_el_mrad << " mrad\n";
+    }
+
     MTTConfig mtt_cfg;
     mtt_cfg.max_missed_frames = 36;
     mtt_cfg.confirm_hits = 2;
@@ -736,21 +756,30 @@ int main(int argc, char** argv) {
         rec.selected_id = sel;
         rec.persistent_owner_id = tm.persistent_owner_id();    // Fix 2
         if (owner) rec.active_track = owner->clone();
-        // Angular target position (faza B): gimbal aktywny + mamy ownera.
-        if (a.fov_h_deg > 0.0f && owner) {
-            GimbalSnapshot g;
-            g.fov_h_rad = deg_to_rad(a.fov_h_deg);
-            g.fov_v_rad = fov_v_from_h(g.fov_h_rad, frame_w, frame_h);
-            g.axis_az_mrad = a.axis_az_mrad;
-            g.axis_el_mrad = a.axis_el_mrad;
-            float cx = 0.5f * (owner->bbox.x1 + owner->bbox.x2);
-            float cy = 0.5f * (owner->bbox.y1 + owner->bbox.y2);
-            AngularOffset ao = pixel_to_angular(cx, cy, frame_w, frame_h, g);
-            rec.target_delta_az_mrad = ao.delta_az_mrad;
-            rec.target_delta_el_mrad = ao.delta_el_mrad;
-            rec.target_az_mrad = ao.target_az_mrad;
-            rec.target_el_mrad = ao.target_el_mrad;
-            rec.target_angular_dist_mrad = ao.theta_mrad;
+        // Angular target position (faza B+C): gimbal aktywny + mamy ownera.
+        // Source priority: CSV per-frame > static args > OFF.
+        if (owner) {
+            std::optional<GimbalSnapshot> g;
+            if (gimbal_csv_source) {
+                g = gimbal_csv_source->lookup(frame_idx, frame_w, frame_h);
+            } else if (a.fov_h_deg > 0.0f) {
+                GimbalSnapshot s;
+                s.fov_h_rad = deg_to_rad(a.fov_h_deg);
+                s.fov_v_rad = fov_v_from_h(s.fov_h_rad, frame_w, frame_h);
+                s.axis_az_mrad = a.axis_az_mrad;
+                s.axis_el_mrad = a.axis_el_mrad;
+                g = s;
+            }
+            if (g) {
+                float cx = 0.5f * (owner->bbox.x1 + owner->bbox.x2);
+                float cy = 0.5f * (owner->bbox.y1 + owner->bbox.y2);
+                AngularOffset ao = pixel_to_angular(cx, cy, frame_w, frame_h, *g);
+                rec.target_delta_az_mrad = ao.delta_az_mrad;
+                rec.target_delta_el_mrad = ao.delta_el_mrad;
+                rec.target_az_mrad = ao.target_az_mrad;
+                rec.target_el_mrad = ao.target_el_mrad;
+                rec.target_angular_dist_mrad = ao.theta_mrad;
+            }
         }
         rec.lock_state = lock_state;
         rec.multi_tracks.reserve(tracks.size());

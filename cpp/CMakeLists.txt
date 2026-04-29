@@ -160,6 +160,7 @@ add_executable(dtracker_tests
     tests/test_narrow_tracker.cpp
     tests/test_io_hal.cpp
     tests/test_angular.cpp
+    tests/test_gimbal_source.cpp
 )
 target_include_directories(dtracker_tests PRIVATE tests)
 target_link_libraries(dtracker_tests PRIVATE dtracker_lib)

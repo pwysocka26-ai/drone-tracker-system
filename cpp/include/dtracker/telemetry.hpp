@@ -47,6 +47,13 @@ struct FrameTelemetry {
     int   cmc_inliers = 0;
     double inference_ms = 0.0;
     double tracker_ms = 0.0;
+    // Angular target position (faza B: integracja z gimbal encoder data).
+    // Wszystkie obecne tylko gdy gimbal aktywny (--fov-h-deg > 0) AND mamy ownera.
+    std::optional<float> target_delta_az_mrad;   // offset target od osi (+ na prawo)
+    std::optional<float> target_delta_el_mrad;   // offset target od osi (+ na gore)
+    std::optional<float> target_az_mrad;         // absolutny azymut (axis + delta)
+    std::optional<float> target_el_mrad;         // absolutny elewacja
+    std::optional<float> target_angular_dist_mrad;  // theta — sumaryczna odleglosc katowa od osi
 };
 
 class TelemetryWriter {

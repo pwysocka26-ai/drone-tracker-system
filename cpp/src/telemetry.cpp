@@ -76,6 +76,16 @@ void TelemetryWriter::write(const FrameTelemetry& r) {
     ofs_ << ",\"center_lock\":" << (r.center_lock ? "true" : "false");
     ofs_ << ",\"inference_ms\":" << r.inference_ms;
     ofs_ << ",\"tracker_ms\":" << r.tracker_ms;
+    // Angular target position (only present when gimbal active + owner exists)
+    auto write_opt_float = [&](const char* key, const std::optional<float>& v) {
+        ofs_ << ",\"" << key << "\":";
+        if (v) ofs_ << *v; else ofs_ << "null";
+    };
+    write_opt_float("target_delta_az_mrad", r.target_delta_az_mrad);
+    write_opt_float("target_delta_el_mrad", r.target_delta_el_mrad);
+    write_opt_float("target_az_mrad", r.target_az_mrad);
+    write_opt_float("target_el_mrad", r.target_el_mrad);
+    write_opt_float("target_angular_dist_mrad", r.target_angular_dist_mrad);
     // full tracks array (opcjonalnie, moze dazyc JSON)
     ofs_ << ",\"tracks\":[";
     for (size_t i = 0; i < r.multi_tracks.size(); ++i) {

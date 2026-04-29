@@ -21,6 +21,7 @@
 #include <opencv2/imgproc.hpp>
 #include <opencv2/videoio.hpp>
 
+#include "dtracker/angular.hpp"
 #include "dtracker/dashboard.hpp"
 #include "dtracker/inference.hpp"
 #include "dtracker/io/file_frame_source.hpp"
@@ -66,6 +67,13 @@ struct CliArgs {
     float min_side = 4.0f;
     int max_frames = -1;
     bool use_directml = true;
+    // Gimbal data (faza B: angular target position w telemetry).
+    // fov_h_deg=0 (default) -> angular calc OFF. fov_h_deg>0 -> ON, wymaga
+    // axis_az_mrad + axis_el_mrad (z encoderow glowicy). fov_v wyliczany
+    // automatycznie z aspect ratio (square pixels assumption).
+    float fov_h_deg = 0.0f;
+    float axis_az_mrad = 0.0f;
+    float axis_el_mrad = 0.0f;
 };
 
 static CliArgs parse_args(int argc, char** argv) {
@@ -93,13 +101,18 @@ static CliArgs parse_args(int argc, char** argv) {
         if (take_float("--conf", a.conf)) continue;
         if (take_float("--min-area", a.min_area)) continue;
         if (take_float("--min-side", a.min_side)) continue;
+        if (take_float("--fov-h-deg", a.fov_h_deg)) continue;
+        if (take_float("--axis-az-mrad", a.axis_az_mrad)) continue;
+        if (take_float("--axis-el-mrad", a.axis_el_mrad)) continue;
         if (take_int("--max-frames", a.max_frames)) continue;
         if (s == "--no-gui") { a.gui = false; continue; }
         if (s == "--no-record") { a.record = false; continue; }
         if (s == "--cpu") { a.use_directml = false; continue; }
         if (s == "-h" || s == "--help") {
             std::cout << "Usage: dtracker_main [--video PATH] [--model PATH] [--out-dir PATH]"
-                      << " [--imgsz N] [--conf F] [--min-area F] [--min-side F] [--max-frames N] [--no-gui] [--no-record] [--cpu]\n";
+                      << " [--imgsz N] [--conf F] [--min-area F] [--min-side F]"
+                      << " [--fov-h-deg F] [--axis-az-mrad F] [--axis-el-mrad F]"
+                      << " [--max-frames N] [--no-gui] [--no-record] [--cpu]\n";
             std::exit(0);
         }
     }
@@ -723,6 +736,22 @@ int main(int argc, char** argv) {
         rec.selected_id = sel;
         rec.persistent_owner_id = tm.persistent_owner_id();    // Fix 2
         if (owner) rec.active_track = owner->clone();
+        // Angular target position (faza B): gimbal aktywny + mamy ownera.
+        if (a.fov_h_deg > 0.0f && owner) {
+            GimbalSnapshot g;
+            g.fov_h_rad = deg_to_rad(a.fov_h_deg);
+            g.fov_v_rad = fov_v_from_h(g.fov_h_rad, frame_w, frame_h);
+            g.axis_az_mrad = a.axis_az_mrad;
+            g.axis_el_mrad = a.axis_el_mrad;
+            float cx = 0.5f * (owner->bbox.x1 + owner->bbox.x2);
+            float cy = 0.5f * (owner->bbox.y1 + owner->bbox.y2);
+            AngularOffset ao = pixel_to_angular(cx, cy, frame_w, frame_h, g);
+            rec.target_delta_az_mrad = ao.delta_az_mrad;
+            rec.target_delta_el_mrad = ao.delta_el_mrad;
+            rec.target_az_mrad = ao.target_az_mrad;
+            rec.target_el_mrad = ao.target_el_mrad;
+            rec.target_angular_dist_mrad = ao.theta_mrad;
+        }
         rec.lock_state = lock_state;
         rec.multi_tracks.reserve(tracks.size());
         for (const auto& t : tracks) rec.multi_tracks.push_back(t.clone());

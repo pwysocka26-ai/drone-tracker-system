@@ -81,7 +81,8 @@ int Dashboard::render(const cv::Mat& frame_bgr,
                        int selected_id,
                        LockState lock_state,
                        const NarrowState& narrow_state,
-                       const BBox& narrow_crop) {
+                       const BBox& narrow_crop,
+                       const std::optional<AngularOffset>& angular) {
     if (!cfg_.show_gui) return -1;
     if (frame_bgr.empty()) return -1;
 
@@ -141,6 +142,26 @@ int Dashboard::render(const cv::Mat& frame_bgr,
            << "  tracks=" << tracks.size();
     cv::putText(wide, status.str(), cv::Point(10, 30),
                 cv::FONT_HERSHEY_SIMPLEX, 0.7, color_for_state(lock_state), 2);
+
+    // Angular target position (gimbal opt-in) — prawy gorny rog.
+    if (angular) {
+        const int x0 = wide.cols - 290;
+        int y = 30;
+        const auto col = cv::Scalar(0, 255, 255);  // yellow
+        const auto fmt = [](float v) {
+            std::ostringstream os;
+            os << std::fixed << std::setprecision(2) << v;
+            return os.str();
+        };
+        cv::putText(wide, "AZ: " + fmt(angular->target_az_mrad) + " mrad  (d " + fmt(angular->delta_az_mrad) + ")",
+                    cv::Point(x0, y), cv::FONT_HERSHEY_SIMPLEX, 0.45, col, 1);
+        y += 18;
+        cv::putText(wide, "EL: " + fmt(angular->target_el_mrad) + " mrad  (d " + fmt(angular->delta_el_mrad) + ")",
+                    cv::Point(x0, y), cv::FONT_HERSHEY_SIMPLEX, 0.45, col, 1);
+        y += 18;
+        cv::putText(wide, "theta: " + fmt(angular->theta_mrad) + " mrad",
+                    cv::Point(x0, y), cv::FONT_HERSHEY_SIMPLEX, 0.45, col, 1);
+    }
 
     cv::imshow(cfg_.wide_title, wide);
 

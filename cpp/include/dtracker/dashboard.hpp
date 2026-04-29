@@ -2,8 +2,11 @@
 // Wykorzystuje cv::imshow. W production (Jetson bez GUI) wylaczone flagą.
 #pragma once
 
+#include <optional>
+
 #include <opencv2/core/mat.hpp>
 
+#include "dtracker/angular.hpp"
 #include "dtracker/lock_pipeline.hpp"
 #include "dtracker/narrow_tracker.hpp"
 #include "dtracker/track.hpp"
@@ -31,7 +34,8 @@ public:
                int selected_id,
                LockState lock_state,
                const NarrowState& narrow_state,
-               const BBox& narrow_crop);
+               const BBox& narrow_crop,
+               const std::optional<AngularOffset>& angular = std::nullopt);
 
 private:
     DashboardConfig cfg_;

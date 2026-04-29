@@ -380,7 +380,8 @@ static void draw_dashed_rect_local(cv::Mat& img, cv::Point p1, cv::Point p2,
 static cv::Mat draw_wide_overlays(const cv::Mat& frame, const std::vector<Track>& tracks,
                                    int sel_id, int persistent_id,
                                    LockState lock_state, const BBox& crop,
-                                   const NarrowState& nstate) {
+                                   const NarrowState& nstate,
+                                   const std::optional<AngularOffset>& angular = std::nullopt) {
     cv::Mat vis = frame.clone();
     cv::Scalar lock_color(0, 255, 0);
     if (lock_state == LockState::ACQUIRE)        lock_color = cv::Scalar(0, 200, 255);
@@ -442,6 +443,26 @@ static cv::Mat draw_wide_overlays(const cv::Mat& frame, const std::vector<Track>
     }
     cv::putText(vis, banner.str(), cv::Point(10, 30),
                 cv::FONT_HERSHEY_SIMPLEX, 0.7, lock_color, 2);
+
+    // Angular target position (parity z dashboard.cpp render)
+    if (angular) {
+        const int x0 = vis.cols - 290;
+        int y = 30;
+        const auto col = cv::Scalar(0, 255, 255);
+        const auto fmt = [](float v) {
+            std::ostringstream os;
+            os << std::fixed << std::setprecision(2) << v;
+            return os.str();
+        };
+        cv::putText(vis, "AZ: " + fmt(angular->target_az_mrad) + " mrad  (d " + fmt(angular->delta_az_mrad) + ")",
+                    cv::Point(x0, y), cv::FONT_HERSHEY_SIMPLEX, 0.45, col, 1);
+        y += 18;
+        cv::putText(vis, "EL: " + fmt(angular->target_el_mrad) + " mrad  (d " + fmt(angular->delta_el_mrad) + ")",
+                    cv::Point(x0, y), cv::FONT_HERSHEY_SIMPLEX, 0.45, col, 1);
+        y += 18;
+        cv::putText(vis, "theta: " + fmt(angular->theta_mrad) + " mrad",
+                    cv::Point(x0, y), cv::FONT_HERSHEY_SIMPLEX, 0.45, col, 1);
+    }
     return vis;
 }
 
@@ -742,22 +763,10 @@ int main(int argc, char** argv) {
             }
         }
 
-        // GUI render (cv::imshow + key)
-        int key = -1;
-        if (a.gui) {
-            key = dashboard.render(frame, tracks, sel_id, lock_state,
-                                    narrow.state(), crop);
-        }
-
-        // Telemetry (Track is move-only -> clone)
-        FrameTelemetry rec;
-        rec.frame_idx = frame_idx;
-        rec.time_s = static_cast<double>(frame_idx) / fps;
-        rec.selected_id = sel;
-        rec.persistent_owner_id = tm.persistent_owner_id();    // Fix 2
-        if (owner) rec.active_track = owner->clone();
         // Angular target position (faza B+C): gimbal aktywny + mamy ownera.
         // Source priority: CSV per-frame > static args > OFF.
+        // Liczymy PRZED render zeby przekazac do dashboard overlay (faza D).
+        std::optional<AngularOffset> angular_offset;
         if (owner) {
             std::optional<GimbalSnapshot> g;
             if (gimbal_csv_source) {
@@ -773,13 +782,30 @@ int main(int argc, char** argv) {
             if (g) {
                 float cx = 0.5f * (owner->bbox.x1 + owner->bbox.x2);
                 float cy = 0.5f * (owner->bbox.y1 + owner->bbox.y2);
-                AngularOffset ao = pixel_to_angular(cx, cy, frame_w, frame_h, *g);
-                rec.target_delta_az_mrad = ao.delta_az_mrad;
-                rec.target_delta_el_mrad = ao.delta_el_mrad;
-                rec.target_az_mrad = ao.target_az_mrad;
-                rec.target_el_mrad = ao.target_el_mrad;
-                rec.target_angular_dist_mrad = ao.theta_mrad;
+                angular_offset = pixel_to_angular(cx, cy, frame_w, frame_h, *g);
             }
+        }
+
+        // GUI render (cv::imshow + key)
+        int key = -1;
+        if (a.gui) {
+            key = dashboard.render(frame, tracks, sel_id, lock_state,
+                                    narrow.state(), crop, angular_offset);
+        }
+
+        // Telemetry (Track is move-only -> clone)
+        FrameTelemetry rec;
+        rec.frame_idx = frame_idx;
+        rec.time_s = static_cast<double>(frame_idx) / fps;
+        rec.selected_id = sel;
+        rec.persistent_owner_id = tm.persistent_owner_id();    // Fix 2
+        if (owner) rec.active_track = owner->clone();
+        if (angular_offset) {
+            rec.target_delta_az_mrad = angular_offset->delta_az_mrad;
+            rec.target_delta_el_mrad = angular_offset->delta_el_mrad;
+            rec.target_az_mrad = angular_offset->target_az_mrad;
+            rec.target_el_mrad = angular_offset->target_el_mrad;
+            rec.target_angular_dist_mrad = angular_offset->theta_mrad;
         }
         rec.lock_state = lock_state;
         rec.multi_tracks.reserve(tracks.size());
@@ -812,7 +838,8 @@ int main(int argc, char** argv) {
         if (video_writer.isOpened() && recording_active) {
             cv::Mat wide_vis = draw_wide_overlays(frame, tracks, sel_id,
                                                     tm.persistent_owner_id(),
-                                                    lock_state, crop, narrow.state());
+                                                    lock_state, crop, narrow.state(),
+                                                    angular_offset);
             cv::Mat narrow_vis;
             if (dual_camera_mode) {
                 // Phase 3: narrow = physical stream z osobnej kamery (np. PTZ

@@ -1,0 +1,5 @@
+path: ../v6
+train: images/train
+val: images/val
+nc: 3
+names: ['dron_maly', 'dron_duzy', 'pilka']

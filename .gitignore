@@ -106,6 +106,9 @@ training/v4/review/
 training/v5/images/
 training/v5/labels/
 training/v5/review/
+training/v6/images/
+training/v6/labels/
+training/v6/review/
 
 # model weights (pulled from Drive, reproducible)
 *.pt

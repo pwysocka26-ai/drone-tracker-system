@@ -23,6 +23,9 @@ ZOOM_CROP_W = 600
 ZOOM_CROP_H = 450
 
 
+CLASS_NAMES = {0: "dron_maly", 1: "dron_duzy", 2: "pilka"}
+
+
 def select_initial_bbox(frame):
     h, w = frame.shape[:2]
     if w > MAX_DISPLAY_W:
@@ -109,16 +112,18 @@ def write_positive(frame, bbox, img_dir, lbl_dir, review_dir,
 
     img_path = Path(img_dir) / f"{name}.jpg"
     lbl_path = Path(lbl_dir) / f"{name}.txt"
-    cv2.imwrite(str(img_path), frame, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+    # Multi-class: kolejna sesja labellingu (np. piłka po dronie) trafia
+    # na ten sam frame — nie nadpisujemy JPG, append do labels.
+    if not img_path.exists():
+        cv2.imwrite(str(img_path), frame, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
 
     cx_n = (x + w / 2) / fw
     cy_n = (y + h / 2) / fh
     w_n = w / fw
     h_n = h / fh
-    lbl_path.write_text(
-        f"{class_id} {cx_n:.6f} {cy_n:.6f} {w_n:.6f} {h_n:.6f}\n",
-        encoding="utf-8",
-    )
+    line = f"{class_id} {cx_n:.6f} {cy_n:.6f} {w_n:.6f} {h_n:.6f}\n"
+    with open(lbl_path, "a", encoding="utf-8") as f:
+        f.write(line)
 
     if save_review:
         pad = max(w, h) // 2
@@ -129,7 +134,8 @@ def write_positive(frame, bbox, img_dir, lbl_dir, review_dir,
         crop = frame[ry1:ry2, rx1:rx2].copy()
         cv2.rectangle(crop, (x - rx1, y - ry1),
                       (x - rx1 + w, y - ry1 + h), (0, 255, 0), 2)
-        cv2.imwrite(str(Path(review_dir) / f"{name}.jpg"), crop,
+        cls_suffix = CLASS_NAMES.get(class_id, f"id{class_id}")
+        cv2.imwrite(str(Path(review_dir) / f"{name}_{cls_suffix}.jpg"), crop,
                     [int(cv2.IMWRITE_JPEG_QUALITY), 85])
     return True
 
@@ -152,7 +158,9 @@ def run(video: str, video_tag: str,
     fh, fw = frame.shape[:2]
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     fps = cap.get(cv2.CAP_PROP_FPS)
+    cls_name = CLASS_NAMES.get(class_id, f"id={class_id}")
     print(f"{video}: {total} frames, {fps:.1f} fps, {fw}x{fh}  start_frame={start_frame}")
+    print(f"CLASS: {cls_name} (id={class_id})  tag={video_tag}")
 
     bbox0 = select_initial_bbox(frame)
     if bbox0 is None:
@@ -206,8 +214,9 @@ def run(video: str, video_tag: str,
 
         if show_live:
             preview = frame.copy()
-            cv2.rectangle(preview, (x, y), (x + w, y + h), (0, 255, 0), 3)
-            cv2.putText(preview, f"f={frame_idx}  saved={n_saved}  lost={n_lost}",
+            color = {0: (255, 128, 0), 1: (0, 0, 255), 2: (0, 255, 0)}.get(class_id, (0, 255, 0))
+            cv2.rectangle(preview, (x, y), (x + w, y + h), color, 3)
+            cv2.putText(preview, f"{cls_name}  f={frame_idx}  saved={n_saved}  lost={n_lost}",
                         (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2)
             preview = cv2.resize(preview, (960, int(960 * fh / fw)))
             cv2.imshow("csrt live", preview)
@@ -228,11 +237,13 @@ def run(video: str, video_tag: str,
 if __name__ == "__main__":
     video = sys.argv[1]
     tag = sys.argv[2]
-    img_dir = sys.argv[3] if len(sys.argv) > 3 else "training/v2/images/train"
-    lbl_dir = sys.argv[4] if len(sys.argv) > 4 else "training/v2/labels/train"
-    review_dir = sys.argv[5] if len(sys.argv) > 5 else "training/v2/review"
+    img_dir = sys.argv[3] if len(sys.argv) > 3 else "training/v6/images/train"
+    lbl_dir = sys.argv[4] if len(sys.argv) > 4 else "training/v6/labels/train"
+    review_dir = sys.argv[5] if len(sys.argv) > 5 else "training/v6/review"
     step = int(sys.argv[6]) if len(sys.argv) > 6 else 10
     start_frame = int(sys.argv[7]) if len(sys.argv) > 7 else 0
     end_frame = int(sys.argv[8]) if len(sys.argv) > 8 else 0
+    class_id = int(sys.argv[9]) if len(sys.argv) > 9 else 0
     run(video, tag, img_dir, lbl_dir, review_dir, step=step,
+        class_id=class_id,
         start_frame=start_frame, end_frame=end_frame)

@@ -30,6 +30,9 @@ scripts/
 !tools/compare_telemetry.py
 !tools/bench_cpu_vs_dml.py
 !tools/_synth_camera_motion.py
+!tools/v5_prelabel.py
+!tools/v6_review.py
+!tools/_audit_v6_smoke.py
 
 # backupy
 *.bak

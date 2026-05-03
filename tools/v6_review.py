@@ -34,7 +34,7 @@ PORUSZANIE PO KLATKACH I MODYFIKACJE:
     x           delete wybrany (lub wszystkie) bbox
     X           delete cala klatke (.jpg + .txt)
     a           tryb add bbox
-    q           quit (auto-save)
+    Esc         quit (auto-save) — Q nie quit-uje, zbyt blisko a/1 w QWERTY
 """
 import json
 import sys
@@ -708,7 +708,7 @@ class App:
             return False
 
         # navigate
-        if k == ord("q"):
+        if k == 27:  # Esc — quit (Q usuniete bo zbyt blisko a/1, accidentalne quit-y)
             return "quit"
         if k == ord("n") or k == ord(" "):
             return "next"

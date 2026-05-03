@@ -814,8 +814,27 @@ class App:
                     self.idx = len(self.frames) - 1
         self.shutdown()
 
+    def _ensure_window(self):
+        """Recreate okna gdy user zamknal je przez X / Alt+F4.
+        cv2.waitKey nie reaguje na window close — bez recreate proces robi
+        spinning loop na nieistniejacym oknie. Save per-frame chroni roboty,
+        ale UX wymaga zywego okna."""
+        try:
+            visible = cv2.getWindowProperty(self.win, cv2.WND_PROP_VISIBLE)
+        except cv2.error:
+            visible = 0
+        if visible < 1:
+            try:
+                cv2.destroyWindow(self.win)
+            except cv2.error:
+                pass
+            cv2.namedWindow(self.win)
+            cv2.setMouseCallback(self.win, self._on_mouse)
+            print("[info] window recreated po close")
+
     def _frame_loop(self):
         while True:
+            self._ensure_window()
             disp = self.render()
             cv2.imshow(self.win, disp)
             k = cv2.waitKey(20) & 0xFF

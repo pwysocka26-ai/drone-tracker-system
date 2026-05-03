@@ -231,6 +231,7 @@ class App:
         self.pan_start_disp = None
         self.pan_origin_cxcy = None
         self.hover = ""
+        self.mouse_xy = None  # display-coord, dla crosshair overlay w draw mode
 
         self.win = "v6 review"
         cv2.namedWindow(self.win)
@@ -488,6 +489,18 @@ class App:
         cv2.putText(disp, mode_str, (8, self.disp_h - 8),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, mode_color, 1)
 
+        # Crosshair overlay w trybach rysowania — czarny, widoczny na chmurach.
+        # Mapsy z luka 6 px wokol kursora zeby nie zaslaniac docelowego piksela.
+        if self.mode in ("draw_pending", "drawing") and self.mouse_xy is not None:
+            mx, my = self.mouse_xy
+            canvas_h = self.disp_h - bar_h
+            if 0 <= mx < self.disp_w and 0 <= my < canvas_h:
+                gap = 6
+                cv2.line(disp, (0, my), (mx - gap, my), (0, 0, 0), 1)
+                cv2.line(disp, (mx + gap, my), (self.disp_w, my), (0, 0, 0), 1)
+                cv2.line(disp, (mx, 0), (mx, my - gap), (0, 0, 0), 1)
+                cv2.line(disp, (mx, my + gap), (mx, canvas_h), (0, 0, 0), 1)
+
         return disp
 
     # ---------- helpers ----------
@@ -541,6 +554,7 @@ class App:
 
     def _on_mouse(self, event, x, y, flags, param):
         fx, fy = self.disp_to_frame(x, y)
+        self.mouse_xy = (x, y)
 
         # wheel zoom dziala zawsze
         if event == cv2.EVENT_MOUSEWHEEL:

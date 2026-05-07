@@ -113,8 +113,55 @@ int Dashboard::render(const cv::Mat& frame_bgr,
             thickness = is_kalman_drift ? 1 : 2;
         }
 
-        cv::Point p1(static_cast<int>(t.bbox.x1), static_cast<int>(t.bbox.y1));
-        cv::Point p2(static_cast<int>(t.bbox.x2), static_cast<int>(t.bbox.y2));
+        // Predictive bbox: kompensuje inference latency (~26 ms) przez extrapolację
+        // pozycji. Używamy INSTANTANEOUS velocity (1-frame delta z last_centers_)
+        // zamiast Kalman vel (która laguje przy szybkim ruchu/acceleracji).
+        // Sign-flip detection na Kalman vel (mniej noise) — gdy direction change
+        // → lookahead=0.
+        double lookahead = (is_owner || (!is_kalman_drift && !is_unconfirmed)) ? 1.0 : 0.0;
+        // Centrum bbox (potrzebne do inst_vel + zachowania w mapach)
+        const double cx_now = (t.bbox.x1 + t.bbox.x2) * 0.5;
+        const double cy_now = (t.bbox.y1 + t.bbox.y2) * 0.5;
+        // Sign flip clamp (na Kalman vel)
+        if (lookahead > 0.0) {
+            auto it = last_velocities_.find(t.track_id);
+            if (it != last_velocities_.end()) {
+                const auto& prev = it->second;
+                const bool flip_x = (prev.x * t.velocity.x < 0.0) &&
+                                    (std::abs(prev.x) > 1.0) && (std::abs(t.velocity.x) > 1.0);
+                const bool flip_y = (prev.y * t.velocity.y < 0.0) &&
+                                    (std::abs(prev.y) > 1.0) && (std::abs(t.velocity.y) > 1.0);
+                if (flip_x || flip_y) {
+                    lookahead = 0.0;  // Direction change — nie predykuj
+                }
+            }
+        }
+        // Instantaneous velocity (fresh, mniej laggy niż Kalman vel).
+        // Fallback: Kalman vel jeśli brak last_center.
+        double vel_x = t.velocity.x;
+        double vel_y = t.velocity.y;
+        {
+            auto it = last_centers_.find(t.track_id);
+            if (it != last_centers_.end()) {
+                const double inst_vx = cx_now - it->second.x;
+                const double inst_vy = cy_now - it->second.y;
+                // Clip outliers (noisy detection bbox jitter) — clamp do +/- 30 px/frame
+                vel_x = std::max(-30.0, std::min(30.0, inst_vx));
+                vel_y = std::max(-30.0, std::min(30.0, inst_vy));
+            }
+        }
+        const double dx = vel_x * lookahead;
+        const double dy = vel_y * lookahead;
+        // Visual padding (matches Python parse_tracks): YOLO wycina korpus drona,
+        // propellery + drobny motion wystają poza bbox. 15% horizontal, 20% vertical.
+        const double bbox_w = t.bbox.x2 - t.bbox.x1;
+        const double bbox_h = t.bbox.y2 - t.bbox.y1;
+        const double pad_w = bbox_w * 0.15;
+        const double pad_h = bbox_h * 0.20;
+        cv::Point p1(static_cast<int>(t.bbox.x1 - pad_w + dx),
+                     static_cast<int>(t.bbox.y1 - pad_h + dy));
+        cv::Point p2(static_cast<int>(t.bbox.x2 + pad_w + dx),
+                     static_cast<int>(t.bbox.y2 + pad_h + dy));
         if (is_kalman_drift) {
             draw_dashed_rect(wide, p1, p2, col, thickness);
         } else {
@@ -128,6 +175,22 @@ int Dashboard::render(const cv::Mat& frame_bgr,
         cv::putText(wide, ss.str(),
                     cv::Point(p1.x, p1.y - 6),
                     cv::FONT_HERSHEY_SIMPLEX, 0.5, col, 1);
+    }
+
+    // Zachowaj velocity (Kalman, do sign-flip) i center (do inst_vel) dla
+    // następnej klatki. Czyścimy entries dla zaginionych track_id.
+    {
+        std::unordered_map<int, Point2> next_vels;
+        std::unordered_map<int, Point2> next_centers;
+        next_vels.reserve(tracks.size());
+        next_centers.reserve(tracks.size());
+        for (const auto& t : tracks) {
+            next_vels[t.track_id] = t.velocity;
+            next_centers[t.track_id] = Point2{(t.bbox.x1 + t.bbox.x2) * 0.5,
+                                              (t.bbox.y1 + t.bbox.y2) * 0.5};
+        }
+        last_velocities_ = std::move(next_vels);
+        last_centers_ = std::move(next_centers);
     }
 
     // Narrow crop rectangle na wide

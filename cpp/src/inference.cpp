@@ -34,7 +34,9 @@ struct YoloOnnxDetector::Impl {
 YoloOnnxDetector::YoloOnnxDetector(const YoloConfig& cfg) : impl_(std::make_unique<Impl>()), cfg_(cfg) {
     auto& opts = impl_->session_options;
     opts.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
-    opts.SetIntraOpNumThreads(1);  // DirectML pcha rownolegle; CPU fallback uzyje intra
+    // SetIntraOpNumThreads(1) usuniete (eksperyment 2026-05-07) — Python bench
+    // pokazal 14ms bez tego ustawienia, C++ z =1 dawalo 26ms. DML moze potrzebowac
+    // wiecej watkow do CPU fallback ops (Resize/Softmax/post-processing).
 
     if (cfg_.use_directml) {
         // AMD iGPU (Radeon 8060S) albo Intel iGPU albo NVIDIA — DirectML agnostic.

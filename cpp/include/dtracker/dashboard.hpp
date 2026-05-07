@@ -3,6 +3,7 @@
 #pragma once
 
 #include <optional>
+#include <unordered_map>
 
 #include <opencv2/core/mat.hpp>
 
@@ -10,6 +11,7 @@
 #include "dtracker/lock_pipeline.hpp"
 #include "dtracker/narrow_tracker.hpp"
 #include "dtracker/track.hpp"
+#include "dtracker/types.hpp"
 
 namespace dtracker {
 
@@ -39,6 +41,14 @@ public:
 
 private:
     DashboardConfig cfg_;
+    // Last frame Kalman velocity per track_id — używane do wykrywania sign flip
+    // (direction change) → wtedy NIE predykujemy bbox bo Kalman vel jest stale.
+    std::unordered_map<int, Point2> last_velocities_;
+    // Last frame bbox center per track_id — używane do liczenia INSTANTANEOUS
+    // velocity (1-frame delta) która jest mniej laggy niż Kalman vel przy
+    // szybkim ruchu. Dla prediction używamy inst_vel (bardziej fresh), a sign-flip
+    // detection nadal Kalman vel (mniej noise).
+    std::unordered_map<int, Point2> last_centers_;
 };
 
 }  // namespace dtracker

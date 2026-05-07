@@ -3,13 +3,15 @@ video:
   source: artifacts/test_videos/video_test_wide_short.mp4
   record_on_start: true
 yolo:
-  model: data/weights/best.pt   # v3 custom drone model (yolov8m, imgsz=960, mAP@0.5=0.956)
+  model: data/weights/v7_best.pt   # v7 combined v5+v6 (yolov8m, imgsz=1280, mAP@0.5=0.969, multi-class)
   backend: track
   tracker: config/bytetrack_fast_acquire.yaml
   conf: 0.20
-  imgsz: 960
+  imgsz: 1280
   classes:
-  - 0   # drone (single-class custom model)
+  - 0   # dron_maly
+  - 1   # dron_duzy
+  - 2   # pilka
   inference_every: 2
   search_fallback: false   # wyłączone — search_fallback podwaja inference cost
   search_conf: 0.07

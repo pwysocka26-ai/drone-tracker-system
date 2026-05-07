@@ -751,7 +751,13 @@ def run_app(config):
     effective_tracker_cfg['degraded_switch_persist'] = max(int(effective_tracker_cfg.get('degraded_switch_persist', 2)), 2)
     effective_tracker_cfg['healthy_switch_persist'] = max(int(effective_tracker_cfg.get('healthy_switch_persist', 4)), 4)
 
-    model = YOLO(model_name)
+    # Use PyOrtYOLO (custom ORT+DirectML wrapper) dla .onnx — daje 15ms inference
+    # zamiast 400ms ultralytics (CPU EP fallback). For .pt zostawiamy ultralytics.
+    if str(model_name).lower().endswith('.onnx'):
+        from core.py_ort_yolo import PyOrtYOLO
+        model = PyOrtYOLO(model_name, imgsz=imgsz, default_conf=conf)
+    else:
+        model = YOLO(model_name)
     cap = cv2.VideoCapture(source)
     if not cap.isOpened():
         print(f'Nie moge otworzyc pliku: {source}')

@@ -3,7 +3,7 @@ video:
   source: artifacts/test_videos/video_test_wide_short.mp4
   record_on_start: true
 yolo:
-  model: data/weights/v7_best.pt   # v7 combined v5+v6 (yolov8m, imgsz=1280, mAP@0.5=0.969, multi-class)
+  model: data/weights/v7_best_fp16_imgsz1280.onnx   # v7 ONNX FP16 — PyOrtYOLO (ORT 1.23 + DirectML iGPU, 15ms inference)
   backend: track
   tracker: config/bytetrack_fast_acquire.yaml
   conf: 0.20

@@ -1,9 +1,15 @@
 #include "dtracker/inference.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
+#include <memory>
+#include <mutex>
+#include <queue>
 #include <stdexcept>
+#include <thread>
 #include <vector>
 
 #include <dml_provider_factory.h>
@@ -18,6 +24,15 @@ static std::wstring widen(const std::string& s) {
     return std::wstring(s.begin(), s.end());
 }
 
+struct AsyncJob {
+    cv::Mat frame;       // owned copy (clone z caller'a)
+    cv::Mat blob;        // 4D NCHW float, alokowany w worker'ze
+    float scale = 1.0f;
+    int pad_x = 0, pad_y = 0;
+    int orig_w = 0, orig_h = 0;
+    double preprocess_ms = 0.0;
+};
+
 struct YoloOnnxDetector::Impl {
     Ort::Env env{ORT_LOGGING_LEVEL_WARNING, "dtracker"};
     Ort::SessionOptions session_options;
@@ -29,6 +44,16 @@ struct YoloOnnxDetector::Impl {
     std::vector<std::string> output_names;
     std::vector<std::vector<int64_t>> input_shapes;  // cache z modelu
     std::vector<std::vector<int64_t>> output_shapes;
+
+    int imgsz_cached = 0;
+    std::thread worker;
+    std::atomic<bool> worker_run{false};
+    std::mutex q_mtx;
+    std::condition_variable q_cv;
+    std::queue<std::unique_ptr<AsyncJob>> in_q;
+    std::queue<std::unique_ptr<AsyncJob>> ready_q;
+
+    void worker_loop();
 };
 
 YoloOnnxDetector::YoloOnnxDetector(const YoloConfig& cfg) : impl_(std::make_unique<Impl>()), cfg_(cfg) {
@@ -65,9 +90,22 @@ YoloOnnxDetector::YoloOnnxDetector(const YoloConfig& cfg) : impl_(std::make_uniq
     if (impl_->input_names.empty() || impl_->output_names.empty()) {
         throw std::runtime_error("YoloOnnxDetector: model bez wejsc lub wyjsc");
     }
+
+    impl_->imgsz_cached = cfg_.imgsz;
+    impl_->worker_run.store(true);
+    impl_->worker = std::thread([impl = impl_.get()]{ impl->worker_loop(); });
 }
 
-YoloOnnxDetector::~YoloOnnxDetector() = default;
+YoloOnnxDetector::~YoloOnnxDetector() {
+    if (impl_) {
+        {
+            std::lock_guard<std::mutex> lk(impl_->q_mtx);
+            impl_->worker_run.store(false);
+        }
+        impl_->q_cv.notify_all();
+        if (impl_->worker.joinable()) impl_->worker.join();
+    }
+}
 
 // Preprocess: BGR -> letterbox pad -> RGB -> /255 -> CHW float32 (manual).
 // Korzystamy bezposrednio z blobFromImage: BGR uint8 + swapRB=true + scalefactor=1/255.
@@ -180,49 +218,164 @@ Detections YoloOnnxDetector::detect_with_conf(const cv::Mat& frame, float conf_o
     if (frame.empty()) return {};
     float conf = (conf_override > 0.0f) ? conf_override : cfg_.conf_threshold;
 
-    // Preprocess
+    using clk = std::chrono::high_resolution_clock;
+    auto t_start = clk::now();
+
     cv::Mat blob;
     float scale = 1.0f;
     int pad_x = 0, pad_y = 0;
     preprocess(frame, cfg_.imgsz, blob, scale, pad_x, pad_y);
+    auto t_pre = clk::now();
 
-    // Prep ORT input tensor (NCHW float32)
     std::array<int64_t, 4> input_shape{1, 3, cfg_.imgsz, cfg_.imgsz};
     size_t input_size = 1 * 3 * cfg_.imgsz * cfg_.imgsz;
     Ort::Value input_tensor = Ort::Value::CreateTensor<float>(
         impl_->memory_info, reinterpret_cast<float*>(blob.data), input_size,
         input_shape.data(), input_shape.size());
+    auto t_tensor = clk::now();
 
-    // Inference (timed)
     std::vector<const char*> in_names_c = {impl_->input_names[0].c_str()};
     std::vector<const char*> out_names_c = {impl_->output_names[0].c_str()};
-    auto t0 = std::chrono::high_resolution_clock::now();
     auto outputs = impl_->session->Run(Ort::RunOptions{nullptr}, in_names_c.data(),
                                         &input_tensor, 1, out_names_c.data(), 1);
-    auto t1 = std::chrono::high_resolution_clock::now();
-    last_inference_ms_ = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    auto t_run = clk::now();
+    last_inference_ms_ = std::chrono::duration<double, std::milli>(t_run - t_tensor).count();
 
-    // Decode
-    if (outputs.empty()) return {};
+    if (outputs.empty()) {
+        last_timings_ = StageTimings{};
+        last_timings_.preprocess_ms = std::chrono::duration<double, std::milli>(t_pre - t_start).count();
+        last_timings_.create_tensor_ms = std::chrono::duration<double, std::milli>(t_tensor - t_pre).count();
+        last_timings_.run_ms = last_inference_ms_;
+        last_timings_.total_ms = std::chrono::duration<double, std::milli>(t_run - t_start).count();
+        return {};
+    }
     auto shape = outputs[0].GetTensorTypeAndShapeInfo().GetShape();
     const float* data = outputs[0].GetTensorData<float>();
     Detections raw = decode_yolov8(data, shape, cfg_.imgsz, conf);
+    auto t_decode = clk::now();
 
-    // NMS
     Detections nmsed = nms(raw, cfg_.nms_iou_threshold);
+    auto t_nms = clk::now();
 
-    // Unproject bboxy do rozmiaru oryginalnej klatki (odwrocenie letterbox)
     for (auto& d : nmsed) {
         d.bbox.x1 = (d.bbox.x1 - pad_x) / scale;
         d.bbox.y1 = (d.bbox.y1 - pad_y) / scale;
         d.bbox.x2 = (d.bbox.x2 - pad_x) / scale;
         d.bbox.y2 = (d.bbox.y2 - pad_y) / scale;
-        // clamp do ramek
         d.bbox.x1 = std::max(0.0f, std::min(d.bbox.x1, static_cast<float>(frame.cols)));
         d.bbox.y1 = std::max(0.0f, std::min(d.bbox.y1, static_cast<float>(frame.rows)));
         d.bbox.x2 = std::max(0.0f, std::min(d.bbox.x2, static_cast<float>(frame.cols)));
         d.bbox.y2 = std::max(0.0f, std::min(d.bbox.y2, static_cast<float>(frame.rows)));
     }
+    auto t_unproj = clk::now();
+
+    last_timings_.preprocess_ms = std::chrono::duration<double, std::milli>(t_pre - t_start).count();
+    last_timings_.create_tensor_ms = std::chrono::duration<double, std::milli>(t_tensor - t_pre).count();
+    last_timings_.run_ms = last_inference_ms_;
+    last_timings_.decode_ms = std::chrono::duration<double, std::milli>(t_decode - t_run).count();
+    last_timings_.nms_ms = std::chrono::duration<double, std::milli>(t_nms - t_decode).count();
+    last_timings_.unproject_ms = std::chrono::duration<double, std::milli>(t_unproj - t_nms).count();
+    last_timings_.total_ms = std::chrono::duration<double, std::milli>(t_unproj - t_start).count();
+
+    return nmsed;
+}
+
+void YoloOnnxDetector::Impl::worker_loop() {
+    using clk = std::chrono::high_resolution_clock;
+    while (true) {
+        std::unique_ptr<AsyncJob> job;
+        {
+            std::unique_lock<std::mutex> lk(q_mtx);
+            q_cv.wait(lk, [&]{ return !worker_run.load() || !in_q.empty(); });
+            if (!worker_run.load() && in_q.empty()) return;
+            job = std::move(in_q.front());
+            in_q.pop();
+        }
+        auto t0 = clk::now();
+        preprocess(job->frame, imgsz_cached, job->blob, job->scale, job->pad_x, job->pad_y);
+        auto t1 = clk::now();
+        job->preprocess_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        {
+            std::lock_guard<std::mutex> lk(q_mtx);
+            ready_q.push(std::move(job));
+        }
+        q_cv.notify_all();
+    }
+}
+
+void YoloOnnxDetector::enqueue(const cv::Mat& frame) {
+    auto job = std::make_unique<AsyncJob>();
+    job->frame = frame.clone();
+    job->orig_w = frame.cols;
+    job->orig_h = frame.rows;
+    {
+        std::lock_guard<std::mutex> lk(impl_->q_mtx);
+        impl_->in_q.push(std::move(job));
+    }
+    impl_->q_cv.notify_all();
+}
+
+Detections YoloOnnxDetector::wait_get() {
+    using clk = std::chrono::high_resolution_clock;
+    auto t_call = clk::now();
+
+    std::unique_ptr<AsyncJob> job;
+    {
+        std::unique_lock<std::mutex> lk(impl_->q_mtx);
+        impl_->q_cv.wait(lk, [&]{ return !impl_->ready_q.empty(); });
+        job = std::move(impl_->ready_q.front());
+        impl_->ready_q.pop();
+    }
+    auto t_got = clk::now();
+
+    std::array<int64_t, 4> input_shape{1, 3, cfg_.imgsz, cfg_.imgsz};
+    size_t input_size = 1 * 3 * cfg_.imgsz * cfg_.imgsz;
+    Ort::Value input_tensor = Ort::Value::CreateTensor<float>(
+        impl_->memory_info, reinterpret_cast<float*>(job->blob.data), input_size,
+        input_shape.data(), input_shape.size());
+    auto t_tensor = clk::now();
+
+    std::vector<const char*> in_names_c = {impl_->input_names[0].c_str()};
+    std::vector<const char*> out_names_c = {impl_->output_names[0].c_str()};
+    auto outputs = impl_->session->Run(Ort::RunOptions{nullptr}, in_names_c.data(),
+                                        &input_tensor, 1, out_names_c.data(), 1);
+    auto t_run = clk::now();
+    last_inference_ms_ = std::chrono::duration<double, std::milli>(t_run - t_tensor).count();
+
+    last_timings_ = StageTimings{};
+    last_timings_.preprocess_ms = job->preprocess_ms;
+    last_timings_.create_tensor_ms = std::chrono::duration<double, std::milli>(t_tensor - t_got).count();
+    last_timings_.run_ms = last_inference_ms_;
+
+    if (outputs.empty()) {
+        last_timings_.total_ms = std::chrono::duration<double, std::milli>(t_run - t_call).count();
+        return {};
+    }
+
+    auto shape = outputs[0].GetTensorTypeAndShapeInfo().GetShape();
+    const float* data = outputs[0].GetTensorData<float>();
+    Detections raw = decode_yolov8(data, shape, cfg_.imgsz, cfg_.conf_threshold);
+    auto t_decode = clk::now();
+
+    Detections nmsed = nms(raw, cfg_.nms_iou_threshold);
+    auto t_nms = clk::now();
+
+    for (auto& d : nmsed) {
+        d.bbox.x1 = (d.bbox.x1 - job->pad_x) / job->scale;
+        d.bbox.y1 = (d.bbox.y1 - job->pad_y) / job->scale;
+        d.bbox.x2 = (d.bbox.x2 - job->pad_x) / job->scale;
+        d.bbox.y2 = (d.bbox.y2 - job->pad_y) / job->scale;
+        d.bbox.x1 = std::max(0.0f, std::min(d.bbox.x1, static_cast<float>(job->orig_w)));
+        d.bbox.y1 = std::max(0.0f, std::min(d.bbox.y1, static_cast<float>(job->orig_h)));
+        d.bbox.x2 = std::max(0.0f, std::min(d.bbox.x2, static_cast<float>(job->orig_w)));
+        d.bbox.y2 = std::max(0.0f, std::min(d.bbox.y2, static_cast<float>(job->orig_h)));
+    }
+    auto t_unproj = clk::now();
+
+    last_timings_.decode_ms = std::chrono::duration<double, std::milli>(t_decode - t_run).count();
+    last_timings_.nms_ms = std::chrono::duration<double, std::milli>(t_nms - t_decode).count();
+    last_timings_.unproject_ms = std::chrono::duration<double, std::milli>(t_unproj - t_nms).count();
+    last_timings_.total_ms = std::chrono::duration<double, std::milli>(t_unproj - t_call).count();
 
     return nmsed;
 }

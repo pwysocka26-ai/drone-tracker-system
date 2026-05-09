@@ -103,6 +103,9 @@ target_link_libraries(poc_inference PRIVATE dtracker_lib)
 add_executable(dtracker_main app/main.cpp)
 target_link_libraries(dtracker_main PRIVATE dtracker_lib)
 
+add_executable(bench_stages app/bench_stages.cpp)
+target_link_libraries(bench_stages PRIVATE dtracker_lib)
+
 # Windows: skopiuj ONNX Runtime DLL + OpenCV DLL do output dir kazdego exe.
 # Funkcja, zeby nie duplikowac.
 function(dtracker_copy_runtime_dlls _target)
@@ -148,6 +151,7 @@ endfunction()
 
 dtracker_copy_runtime_dlls(poc_inference)
 dtracker_copy_runtime_dlls(dtracker_main)
+dtracker_copy_runtime_dlls(bench_stages)
 
 # ======== Tests ========
 # Self-contained test runner (test_framework.hpp). Brak zewnetrznych deps.

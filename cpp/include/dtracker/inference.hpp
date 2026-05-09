@@ -12,6 +12,16 @@
 
 namespace dtracker {
 
+struct StageTimings {
+    double preprocess_ms = 0.0;
+    double create_tensor_ms = 0.0;
+    double run_ms = 0.0;
+    double decode_ms = 0.0;
+    double nms_ms = 0.0;
+    double unproject_ms = 0.0;
+    double total_ms = 0.0;
+};
+
 struct YoloConfig {
     std::string model_path;
     int imgsz = 640;
@@ -40,11 +50,24 @@ public:
     // Diagnostyka: czas ostatniego inference w ms.
     double last_inference_ms() const { return last_inference_ms_; }
 
+    // Per-stage timings ostatniego detect() (preprocess / run / decode / nms / ...).
+    StageTimings last_stage_timings() const { return last_timings_; }
+
+    // ====== Async pipeline ======
+    // Producer (worker) thread robi preprocess; main thread robi DML run + decode.
+    // Cel: hide preprocess (~27 ms) za DML run (~41 ms) -> max(pre,run) zamiast pre+run.
+    // Order zachowany (FIFO). Caller pattern:
+    //     enqueue(f0); enqueue(f1);
+    //     for i: if (i+1<N) enqueue(f[i+1]); auto d = wait_get();
+    void enqueue(const cv::Mat& frame);
+    Detections wait_get();
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
     YoloConfig cfg_;
     double last_inference_ms_ = 0.0;
+    StageTimings last_timings_{};
 };
 
 }  // namespace dtracker

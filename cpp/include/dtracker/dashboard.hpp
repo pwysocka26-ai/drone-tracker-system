@@ -37,7 +37,8 @@ public:
                LockState lock_state,
                const NarrowState& narrow_state,
                const BBox& narrow_crop,
-               const std::optional<AngularOffset>& angular = std::nullopt);
+               const std::optional<AngularOffset>& angular = std::nullopt,
+               int persistent_owner_id = -1);
 
 private:
     DashboardConfig cfg_;

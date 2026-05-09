@@ -82,7 +82,8 @@ int Dashboard::render(const cv::Mat& frame_bgr,
                        LockState lock_state,
                        const NarrowState& narrow_state,
                        const BBox& narrow_crop,
-                       const std::optional<AngularOffset>& angular) {
+                       const std::optional<AngularOffset>& angular,
+                       int persistent_owner_id) {
     if (!cfg_.show_gui) return -1;
     if (frame_bgr.empty()) return -1;
 
@@ -169,7 +170,9 @@ int Dashboard::render(const cv::Mat& frame_bgr,
         }
 
         std::ostringstream ss;
-        ss << "id=" << t.track_id << " c=" << std::setprecision(2) << t.confidence;
+        // Owner: persistent_owner_id (stable identity z TM Fix 2). Inni: raw track_id.
+        int label_id = (is_owner && persistent_owner_id >= 0) ? persistent_owner_id : t.track_id;
+        ss << "id=" << label_id << " c=" << std::setprecision(2) << t.confidence;
         if (is_kalman_drift) ss << " K" << t.missed_frames;
         else if (is_unconfirmed) ss << " ?";
         cv::putText(wide, ss.str(),
@@ -199,9 +202,10 @@ int Dashboard::render(const cv::Mat& frame_bgr,
                   cv::Point(static_cast<int>(narrow_crop.x2), static_cast<int>(narrow_crop.y2)),
                   cv::Scalar(255, 255, 255), 1);
 
-    // Status text
+    // Status text — owner pokazuje persistent_owner_id (stable mimo MTT raw swap)
     std::ostringstream status;
-    status << "lock=" << to_string(lock_state) << "  owner=" << selected_id
+    int status_owner_id = (persistent_owner_id >= 0) ? persistent_owner_id : selected_id;
+    status << "lock=" << to_string(lock_state) << "  owner=" << status_owner_id
            << "  tracks=" << tracks.size();
     cv::putText(wide, status.str(), cv::Point(10, 30),
                 cv::FONT_HERSHEY_SIMPLEX, 0.7, color_for_state(lock_state), 2);

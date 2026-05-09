@@ -3,16 +3,21 @@
 // dashboard + telemetry + recording.
 // Parity z Python src/main.py + src/core/app.py (D6 plan).
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <mutex>
 #include <optional>
+#include <queue>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <opencv2/core.hpp>
@@ -77,6 +82,9 @@ struct CliArgs {
     float axis_el_mrad = 0.0f;
     // Per-frame gimbal source (CSV). Priorytet: --gimbal-csv > --fov-h-deg/--axis-* > OFF.
     std::string gimbal_csv;
+    // Async preprocess pipeline (Fala 1a). 1-frame lag w detection ale visual
+    // alignment zachowane (display frame N-1 z detections N-1).
+    bool async = false;
 };
 
 static CliArgs parse_args(int argc, char** argv) {
@@ -112,11 +120,12 @@ static CliArgs parse_args(int argc, char** argv) {
         if (s == "--no-gui") { a.gui = false; continue; }
         if (s == "--no-record") { a.record = false; continue; }
         if (s == "--cpu") { a.use_directml = false; continue; }
+        if (s == "--async") { a.async = true; continue; }
         if (s == "-h" || s == "--help") {
             std::cout << "Usage: dtracker_main [--video PATH] [--model PATH] [--out-dir PATH]"
                       << " [--imgsz N] [--conf F] [--min-area F] [--min-side F]"
                       << " [--fov-h-deg F] [--axis-az-mrad F] [--axis-el-mrad F] [--gimbal-csv PATH]"
-                      << " [--max-frames N] [--no-gui] [--no-record] [--cpu]\n";
+                      << " [--max-frames N] [--no-gui] [--no-record] [--cpu] [--async]\n";
             std::exit(0);
         }
     }
@@ -548,7 +557,12 @@ int main(int argc, char** argv) {
     mtt_cfg.velocity_alpha = 0.65f;
     MultiTargetTracker mtt(mtt_cfg);
 
-    TargetManager tm;
+    // TM tuning (hipoteza 2, 2026-05-09): zminimalizowac ID swap przy duplikatach MTT.
+    // Empirycznie: 12% klatek ma 2+ confirmed tracki, MTT spawnuje duplikaty na ten
+    // sam fizyczny drone. switch_margin 0.55 -> 3.0 wymaga kandydata 4x lepszego.
+    TMConfig tm_cfg;
+    tm_cfg.switch_margin = 3.0f;
+    TargetManager tm(tm_cfg);
     LockPipeline lock;
 
     // LocalTargetTracker (CSRT) jako wizualny fallback gdy YOLO traci ownera.
@@ -565,9 +579,14 @@ int main(int argc, char** argv) {
     constexpr float CSRT_REFRESH_MIN_CONF = 0.50f;
 
     NarrowConfig narrow_cfg;
-    narrow_cfg.display_center_alpha = 0.78f;
+    narrow_cfg.display_center_alpha = 0.78f;  // UWAGA: dead config, nie czytany w narrow_tracker.cpp
     narrow_cfg.display_size_alpha = 0.50f;
     narrow_cfg.display_max_size_step = 50.0f;
+    // Narrow PID tuning (hipoteza 1, 2026-05-09): "ramka przyklejona do celu".
+    // Defaulty (kp=0.24, dead=4, alpha=0.74) byly za sluggish dla v7 detekcji.
+    narrow_cfg.pid_kp_active = 0.5f;
+    narrow_cfg.pid_dead_zone_active = 1.0f;
+    narrow_cfg.pid_smooth_alpha = 0.4f;
     NarrowTracker narrow(narrow_cfg, frame_w, frame_h);
 
     DashboardConfig dcfg;
@@ -593,13 +612,44 @@ int main(int argc, char** argv) {
 
     int frame_idx = 0;
     cv::Mat frame;
-    cv::Mat narrow_frame;  // Phase 3: dual-camera physical narrow stream
+    cv::Mat narrow_frame;
     dtracker::io::Frame io_frame;
     dtracker::io::Frame io_frame_narrow;
+    dtracker::io::Frame io_frame_next;
+    dtracker::io::Frame io_frame_narrow_next;
     auto t_start = std::chrono::steady_clock::now();
     double total_inf_ms = 0.0;
     double total_track_ms = 0.0;
+    double total_cycle_ms = 0.0;
+    std::vector<double> all_inf_ms;
+    std::vector<double> all_cycle_ms;
+    std::vector<double> all_read_ms;
+    std::vector<double> all_post_inf_ms;
+    std::vector<double> all_post_trk_ms;
+    all_inf_ms.reserve(static_cast<size_t>(std::max(0, a.max_frames > 0 ? a.max_frames : 1024)));
+    all_cycle_ms.reserve(all_inf_ms.capacity());
+    all_read_ms.reserve(all_inf_ms.capacity());
+    all_post_inf_ms.reserve(all_inf_ms.capacity());
+    all_post_trk_ms.reserve(all_inf_ms.capacity());
     bool quit = false;
+
+    // Async pipeline pre-load (Fala 1a): pre-read frame 0, enqueue dla worker'a.
+    // I/O thread odrzucony (testowany 2026-05-09): nie daje poprawy na Strix
+    // Halo z 3+ threadami zamiast 2 (CPU/iGPU power budget shared).
+    bool async_eof = false;
+    if (a.async) {
+        if (!source->read(io_frame) || io_frame.image.empty()) {
+            std::cerr << "ERROR: empty source on async preload\n";
+            return 1;
+        }
+        if (dual_camera_mode) {
+            if (!narrow_source->read(io_frame_narrow) || io_frame_narrow.image.empty()) {
+                std::cerr << "ERROR: narrow EOF on async preload\n";
+                return 1;
+            }
+        }
+        detector.enqueue(io_frame.image);
+    }
 
     // ROI search (port src/core/app.py:roi_search): sekundarny YOLO inference
     // na ROI 4.8x wokol last_good_center gdy primary detection traci ownera.
@@ -618,23 +668,39 @@ int main(int argc, char** argv) {
     bool telemetry_active = true;
 
     while (!quit) {
-        if (!source->read(io_frame) || io_frame.image.empty()) break;
-        frame = io_frame.image;
-        // Phase 3 dual-camera: czytaj narrow stream sync per frame index. Jesli
-        // narrow short-circuits (EOF wczesniej niz wide), zatrzymaj caly pipeline
-        // -- inaczej rozjedzie sie sync.
-        if (dual_camera_mode) {
-            if (!narrow_source->read(io_frame_narrow) || io_frame_narrow.image.empty()) {
-                std::cout << "Narrow EOF at frame " << frame_idx << " -- stopping\n";
-                break;
+        auto t_cycle0 = std::chrono::steady_clock::now();
+        if (a.async) {
+            // Read NEXT frame, enqueue (worker robi preprocess równolegle z wait_get).
+            // Process io_frame (= prev-read), którego detekcje są in-flight.
+            if (async_eof) break;
+            bool has_next = source->read(io_frame_next) && !io_frame_next.image.empty();
+            if (has_next && dual_camera_mode) {
+                if (!narrow_source->read(io_frame_narrow_next) || io_frame_narrow_next.image.empty()) {
+                    std::cout << "Narrow EOF at frame " << frame_idx << " -- stopping\n";
+                    has_next = false;
+                }
             }
-            narrow_frame = io_frame_narrow.image;
+            if (has_next) detector.enqueue(io_frame_next.image);
+            else async_eof = true;
+            frame = io_frame.image;
+            if (dual_camera_mode) narrow_frame = io_frame_narrow.image;
+        } else {
+            if (!source->read(io_frame) || io_frame.image.empty()) break;
+            frame = io_frame.image;
+            if (dual_camera_mode) {
+                if (!narrow_source->read(io_frame_narrow) || io_frame_narrow.image.empty()) {
+                    std::cout << "Narrow EOF at frame " << frame_idx << " -- stopping\n";
+                    break;
+                }
+                narrow_frame = io_frame_narrow.image;
+            }
         }
         if (a.max_frames > 0 && frame_idx >= a.max_frames) break;
         ++frame_idx;
 
         auto t_inf0 = std::chrono::steady_clock::now();
-        Detections raw = detector.detect(frame);
+        double read_ms = std::chrono::duration<double, std::milli>(t_inf0 - t_cycle0).count();
+        Detections raw = a.async ? detector.wait_get() : detector.detect(frame);
         auto t_inf1 = std::chrono::steady_clock::now();
         double inf_ms = std::chrono::duration<double, std::milli>(t_inf1 - t_inf0).count();
         total_inf_ms += inf_ms;
@@ -790,7 +856,8 @@ int main(int argc, char** argv) {
         int key = -1;
         if (a.gui) {
             key = dashboard.render(frame, tracks, sel_id, lock_state,
-                                    narrow.state(), crop, angular_offset);
+                                    narrow.state(), crop, angular_offset,
+                                    tm.persistent_owner_id());
         }
 
         // Telemetry (Track is move-only -> clone)
@@ -931,12 +998,32 @@ int main(int argc, char** argv) {
             }
         }
 
+        // Async pipeline: shift NEXT->CURRENT for next iteration's processing.
+        if (a.async && !async_eof) {
+            io_frame = io_frame_next;
+            if (dual_camera_mode) io_frame_narrow = io_frame_narrow_next;
+        }
+
+        auto t_cycle1 = std::chrono::steady_clock::now();
+        double cycle_ms = std::chrono::duration<double, std::milli>(t_cycle1 - t_cycle0).count();
+        // post_inf_ms = od konca inference do konca trackera (ROI search + filter + MTT + TM + lock + CSRT + narrow)
+        double post_inf_ms = std::chrono::duration<double, std::milli>(t_trk1 - t_inf1).count();
+        // post_trk_ms = od konca trackera do konca cyklu (telemetry + dashboard render + video write + shift)
+        double post_trk_ms = std::chrono::duration<double, std::milli>(t_cycle1 - t_trk1).count();
+        total_cycle_ms += cycle_ms;
+        all_inf_ms.push_back(inf_ms);
+        all_cycle_ms.push_back(cycle_ms);
+        all_read_ms.push_back(read_ms);
+        all_post_inf_ms.push_back(post_inf_ms);
+        all_post_trk_ms.push_back(post_trk_ms);
+
         if (frame_idx % 30 == 0) {
             std::cout << "frame " << frame_idx << "/" << total
                       << "  lock=" << to_string(lock_state)
                       << "  owner=" << (sel ? std::to_string(*sel) : std::string("-"))
                       << "  tracks=" << tracks.size()
-                      << "  inf=" << std::fixed << std::setprecision(1) << inf_ms << "ms"
+                      << "  inf=" << std::fixed << std::setprecision(1) << inf_ms
+                      << "ms cycle=" << std::fixed << std::setprecision(1) << cycle_ms << "ms"
                       << "\n";
         }
     }
@@ -947,8 +1034,47 @@ int main(int argc, char** argv) {
     std::cout << "Frames: " << frame_idx << " / " << total_s << "s = "
               << (frame_idx > 0 ? frame_idx / total_s : 0.0) << " fps\n";
     if (frame_idx > 0) {
-        std::cout << "Avg inference: " << (total_inf_ms / frame_idx) << " ms\n";
+        auto stats = [](std::vector<double> v) {
+            std::sort(v.begin(), v.end());
+            double sum = 0.0; for (double x : v) sum += x;
+            size_t n = v.size();
+            return std::tuple<double,double,double,double,double>{
+                v[0], v[(n*50)/100], v[(n*90)/100], v[(n*99)/100], sum / n
+            };
+        };
+        auto print_stats = [&](const char* label, const std::vector<double>& v) {
+            auto [mn, p50, p90, p99, mean] = stats(v);
+            std::cout << label
+                      << "  mean=" << std::fixed << std::setprecision(2) << mean
+                      << "  p50=" << p50
+                      << "  p90=" << p90
+                      << "  p99=" << p99
+                      << "  min=" << mn
+                      << "  n=" << v.size() << "\n";
+        };
+        std::cout << "\n=== ALL FRAMES ===\n";
+        print_stats("inference (ms)   ", all_inf_ms);
+        print_stats("cycle     (ms)   ", all_cycle_ms);
+        // Steady state: pomijamy pierwsze 1/3 (GPU warmup, file caches).
+        if (frame_idx >= 30) {
+            size_t skip = static_cast<size_t>(frame_idx) / 3;
+            std::vector<double> inf_ss(all_inf_ms.begin() + skip, all_inf_ms.end());
+            std::vector<double> cyc_ss(all_cycle_ms.begin() + skip, all_cycle_ms.end());
+            std::vector<double> read_ss(all_read_ms.begin() + skip, all_read_ms.end());
+            std::vector<double> postinf_ss(all_post_inf_ms.begin() + skip, all_post_inf_ms.end());
+            std::vector<double> posttrk_ss(all_post_trk_ms.begin() + skip, all_post_trk_ms.end());
+            std::cout << "\n=== STEADY STATE (skip first " << skip << " frames) ===\n";
+            print_stats("read+enqueue (ms)", read_ss);
+            print_stats("inference   (ms)", inf_ss);
+            print_stats("post_inf    (ms)", postinf_ss);
+            print_stats("post_trk    (ms)", posttrk_ss);
+            print_stats("cycle       (ms)", cyc_ss);
+            auto [mn, p50, p90, p99, mean] = stats(cyc_ss);
+            std::cout << "throughput: " << (1000.0 / mean) << " fps (steady-state mean)\n";
+        }
         std::cout << "Avg tracker:   " << (total_track_ms / frame_idx) << " ms\n";
+        std::cout << "mode:          " << (a.async ? "ASYNC (Fala 1a)" : "SYNC")
+                  << (a.async ? "  (inference = wait_get: DML + wait, preprocess overlapped)" : "") << "\n";
     }
 
     if (video_writer.isOpened()) video_writer.release();

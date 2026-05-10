@@ -76,6 +76,7 @@ void TelemetryWriter::write(const FrameTelemetry& r) {
     ofs_ << ",\"center_lock\":" << (r.center_lock ? "true" : "false");
     ofs_ << ",\"inference_ms\":" << r.inference_ms;
     ofs_ << ",\"tracker_ms\":" << r.tracker_ms;
+    ofs_ << ",\"dedup_dropped\":" << r.dedup_dropped;
     // Angular target position (only present when gimbal active + owner exists)
     auto write_opt_float = [&](const char* key, const std::optional<float>& v) {
         ofs_ << ",\"" << key << "\":";

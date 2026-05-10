@@ -126,6 +126,42 @@ TEST(MTT_VelocityConvergesAfterSeveralFrames) {
     ASSERT_NEAR(tracks[0].velocity.y, 5.0, 2.5);
 }
 
+// Regresja dla ID-stability invariant (założenie projektowe 2026-05-09):
+// dwa rozne drony lecace rownolegle z separacja 60 px musza zachowac dwa
+// rozne track_id przez >=15 klatek. Zabezpiecza przed nadgorliwym scalaniem
+// w MTT (nms_dedup w main.cpp ma IoU=0.45 + center 8 px wiec 60 px separation
+// daleko poza zasiegiem -- ale jesli ktos w przyszlosci podkreca dedup
+// progi, ten test wylapie regresje na poziomie samego MTT).
+TEST(MTT_TwoSeparateTargetsStableIds) {
+    MTTConfig cfg;
+    cfg.confirm_hits = 2;
+    MultiTargetTracker mtt(cfg);
+
+    int id_a = -1, id_b = -1;
+    for (int i = 0; i < 15; ++i) {
+        // dron A na (200, 300) +- malo ruchu, dron B na (260, 300)
+        Detections dets = {
+            make_det(200.0f + i * 0.5f, 300.0f),
+            make_det(260.0f + i * 0.5f, 300.0f),
+        };
+        auto tracks = mtt.update(dets);
+        ASSERT_EQ(tracks.size(), static_cast<size_t>(2));
+        if (id_a < 0) {
+            // Pierwsza klatka: snapshot ID per pozycji
+            id_a = (tracks[0].center.x < tracks[1].center.x) ? tracks[0].track_id : tracks[1].track_id;
+            id_b = (tracks[0].center.x < tracks[1].center.x) ? tracks[1].track_id : tracks[0].track_id;
+        }
+        // Po pierwszej klatce: sprawdz ze oba ID nadal istnieja, brak swap
+        bool found_a = false, found_b = false;
+        for (const auto& t : tracks) {
+            if (t.track_id == id_a) found_a = true;
+            else if (t.track_id == id_b) found_b = true;
+        }
+        ASSERT_TRUE(found_a);
+        ASSERT_TRUE(found_b);
+    }
+}
+
 TEST(MTT_ResetClearsTracks) {
     MultiTargetTracker mtt;
     mtt.update({ make_det(100, 100) });

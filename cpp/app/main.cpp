@@ -248,6 +248,43 @@ static float bbox_iou_local(const BBox& a, const BBox& b) {
     return uni > 0.0f ? inter / uni : 0.0f;
 }
 
+// Cross-class dedup detekcji w pojedynczej klatce. YOLO NMS jest per-class
+// (inference.cpp:nms), wiec dwie detekcje na tym samym dronie z roznymi klasami
+// nie sa scalane. Plus: per-class IoU 0.45 jest za rygorystyczne dla malych
+// dronow (~14x13 px), gdzie sub-pixel jitter daje IoU 0.30-0.40 mimo ze to ten
+// sam target. Empirycznie (artifacts/runs/2026-05-09_234124, analyzer):
+// 12/16 spawn events to duplikat <10 px od istniejacego confirmed track.
+//
+// Strategia: po sortowaniu desc. po conf, suppress kazdego kandydata ktory ma
+// (IoU > iou_thresh) LUB (center distance <= center_thresh_px) z ktoremkolwiek
+// zachowanym. Cross-class (klasy ignorowane). Center distance jako fallback
+// dla malych obiektow gdzie IoU jest noisy.
+static Detections nms_dedup(const Detections& dets, float iou_thresh, float center_thresh_px) {
+    if (dets.size() <= 1) return dets;
+    std::vector<int> idx(dets.size());
+    for (size_t i = 0; i < idx.size(); ++i) idx[i] = static_cast<int>(i);
+    std::sort(idx.begin(), idx.end(), [&](int a, int b) { return dets[a].conf > dets[b].conf; });
+    std::vector<bool> keep(dets.size(), true);
+    for (size_t i = 0; i < idx.size(); ++i) {
+        int ii = idx[i];
+        if (!keep[ii]) continue;
+        for (size_t j = i + 1; j < idx.size(); ++j) {
+            int jj = idx[j];
+            if (!keep[jj]) continue;
+            float iou_val = bbox_iou_local(dets[ii].bbox, dets[jj].bbox);
+            if (iou_val > iou_thresh) { keep[jj] = false; continue; }
+            float dx = dets[ii].bbox.cx() - dets[jj].bbox.cx();
+            float dy = dets[ii].bbox.cy() - dets[jj].bbox.cy();
+            float center_dist = std::sqrt(dx * dx + dy * dy);
+            if (center_dist <= center_thresh_px) { keep[jj] = false; }
+        }
+    }
+    Detections out;
+    out.reserve(dets.size());
+    for (size_t i = 0; i < dets.size(); ++i) if (keep[i]) out.push_back(dets[i]);
+    return out;
+}
+
 static Detections merge_detection_lists(const Detections& primary, const Detections& secondary,
                                          float iou_thresh, float center_thresh_px) {
     Detections merged = primary;
@@ -663,6 +700,12 @@ int main(int argc, char** argv) {
     const float roi_merge_iou = 0.16f;
     const float roi_merge_center_px = 48.0f;
 
+    // Pre-MTT detection dedup. Cross-class, IoU 0.45 + center 8px fallback dla
+    // malych dronow. Cel: kasacja MTT duplicate spawn (12/16 spawn events
+    // <10px od istniejacego confirmed track na empirical run 2026-05-09_234124).
+    const float dedup_iou = 0.45f;
+    const float dedup_center_px = 8.0f;
+
     // Runtime toggles (R = recording, T = telemetry). Domyslny stan z CLI flag.
     bool recording_active = a.record;
     bool telemetry_active = true;
@@ -706,6 +749,11 @@ int main(int argc, char** argv) {
         total_inf_ms += inf_ms;
 
         Detections filtered = filter_and_pad(raw, frame_w, frame_h, a.min_area, a.min_side);
+        // Dedup po filter_and_pad: scala duplikaty YOLO (per-class NMS nie laczy
+        // cross-class, plus IoU 0.45 jest noisy dla malych dronow).
+        size_t pre_dedup_n = filtered.size();
+        filtered = nms_dedup(filtered, dedup_iou, dedup_center_px);
+        int dedup_dropped = static_cast<int>(pre_dedup_n) - static_cast<int>(filtered.size());
 
         // ROI search fallback: gdy primary YOLO traci wszystkie targety LUB
         // jest drop_streak >= 1, a narrow ma last_good_center, robimy 2-gi
@@ -726,6 +774,12 @@ int main(int argc, char** argv) {
                     if (!roi_filtered.empty()) {
                         Detections merged = merge_detection_lists(filtered, roi_filtered,
                                                                    roi_merge_iou, roi_merge_center_px);
+                        // Drugi dedup po merge ROI -- merge_detection_lists ma luzne progi
+                        // (IoU 0.16 / 48 px), wiec moze przepuscic mniej-overlapping kandydatow
+                        // ktorzy razem stworza duplikaty w MTT.
+                        size_t pre_merge_dedup = merged.size();
+                        merged = nms_dedup(merged, dedup_iou, dedup_center_px);
+                        dedup_dropped += static_cast<int>(pre_merge_dedup) - static_cast<int>(merged.size());
                         roi_search_added = static_cast<int>(merged.size()) - static_cast<int>(filtered.size());
                         filtered = merged;
                         roi_search_used = true;
@@ -899,6 +953,7 @@ int main(int argc, char** argv) {
         rec.cmc_inliers = mtt.last_camera_motion_inliers();
         rec.inference_ms = inf_ms;
         rec.tracker_ms = trk_ms;
+        rec.dedup_dropped = dedup_dropped;
         if (telemetry_active) telemetry.write(rec);
 
         // VideoWriter — composite wide + narrow crop

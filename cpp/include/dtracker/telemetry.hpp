@@ -47,6 +47,7 @@ struct FrameTelemetry {
     int   cmc_inliers = 0;
     double inference_ms = 0.0;
     double tracker_ms = 0.0;
+    int dedup_dropped = 0;               // ile detekcji odrzucil pre-MTT nms_dedup
     // Angular target position (faza B: integracja z gimbal encoder data).
     // Wszystkie obecne tylko gdy gimbal aktywny (--fov-h-deg > 0) AND mamy ownera.
     std::optional<float> target_delta_az_mrad;   // offset target od osi (+ na prawo)

@@ -619,11 +619,17 @@ int main(int argc, char** argv) {
     narrow_cfg.display_center_alpha = 0.78f;  // UWAGA: dead config, nie czytany w narrow_tracker.cpp
     narrow_cfg.display_size_alpha = 0.50f;
     narrow_cfg.display_max_size_step = 50.0f;
-    // Narrow PID tuning (hipoteza 1, 2026-05-09): "ramka przyklejona do celu".
-    // Defaulty (kp=0.24, dead=4, alpha=0.74) byly za sluggish dla v7 detekcji.
+    // Narrow PID tuning. Empirical lag (artifacts/runs/2026-05-10_102204,
+    // analyze_narrow_lag.py): stationary 0.93 px ok, ale fast manewry vel>=20
+    // px/frame daje lag 8-14 px (frame 12500-12510 case). Dominujacy dlawik:
+    // EMA na speed (smooth_alpha) -- kazda klatka tylko 60% nowej predkosci.
+    // A1 (2026-05-10): wylaczyc EMA na speed -- speed = pelne new kazdej klatki.
+    // Dla error 28 px / kp 0.5 / max_step 46: step = 14 px/frame, lag steady-
+    // state spada z ~12 px do ~6-8 px dla vel=20. Stationary tracking nie
+    // pogarsza sie (bbox jest stabilny dzieki MTT smooth_bbox + Kalman).
     narrow_cfg.pid_kp_active = 0.5f;
     narrow_cfg.pid_dead_zone_active = 1.0f;
-    narrow_cfg.pid_smooth_alpha = 0.4f;
+    narrow_cfg.pid_smooth_alpha = 0.0f;
     NarrowTracker narrow(narrow_cfg, frame_w, frame_h);
 
     DashboardConfig dcfg;

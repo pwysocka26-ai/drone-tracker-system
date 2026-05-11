@@ -44,11 +44,13 @@ from pathlib import Path
 import cv2
 
 
-CLASS_NAMES = {0: "dron_maly", 1: "dron_duzy", 2: "pilka"}
-CLASS_COLORS = {0: (255, 128, 0), 1: (0, 0, 255), 2: (0, 255, 0)}
-CLASS_KEYS = {ord("m"): 0, ord("d"): 1, ord("b"): 2}
-CLASS_KEYS_ALL = {ord("M"): 0, ord("D"): 1, ord("B"): 2}
-ADD_CLASS_KEYS = {ord("0"): 0, ord("1"): 1, ord("2"): 2}
+# Single-class (decyzja 2026-05-10): wszystkie etykiety = "dron". Klawisze
+# m/d/b oraz add 0/1/2 wszystkie mapują na 0 — kompatybilność z muscle memory.
+CLASS_NAMES = {0: "dron", 1: "dron", 2: "dron"}
+CLASS_COLORS = {0: (0, 255, 0), 1: (0, 255, 0), 2: (0, 255, 0)}
+CLASS_KEYS = {ord("m"): 0, ord("d"): 0, ord("b"): 0}
+CLASS_KEYS_ALL = {ord("M"): 0, ord("D"): 0, ord("B"): 0}
+ADD_CLASS_KEYS = {ord("0"): 0, ord("1"): 0, ord("2"): 0}
 DRAG_THRESHOLD_DISP = 3  # px display - poniżej tej odleglosci klik traktowany jako select
 
 MAX_DISPLAY_W = 1600

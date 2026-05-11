@@ -33,6 +33,12 @@ scripts/
 !tools/v5_prelabel.py
 !tools/v6_review.py
 !tools/_audit_v6_smoke.py
+!tools/_build_v8_dataset.py
+!tools/dump_missing_frames.py
+!tools/convert_to_single_class.py
+!tools/analyze_mtt_duplicates.py
+!tools/analyze_narrow_lag.py
+!tools/quick_eval_v8_test.py
 
 # backupy
 *.bak
@@ -112,6 +118,8 @@ training/v5/review/
 training/v6/images/
 training/v6/labels/
 training/v6/review/
+training/v7/
+training/v8/
 
 # model weights (pulled from Drive, reproducible)
 *.pt

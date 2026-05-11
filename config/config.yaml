@@ -3,7 +3,7 @@ video:
   source: artifacts/test_videos/video_test_wide_short.mp4
   record_on_start: true
 yolo:
-  model: data/weights/v7_best_fp16_imgsz1280.onnx   # v7 ONNX FP16 — PyOrtYOLO (ORT 1.23 + DirectML iGPU, 15ms inference)
+  model: data/weights/v8_best_fp16_imgsz1280.onnx   # v8 ONNX FP16 (single-class) — fix sea blind spot, 100% detection na test.mp4 (vs v7 52%)
   backend: track
   tracker: config/bytetrack_fast_acquire.yaml
   conf: 0.20

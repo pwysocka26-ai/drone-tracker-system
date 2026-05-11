@@ -21,8 +21,10 @@ import cv2
 from ultralytics import YOLO
 
 
-CLASS_NAMES = {0: "dron_maly", 1: "dron_duzy", 2: "pilka"}
-CLASS_COLORS = {0: (255, 128, 0), 1: (0, 0, 255), 2: (0, 255, 0)}
+# Single-class (decyzja 2026-05-10): wszystkie etykiety = "dron".
+# Mapy zachowane dla kompatybilności starych runów review JPG.
+CLASS_NAMES = {0: "dron", 1: "dron", 2: "dron"}
+CLASS_COLORS = {0: (0, 255, 0), 1: (0, 255, 0), 2: (0, 255, 0)}
 
 
 def map_to_v6_class(w: int, h: int, size_threshold: int,
@@ -182,9 +184,9 @@ if __name__ == "__main__":
     ap.add_argument("--size-threshold", type=int, default=30,
                     help="max(w,h) > threshold -> dron_duzy, else dron_maly "
                          "(ignorowane gdy --default-class >= 0)")
-    ap.add_argument("--default-class", type=int, default=-1,
-                    help="Override: 0=dron_maly 1=dron_duzy 2=pilka. "
-                         "-1 (default) = uzyj size_threshold heurystyki")
+    ap.add_argument("--default-class", type=int, default=0,
+                    help="Single-class default: 0=dron (decyzja 2026-05-10). "
+                         "Legacy multi-class: -1 = uzyj size_threshold heurystyki")
     ap.add_argument("--imgsz", type=int, default=1280)
     ap.add_argument("--review-every", type=int, default=100,
                     help="zapisuje review JPG co N klatek")

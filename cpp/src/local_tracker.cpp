@@ -53,7 +53,11 @@ bool LocalTargetTracker::init(const cv::Mat& frame, const BBox& roi) {
     if (w < 4 || h < 4) return false;  // CSRT wymaga min ~8x8, dajemy bufor
 
     try {
-        impl_->tracker = cv::TrackerCSRT::create();
+        // 2026-05-13: CSRT -> KCF. CSRT byl ~5-10x wolniejszy (65 ms p99 dominowal
+        // post_inf cycle). KCF wystarczy dla short-gap bridging (1-5 klatek) w
+        // pipeline gdzie YOLO+MTT to primary tracking. Trade-off: KCF gorszy na
+        // ostre deformacje, ale dla drona w fazie HOLD/REACQUIRE wystarczy.
+        impl_->tracker = cv::TrackerKCF::create();
         impl_->tracker->init(frame, cv::Rect(x1, y1, w, h));
     } catch (const cv::Exception&) {
         impl_->tracker.release();

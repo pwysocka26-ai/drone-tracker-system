@@ -84,7 +84,8 @@ struct CliArgs {
     std::string gimbal_csv;
     // Async preprocess pipeline (Fala 1a). 1-frame lag w detection ale visual
     // alignment zachowane (display frame N-1 z detections N-1).
-    bool async = false;
+    // Default ON od 2026-05-13 — 20-23% szybszy cycle, sync output bit-exact.
+    bool async = true;
 };
 
 static CliArgs parse_args(int argc, char** argv) {
@@ -121,11 +122,12 @@ static CliArgs parse_args(int argc, char** argv) {
         if (s == "--no-record") { a.record = false; continue; }
         if (s == "--cpu") { a.use_directml = false; continue; }
         if (s == "--async") { a.async = true; continue; }
+        if (s == "--no-async") { a.async = false; continue; }
         if (s == "-h" || s == "--help") {
             std::cout << "Usage: dtracker_main [--video PATH] [--model PATH] [--out-dir PATH]"
                       << " [--imgsz N] [--conf F] [--min-area F] [--min-side F]"
                       << " [--fov-h-deg F] [--axis-az-mrad F] [--axis-el-mrad F] [--gimbal-csv PATH]"
-                      << " [--max-frames N] [--no-gui] [--no-record] [--cpu] [--async]\n";
+                      << " [--max-frames N] [--no-gui] [--no-record] [--cpu] [--no-async]\n";
             std::exit(0);
         }
     }
@@ -156,8 +158,12 @@ static Detections filter_and_pad(const Detections& raw, int frame_w, int frame_h
         if (area > max_area) continue;
         if (aspect < 0.10f || aspect > 10.0f) continue;
 
-        float pad_w = bw * 0.15f;
-        float pad_h = bh * 0.20f;
+        // 2026-05-13: padding 15%/20% -> 8%/10%. Kompromis: pelne 15/20 dawalo
+        // (z dashboard render padding) bbox 1.7x wiekszy niz drone, pelne 0/0
+        // bylo za ciasne (CSRT init bez marginu = utrata celu, narrow zoom
+        // wycina propellery). 8%/10% to wystarczajacy margin bez "ramka ogromna".
+        float pad_w = bw * 0.08f;
+        float pad_h = bh * 0.10f;
         Detection p = d;
         p.bbox.x1 = std::max(0.0f, d.bbox.x1 - pad_w);
         p.bbox.y1 = std::max(0.0f, d.bbox.y1 - pad_h);
@@ -590,7 +596,10 @@ int main(int argc, char** argv) {
     MTTConfig mtt_cfg;
     mtt_cfg.max_missed_frames = 36;
     mtt_cfg.confirm_hits = 2;
-    mtt_cfg.max_center_distance = 220.0f;
+    // 2026-05-13: 220 -> 300. Memory: drone manewr 445 px > 220. 400 bylo za duzo
+    // (matching kradl detekcje sasiadow). 250 nie wystarczalo (user: dalej problem
+    // ze sledzeniem). 300 to kompromis - obsluguje wiekszosc manewrow.
+    mtt_cfg.max_center_distance = 300.0f;
     mtt_cfg.velocity_alpha = 0.65f;
     MultiTargetTracker mtt(mtt_cfg);
 
@@ -669,11 +678,20 @@ int main(int argc, char** argv) {
     std::vector<double> all_read_ms;
     std::vector<double> all_post_inf_ms;
     std::vector<double> all_post_trk_ms;
+    // Breakdown timers (2026-05-13 diag): split post_inf na podetapy
+    std::vector<double> all_filter_roi_ms;       // t_inf1 -> t_trk0 (filter + dedup + ROI search)
+    std::vector<double> all_mtt_lock_ms;         // t_trk0 -> t_mtt_tm_lock1 (MTT + TM + lock)
+    std::vector<double> all_csrt_ms;             // t_mtt_tm_lock1 -> t_csrt1 (CSRT lifecycle + update)
+    std::vector<double> all_narrow_ms;           // t_csrt1 -> t_trk1 (narrow.update)
     all_inf_ms.reserve(static_cast<size_t>(std::max(0, a.max_frames > 0 ? a.max_frames : 1024)));
     all_cycle_ms.reserve(all_inf_ms.capacity());
     all_read_ms.reserve(all_inf_ms.capacity());
     all_post_inf_ms.reserve(all_inf_ms.capacity());
     all_post_trk_ms.reserve(all_inf_ms.capacity());
+    all_filter_roi_ms.reserve(all_inf_ms.capacity());
+    all_mtt_lock_ms.reserve(all_inf_ms.capacity());
+    all_csrt_ms.reserve(all_inf_ms.capacity());
+    all_narrow_ms.reserve(all_inf_ms.capacity());
     bool quit = false;
 
     // Async pipeline pre-load (Fala 1a): pre-read frame 0, enqueue dla worker'a.
@@ -799,6 +817,7 @@ int main(int argc, char** argv) {
         drop_streak = filtered.empty() ? (drop_streak + 1) : 0;
         std::optional<int> sel = tm.select(tracks);
         LockState lock_state = lock.step(sel, tracks);
+        auto t_mtt_tm_lock1 = std::chrono::steady_clock::now();
 
         const Track* owner = nullptr;
         if (sel) {
@@ -869,6 +888,7 @@ int main(int argc, char** argv) {
         }
         // owner_healthy == true: pomijamy update -- CSRT model zostaje ostatnio init'owany
 
+        auto t_csrt1 = std::chrono::steady_clock::now();
         narrow.update(owner, is_locked);
         auto t_trk1 = std::chrono::steady_clock::now();
         double trk_ms = std::chrono::duration<double, std::milli>(t_trk1 - t_trk0).count();
@@ -1071,12 +1091,21 @@ int main(int argc, char** argv) {
         double post_inf_ms = std::chrono::duration<double, std::milli>(t_trk1 - t_inf1).count();
         // post_trk_ms = od konca trackera do konca cyklu (telemetry + dashboard render + video write + shift)
         double post_trk_ms = std::chrono::duration<double, std::milli>(t_cycle1 - t_trk1).count();
+        // Breakdown (2026-05-13 diag) — szukamy ktory podetap z post_inf zera p99
+        double filter_roi_ms  = std::chrono::duration<double, std::milli>(t_trk0 - t_inf1).count();
+        double mtt_lock_ms    = std::chrono::duration<double, std::milli>(t_mtt_tm_lock1 - t_trk0).count();
+        double csrt_ms        = std::chrono::duration<double, std::milli>(t_csrt1 - t_mtt_tm_lock1).count();
+        double narrow_only_ms = std::chrono::duration<double, std::milli>(t_trk1 - t_csrt1).count();
         total_cycle_ms += cycle_ms;
         all_inf_ms.push_back(inf_ms);
         all_cycle_ms.push_back(cycle_ms);
         all_read_ms.push_back(read_ms);
         all_post_inf_ms.push_back(post_inf_ms);
         all_post_trk_ms.push_back(post_trk_ms);
+        all_filter_roi_ms.push_back(filter_roi_ms);
+        all_mtt_lock_ms.push_back(mtt_lock_ms);
+        all_csrt_ms.push_back(csrt_ms);
+        all_narrow_ms.push_back(narrow_only_ms);
 
         if (frame_idx % 30 == 0) {
             std::cout << "frame " << frame_idx << "/" << total
@@ -1130,6 +1159,16 @@ int main(int argc, char** argv) {
             print_stats("post_inf    (ms)", postinf_ss);
             print_stats("post_trk    (ms)", posttrk_ss);
             print_stats("cycle       (ms)", cyc_ss);
+            // post_inf breakdown
+            std::vector<double> filter_ss(all_filter_roi_ms.begin() + skip, all_filter_roi_ms.end());
+            std::vector<double> mtt_ss(all_mtt_lock_ms.begin() + skip, all_mtt_lock_ms.end());
+            std::vector<double> csrt_ss(all_csrt_ms.begin() + skip, all_csrt_ms.end());
+            std::vector<double> narrow_ss(all_narrow_ms.begin() + skip, all_narrow_ms.end());
+            std::cout << "  -- post_inf breakdown --\n";
+            print_stats("  filter+ROI", filter_ss);
+            print_stats("  MTT+TM+lock", mtt_ss);
+            print_stats("  CSRT       ", csrt_ss);
+            print_stats("  narrow     ", narrow_ss);
             auto [mn, p50, p90, p99, mean] = stats(cyc_ss);
             std::cout << "throughput: " << (1000.0 / mean) << " fps (steady-state mean)\n";
         }

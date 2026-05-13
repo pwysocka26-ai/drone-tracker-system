@@ -21,10 +21,10 @@ namespace dtracker {
 
 struct NarrowConfig {
     float display_center_alpha = 0.78f;
-    float display_size_alpha = 0.50f;
+    float display_size_alpha = 0.85f;  // 2026-05-13: 0.50 -> 0.85. Slow EMA = mniejsza pulsacja ramki narrow_crop gdy drone zmienia distance.
     float display_max_center_step = 42.0f;
-    float display_max_size_step = 50.0f;
-    float screen_fill = 0.18f;         // docelowy rozmiar drona w kadrze narrow
+    float display_max_size_step = 30.0f;  // 2026-05-13: 50 -> 30. Mniejszy max step = ramka rosnie/maleje wolniej (anti-pulsacja).
+    float screen_fill = 0.55f;         // 2026-05-13: 0.18 -> 0.55. Pierwotnie 0.18 (drone 18% kadru narrow) dawalo "gigantyczne biale okno" (~5.5x bbox). 0.55 = ~1.8x bbox, drone wypelnia 55% narrow window, ramka w wide znacznie mniejsza.
     float zoom_min = 1.0f;
     float zoom_max = 10.0f;
 

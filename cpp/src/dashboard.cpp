@@ -119,7 +119,10 @@ int Dashboard::render(const cv::Mat& frame_bgr,
         // zamiast Kalman vel (która laguje przy szybkim ruchu/acceleracji).
         // Sign-flip detection na Kalman vel (mniej noise) — gdy direction change
         // → lookahead=0.
-        double lookahead = (is_owner || (!is_kalman_drift && !is_unconfirmed)) ? 1.0 : 0.0;
+        // 2026-05-13: lookahead 1.0 -> 2.5. Cykl ~100 ms (3 klatki @ 30 fps),
+        // bbox spozniony 2-3 klatki za dronem w fazie ACQUIRE/HOLD. User: "drone
+        // wyprzedza bbox". Sign-flip clamp dalej chroni przed overshoot na manewry.
+        double lookahead = (is_owner || (!is_kalman_drift && !is_unconfirmed)) ? 2.5 : 0.0;
         // Centrum bbox (potrzebne do inst_vel + zachowania w mapach)
         const double cx_now = (t.bbox.x1 + t.bbox.x2) * 0.5;
         const double cy_now = (t.bbox.y1 + t.bbox.y2) * 0.5;
@@ -153,12 +156,10 @@ int Dashboard::render(const cv::Mat& frame_bgr,
         }
         const double dx = vel_x * lookahead;
         const double dy = vel_y * lookahead;
-        // Visual padding (matches Python parse_tracks): YOLO wycina korpus drona,
-        // propellery + drobny motion wystają poza bbox. 15% horizontal, 20% vertical.
-        const double bbox_w = t.bbox.x2 - t.bbox.x1;
-        const double bbox_h = t.bbox.y2 - t.bbox.y1;
-        const double pad_w = bbox_w * 0.15;
-        const double pad_h = bbox_h * 0.20;
+        // 2026-05-13: drugi padding (po filter_and_pad) -> 0%. Z v8 ciasne bboxy
+        // wystarczaja, dwukrotny padding 15%/20% dawal bbox 1.7x wiekszy niz drone.
+        const double pad_w = 0.0;
+        const double pad_h = 0.0;
         cv::Point p1(static_cast<int>(t.bbox.x1 - pad_w + dx),
                      static_cast<int>(t.bbox.y1 - pad_h + dy));
         cv::Point p2(static_cast<int>(t.bbox.x2 + pad_w + dx),
@@ -196,11 +197,16 @@ int Dashboard::render(const cv::Mat& frame_bgr,
         last_centers_ = std::move(next_centers);
     }
 
-    // Narrow crop rectangle na wide
-    cv::rectangle(wide,
-                  cv::Point(static_cast<int>(narrow_crop.x1), static_cast<int>(narrow_crop.y1)),
-                  cv::Point(static_cast<int>(narrow_crop.x2), static_cast<int>(narrow_crop.y2)),
-                  cv::Scalar(255, 255, 255), 1);
+    // Narrow crop rectangle na wide — tylko gdy narrow ma realnego owner.
+    // 2026-05-13 bugfix: gdy smooth_center is null, narrow_crop() zwraca full
+    // frame (0,0,w,h), bez tego sprawdzenia rysowal sie bialy rectangle po
+    // calym oknie = "gigantyczne biale okno" pulsujace gdy narrow gubi ownera.
+    if (narrow_state.has_owner) {
+        cv::rectangle(wide,
+                      cv::Point(static_cast<int>(narrow_crop.x1), static_cast<int>(narrow_crop.y1)),
+                      cv::Point(static_cast<int>(narrow_crop.x2), static_cast<int>(narrow_crop.y2)),
+                      cv::Scalar(255, 255, 255), 1);
+    }
 
     // Status text — owner pokazuje persistent_owner_id (stable mimo MTT raw swap)
     std::ostringstream status;
@@ -233,6 +239,11 @@ int Dashboard::render(const cv::Mat& frame_bgr,
     cv::imshow(cfg_.wide_title, wide);
 
     // Narrow crop z oryginalnej klatki
+    // 2026-05-13 bugfix: namedWindow w init tworzylo puste biale okno przy starcie.
+    // Bez owner'a imshow nigdy nie byl wywolany -> bialy placeholder OpenCV widoczny
+    // jako "gigantyczne biale okno" w pierwszych klatkach i przy zgubieniu celu.
+    // Fix: czarny placeholder z "NO LOCK" tekstem zamiast pustego okna.
+    bool drew_narrow = false;
     if (narrow_state.has_owner) {
         int x1 = std::max(0, static_cast<int>(narrow_crop.x1));
         int y1 = std::max(0, static_cast<int>(narrow_crop.y1));
@@ -243,7 +254,15 @@ int Dashboard::render(const cv::Mat& frame_bgr,
             cv::Mat narrow_resized;
             cv::resize(narrow, narrow_resized, cv::Size(cfg_.narrow_w, cfg_.narrow_h), 0, 0, cv::INTER_LINEAR);
             cv::imshow(cfg_.narrow_title, narrow_resized);
+            drew_narrow = true;
         }
+    }
+    if (!drew_narrow) {
+        cv::Mat placeholder = cv::Mat::zeros(cfg_.narrow_h, cfg_.narrow_w, CV_8UC3);
+        cv::putText(placeholder, "NO LOCK",
+                    cv::Point(cfg_.narrow_w / 2 - 80, cfg_.narrow_h / 2),
+                    cv::FONT_HERSHEY_SIMPLEX, 1.2, cv::Scalar(80, 80, 80), 2);
+        cv::imshow(cfg_.narrow_title, placeholder);
     }
 
     int key = cv::waitKey(1);

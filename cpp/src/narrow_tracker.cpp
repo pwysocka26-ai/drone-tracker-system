@@ -158,12 +158,26 @@ void NarrowTracker::update(const Track* owner, bool is_locked) {
 }
 
 BBox NarrowTracker::narrow_crop() const {
-    if (!s_.smooth_center) {
-        return BBox{0, 0, static_cast<float>(frame_w_), static_cast<float>(frame_h_)};
+    // 2026-05-13: gdy smooth_center null ale mamy last_good (zachowane przy
+    // poprzednim ownerze), uzyj go. User chce ramke "stabilna i widoczna caly
+    // czas" — z fallbackiem na last_good zamiast skoku na full frame ("gigantyczne
+    // biale okno") gdy lock sie chwilowo gubi.
+    Point2 cx_cy;
+    float size;
+    if (s_.smooth_center) {
+        cx_cy = *s_.smooth_center;
+        size = s_.smooth_size;
+    } else if (s_.last_good_center) {
+        cx_cy = *s_.last_good_center;
+        size = s_.last_good_size > 0.0f ? s_.last_good_size : 200.0f;
+    } else {
+        // Brak jakiegokolwiek lock'a w przeszlosci -- center frame, default size.
+        cx_cy = Point2{frame_w_ * 0.5, frame_h_ * 0.5};
+        size = std::min(frame_w_, frame_h_) * 0.30f;  // ~30% frame size
     }
-    float half = s_.smooth_size * 0.5f;
-    float cx = static_cast<float>(s_.smooth_center->x);
-    float cy = static_cast<float>(s_.smooth_center->y);
+    float half = size * 0.5f;
+    float cx = static_cast<float>(cx_cy.x);
+    float cy = static_cast<float>(cx_cy.y);
     float x1 = std::max(0.0f, cx - half);
     float y1 = std::max(0.0f, cy - half);
     float x2 = std::min(static_cast<float>(frame_w_), cx + half);

@@ -197,15 +197,32 @@ int Dashboard::render(const cv::Mat& frame_bgr,
         last_centers_ = std::move(next_centers);
     }
 
-    // Narrow crop rectangle na wide — tylko gdy narrow ma realnego owner.
-    // 2026-05-13 bugfix: gdy smooth_center is null, narrow_crop() zwraca full
-    // frame (0,0,w,h), bez tego sprawdzenia rysowal sie bialy rectangle po
-    // calym oknie = "gigantyczne biale okno" pulsujace gdy narrow gubi ownera.
-    if (narrow_state.has_owner) {
-        cv::rectangle(wide,
-                      cv::Point(static_cast<int>(narrow_crop.x1), static_cast<int>(narrow_crop.y1)),
-                      cv::Point(static_cast<int>(narrow_crop.x2), static_cast<int>(narrow_crop.y2)),
-                      cv::Scalar(255, 255, 255), 1);
+    // Narrow crop bracketts na wide — 4 corner L-shapes (military targeting style)
+    // zamiast pelnego prostokata. User feedback 2026-05-13: "biala ramka zle wyglada".
+    // Brackets sa wyrazniejsze (thickness 2), mniej dominujace w widoku, i nie traca
+    // krawedzi po resize 4K -> display.
+    {
+        cv::Point tl(static_cast<int>(narrow_crop.x1), static_cast<int>(narrow_crop.y1));
+        cv::Point br(static_cast<int>(narrow_crop.x2), static_cast<int>(narrow_crop.y2));
+        const int box_w = br.x - tl.x;
+        const int box_h = br.y - tl.y;
+        const int len = std::max(20, std::min(box_w, box_h) / 6);  // 1/6 box size, min 20 px
+        const cv::Scalar bracket_col(255, 255, 255);
+        const int bracket_thick = 2;
+        cv::Point tr(br.x, tl.y);
+        cv::Point bl(tl.x, br.y);
+        // top-left
+        cv::line(wide, tl, cv::Point(tl.x + len, tl.y), bracket_col, bracket_thick);
+        cv::line(wide, tl, cv::Point(tl.x, tl.y + len), bracket_col, bracket_thick);
+        // top-right
+        cv::line(wide, tr, cv::Point(tr.x - len, tr.y), bracket_col, bracket_thick);
+        cv::line(wide, tr, cv::Point(tr.x, tr.y + len), bracket_col, bracket_thick);
+        // bottom-left
+        cv::line(wide, bl, cv::Point(bl.x + len, bl.y), bracket_col, bracket_thick);
+        cv::line(wide, bl, cv::Point(bl.x, bl.y - len), bracket_col, bracket_thick);
+        // bottom-right
+        cv::line(wide, br, cv::Point(br.x - len, br.y), bracket_col, bracket_thick);
+        cv::line(wide, br, cv::Point(br.x, br.y - len), bracket_col, bracket_thick);
     }
 
     // Status text — owner pokazuje persistent_owner_id (stable mimo MTT raw swap)

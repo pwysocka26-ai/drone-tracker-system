@@ -910,6 +910,32 @@ int main(int argc, char** argv) {
                     latest_snap = snap;
                 }
 
+                // Video recording z worker (port z legacy linie 1290-1329).
+                // Worker is single-writer dla video_writer = thread-safe.
+                if (video_writer.isOpened() && recording_active) {
+                    cv::Mat wide_vis = draw_wide_overlays(qf.frame, tracks, sel ? *sel : -1,
+                                                            tm.persistent_owner_id(),
+                                                            lock_state, crop, narrow.state(),
+                                                            angular_offset);
+                    cv::Mat narrow_vis;
+                    int nx1 = std::max(0, static_cast<int>(crop.x1));
+                    int ny1 = std::max(0, static_cast<int>(crop.y1));
+                    int nx2 = std::min(frame_w, static_cast<int>(crop.x2));
+                    int ny2 = std::min(frame_h, static_cast<int>(crop.y2));
+                    if (nx2 > nx1 && ny2 > ny1 && narrow.state().has_owner) {
+                        narrow_vis = qf.frame(cv::Rect(nx1, ny1, nx2 - nx1, ny2 - ny1)).clone();
+                        if (narrow.state().is_synthetic) {
+                            std::ostringstream syn;
+                            syn << "HOLD " << narrow.state().hold_count;
+                            cv::putText(narrow_vis, syn.str(), cv::Point(10, 30),
+                                        cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 255, 255), 2);
+                        }
+                    }
+                    cv::Mat composite = make_composite(wide_vis, narrow_vis,
+                                                        composite_w, composite_h);
+                    video_writer.write(composite);
+                }
+
                 // Telemetry write z worker thread (single-writer, thread-safe).
                 if (telemetry_active) {
                     FrameTelemetry rec;

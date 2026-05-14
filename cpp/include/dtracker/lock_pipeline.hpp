@@ -24,7 +24,10 @@ enum class LockState {
 const char* to_string(LockState s);
 
 struct LockPipelineConfig {
-    int acquire_min_hits = 5;         // ile hits przed przejsciem ACQUIRE -> LOCKED
+    // 2026-05-14 sesja stabilizacja: 5 -> 3. Empirically v8 na test.mp4 dawal
+    // hits=4 dopiero w klatce 155, hits=5 dopiero 160 (50 klatek od ACQUIRE).
+    // 3 hits = stabilna detekcja, ale bez ryzyka fala-as-drone (FP zwykle 1 hit).
+    int acquire_min_hits = 3;         // ile hits przed przejsciem ACQUIRE -> LOCKED
     // Fix 4: hold_limit 12 -> 50 sync z TMConfig.stale_owner_frames=50.
     // Bez tego Lock FSM rzucal w REACQUIRE po 12 klatkach mimo ze TM trzymal
     // persistent ownera przez kolejne 38 klatek (telemetria: lock_loss_events
@@ -33,6 +36,12 @@ struct LockPipelineConfig {
     int reacquire_limit = 36;         // max missed_frames w REACQUIRE
     float reacquire_min_conf = 0.15f; // min conf kandydata do reacquire
     float reacquire_max_dist = 150.0f;// max odleglosc (px) od last-known-pos
+    // 2026-05-14: hysteresis na LOCKED. Bez tego state oscyluje LOCKED<->HOLD
+    // co 1-3 klatki przy każdej missed detection (czysto kosmetyczne, bo track
+    // żyje z hold_limit=50, ale UX indicator chaos). Z hysteresis=3:
+    // LOCKED zostaje LOCKED do missed_frames<3, dopiero potem HOLD. Detection
+    // recovery natychmiastowa (HOLD->LOCKED na missed_frames==0 bez hysteresis).
+    int lock_hysteresis_misses = 3;
 };
 
 struct LockPipelineState {

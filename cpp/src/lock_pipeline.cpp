@@ -102,7 +102,9 @@ LockState LockPipeline::step(std::optional<int> selected_id, const std::vector<T
                 break;
             }
             s_.last_known_center = o->center;
-            if (o->missed_frames == 0) {
+            // Hysteresis: LOCKED zostaje LOCKED do missed_frames < hysteresis,
+            // dopiero potem HOLD. Eliminuje LOCKED<->HOLD flicker per-frame.
+            if (o->missed_frames < cfg_.lock_hysteresis_misses) {
                 transit_(LockState::LOCKED);
             } else if (o->missed_frames <= cfg_.hold_limit) {
                 transit_(LockState::HOLD);

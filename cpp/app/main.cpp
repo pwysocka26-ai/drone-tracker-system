@@ -65,7 +65,11 @@ struct CliArgs {
     bool gui = true;
     bool record = true;
     int imgsz = 1280;
-    float conf = 0.20f;
+    // 2026-05-14 sesja stabilizacja: 0.20 -> 0.10. v8 na test.mp4 dawal det
+    // coverage 218/428 (51%) przy 0.20, 357/428 (83%) przy 0.10. LOCKED count
+    // taki sam (218), FP companions handled przez TM (id=3 ghost spawning ale
+    // sel zostaje na id=2 owner). Cel: szybsze ACQUIRE i mniej track death.
+    float conf = 0.10f;
     // Min bbox area (px^2) / side (px) post-NMS, pre-MTT. Defaults 25 / 4
     // dopuszczaja drony 5-15 px (area 25-225 px^2) -- niezbedne dla v5@1280.
     // Dla v4@640: 200 / 8 (legacy threshold).
@@ -599,6 +603,9 @@ int main(int argc, char** argv) {
     }
 
     MTTConfig mtt_cfg;
+    // 2026-05-14: probowano 80 (przeziycie sea blind spot 38 klatek), ale ghost
+    // track id=1 dryfowal i blokowal spawn track id=2 -> LOCKED frame 155 vs 145
+    // przy 36. Wniosek: lepiej szybka smierc + clean respawn niz dlugie ghost.
     mtt_cfg.max_missed_frames = 36;
     mtt_cfg.confirm_hits = 2;
     // 2026-05-13: 220 -> 300. Memory: drone manewr 445 px > 220. 400 bylo za duzo

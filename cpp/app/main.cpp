@@ -788,7 +788,11 @@ int main(int argc, char** argv) {
                     work_queue.pop();
                 }
 
-                // MVP tracker pipeline (synchronous detect, no ROI/CSRT)
+                // Worker tracker pipeline (sync detect, no ROI/CSRT)
+                // ROI search testowany 2026-05-14: zero visible improvement,
+                // ale +89 dropped frames (drugi inference push worker > 33ms budget).
+                // Wniosek: na test.mp4 z conf=0.10 primary YOLO juz wycinia maksimum,
+                // ROI conf=0.06 nie znajduje nic ekstra w blind spot. Skipped w MVP.
                 Detections raw = detector.detect(qf.frame);
                 Detections filtered = filter_and_pad(raw, frame_w, frame_h, a.min_area, a.min_side);
                 filtered = nms_dedup(filtered, dedup_iou, dedup_center_px);
@@ -841,6 +845,39 @@ int main(int argc, char** argv) {
                 {
                     std::lock_guard<std::mutex> lk(snap_mtx);
                     latest_snap = snap;
+                }
+
+                // Telemetry write z worker thread (single-writer, thread-safe).
+                if (telemetry_active) {
+                    FrameTelemetry rec;
+                    rec.frame_idx = qf.frame_idx;
+                    rec.time_s = static_cast<double>(qf.frame_idx) / fps;
+                    rec.selected_id = sel;
+                    rec.persistent_owner_id = tm.persistent_owner_id();
+                    if (owner) rec.active_track = owner->clone();
+                    rec.lock_state = lock_state;
+                    rec.multi_tracks.reserve(tracks.size());
+                    for (const auto& t : tracks) rec.multi_tracks.push_back(t.clone());
+                    if (narrow.state().smooth_center) rec.narrow_center = narrow.state().smooth_center;
+                    rec.center_lock = is_locked;
+                    rec.narrow_synthetic_hold = narrow.state().is_synthetic;
+                    rec.narrow_hold_count = narrow.state().hold_count;
+                    rec.narrow_has_owner = narrow.state().has_owner;
+                    rec.narrow_smooth_size = narrow.state().smooth_size;
+                    rec.narrow_crop_x1 = crop.x1;
+                    rec.narrow_crop_y1 = crop.y1;
+                    rec.narrow_crop_x2 = crop.x2;
+                    rec.narrow_crop_y2 = crop.y2;
+                    rec.narrow_rendered = (narrow.state().has_owner &&
+                                           crop.x2 > crop.x1 && crop.y2 > crop.y1);
+                    if (angular_offset) {
+                        rec.target_delta_az_mrad = angular_offset->delta_az_mrad;
+                        rec.target_delta_el_mrad = angular_offset->delta_el_mrad;
+                        rec.target_az_mrad = angular_offset->target_az_mrad;
+                        rec.target_el_mrad = angular_offset->target_el_mrad;
+                        rec.target_angular_dist_mrad = angular_offset->theta_mrad;
+                    }
+                    telemetry.write(rec);
                 }
             }
         });
@@ -920,6 +957,11 @@ int main(int argc, char** argv) {
         if (narrow_source) narrow_source->close();
         cv::destroyAllWindows();
         telemetry.close();
+
+        fs::path summary_path = run_dir / "run_summary.json";
+        write_run_summary(summary_path, disp_frame_idx, lock.state().owner_id,
+                           lock.current(), lock.state());
+        std::cout << "RUN SUMMARY: " << summary_path.string() << "\n";
         return 0;
     }
     // ====================================================================

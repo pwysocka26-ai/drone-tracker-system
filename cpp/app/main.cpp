@@ -809,6 +809,69 @@ int main(int argc, char** argv) {
                     }
                 }
                 bool is_locked = (lock_state == LockState::LOCKED);
+
+                // CSRT/KCF lifecycle (port z legacy linie 1075-1112).
+                // Init/refresh przy healthy owner, lazy update tylko gdy YOLO degraded.
+                // Synthetic owner z CSRT gdy YOLO calkiem zgubil ownera (kluczowe
+                // dla bridging sea blind spot test.mp4 frames 71-108).
+                Track synthetic_csrt_owner;
+                bool csrt_updated_this_frame = false;
+                bool csrt_synthetic_used = false;
+                bool csrt_refresh_event = false;
+                float csrt_score_seen = 0.0f;
+                bool owner_healthy = (owner && owner->missed_frames == 0 && owner->confidence >= 0.18f);
+
+                if (owner && owner->missed_frames <= 1) {
+                    int sid = owner->track_id;
+                    bool need_init = !local_tracker.is_active() || local_tracker_owner_id != sid;
+                    bool need_refresh = local_tracker.is_active()
+                                        && local_tracker_owner_id == sid
+                                        && owner->confidence >= CSRT_REFRESH_MIN_CONF
+                                        && (qf.frame_idx - local_tracker_init_frame) >= CSRT_REFRESH_INTERVAL;
+                    if (need_init || need_refresh) {
+                        if (local_tracker.init(qf.frame, owner->bbox)) {
+                            local_tracker_owner_id = sid;
+                            local_tracker_init_frame = qf.frame_idx;
+                            if (need_refresh && !need_init) csrt_refresh_event = true;
+                        }
+                    }
+                } else if (!sel && !tm.state().last_selected_center) {
+                    local_tracker.reset();
+                    local_tracker_owner_id = -1;
+                    local_tracker_init_frame = -10000;
+                }
+
+                // Smart skip: jesli worker jest behind (queue full) skip CSRT update
+                // (28ms koszt). Synthetic owner zniknie ten frame ale lock state ma
+                // hold_limit=50, przezyje. Bez tego: dropped frames cascade -> KCF
+                // out-of-sync -> drift. Lepiej skip 1 frame niz cascading drops.
+                size_t pending_queue = 0;
+                {
+                    std::lock_guard<std::mutex> lk(queue_mtx);
+                    pending_queue = work_queue.size();
+                }
+                bool worker_behind = pending_queue >= 3;
+
+                if (!owner_healthy && local_tracker.is_active() && !worker_behind) {
+                    LocalTrackResult lr = local_tracker.update(qf.frame);
+                    csrt_updated_this_frame = true;
+                    csrt_score_seen = lr.score;
+                    if (!owner && sel && lr.bbox && lr.center
+                        && (lr.ok || lr.score >= local_tracker_min_score)) {
+                        synthetic_csrt_owner.track_id = *sel;
+                        synthetic_csrt_owner.raw_id = local_tracker_owner_id;
+                        synthetic_csrt_owner.bbox = *lr.bbox;
+                        synthetic_csrt_owner.center = *lr.center;
+                        synthetic_csrt_owner.confidence = std::max(0.12f, lr.score * 0.35f);
+                        synthetic_csrt_owner.is_confirmed = true;
+                        synthetic_csrt_owner.is_active_target = true;
+                        synthetic_csrt_owner.missed_frames = 0;
+                        synthetic_csrt_owner.hits = 1;
+                        csrt_synthetic_used = true;
+                        owner = &synthetic_csrt_owner;
+                    }
+                }
+
                 narrow.update(owner, is_locked);
                 BBox crop = narrow.narrow_crop();
 
@@ -870,6 +933,11 @@ int main(int argc, char** argv) {
                     rec.narrow_crop_y2 = crop.y2;
                     rec.narrow_rendered = (narrow.state().has_owner &&
                                            crop.x2 > crop.x1 && crop.y2 > crop.y1);
+                    rec.csrt_active = local_tracker.is_active();
+                    rec.csrt_updated_this_frame = csrt_updated_this_frame;
+                    rec.csrt_synthetic_used = csrt_synthetic_used;
+                    rec.csrt_refresh_event = csrt_refresh_event;
+                    rec.csrt_score = csrt_score_seen;
                     if (angular_offset) {
                         rec.target_delta_az_mrad = angular_offset->delta_az_mrad;
                         rec.target_delta_el_mrad = angular_offset->delta_el_mrad;
@@ -899,10 +967,13 @@ int main(int argc, char** argv) {
             ++disp_frame_idx;
             if (a.max_frames > 0 && disp_frame_idx >= a.max_frames) break;
 
-            // Queue for worker (drop if backed up)
+            // Queue for worker (drop if backed up).
+            // Queue size 10: pozwala workerowi nadrobic po slow frame (CSRT update
+            // ~28ms, ROI ~17ms). Bez tego transient peak laggu = permanent dropped
+            // frames bo queue staje sie always-full. 10 = ~0.33s buffer.
             {
                 std::lock_guard<std::mutex> lk(queue_mtx);
-                if (work_queue.size() < 3) {
+                if (work_queue.size() < 10) {
                     work_queue.push({disp_frame_idx, fd.image.clone()});
                     queue_cv.notify_one();
                 } else {

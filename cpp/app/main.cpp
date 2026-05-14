@@ -93,7 +93,11 @@ struct CliArgs {
     // 2026-05-13: Async display thread (Opcja A). Wide window renderuje source
     // klatki w real-time, tracker w osobnym watku async. Bbox moze byc N-2/N-3
     // klatek stary, ale display nie czeka na tracker = zero wizualnego lagu.
-    bool display_thread = false;
+    // 2026-05-14: default ON po feature-complete (telemetry, recording, CSRT,
+    // manual controls). Trade-off: test.mp4 hard blind spot LOCKED -26% vs
+    // legacy (worker drops frames pod CSRT load). DJI clips parity. Opt-out
+    // via --no-display-thread dla max tracking quality.
+    bool display_thread = true;
 };
 
 static CliArgs parse_args(int argc, char** argv) {
@@ -132,11 +136,13 @@ static CliArgs parse_args(int argc, char** argv) {
         if (s == "--async") { a.async = true; continue; }
         if (s == "--no-async") { a.async = false; continue; }
         if (s == "--display-thread") { a.display_thread = true; continue; }
+        if (s == "--no-display-thread") { a.display_thread = false; continue; }
         if (s == "-h" || s == "--help") {
             std::cout << "Usage: dtracker_main [--video PATH] [--model PATH] [--out-dir PATH]"
                       << " [--imgsz N] [--conf F] [--min-area F] [--min-side F]"
                       << " [--fov-h-deg F] [--axis-az-mrad F] [--axis-el-mrad F] [--gimbal-csv PATH]"
-                      << " [--max-frames N] [--no-gui] [--no-record] [--cpu] [--no-async] [--display-thread]\n";
+                      << " [--max-frames N] [--no-gui] [--no-record] [--cpu] [--no-async]"
+                      << " [--display-thread|--no-display-thread]\n";
             std::exit(0);
         }
     }
@@ -776,6 +782,13 @@ int main(int argc, char** argv) {
         latest_snap->narrow_crop = BBox{0, 0, static_cast<float>(frame_w), static_cast<float>(frame_h)};
         std::mutex snap_mtx;
 
+        // Manual lock commands queue. Display loop pisze (key handler), worker drena
+        // przed tm.select(). Bez tego race na tm state. -1 = nothing, 0 = clear,
+        // positive = set_manual_lock(id).
+        std::atomic<int> pending_manual_lock{-1};
+        std::atomic<bool> rec_active{recording_active};
+        std::atomic<bool> tel_active{telemetry_active};
+
         std::thread worker_thread([&]() {
             int worker_drop_streak = 0;
             while (!stop_worker.load()) {
@@ -799,6 +812,15 @@ int main(int argc, char** argv) {
 
                 std::vector<Track> tracks = mtt.update(filtered, qf.frame);
                 worker_drop_streak = filtered.empty() ? worker_drop_streak + 1 : 0;
+
+                // Drain manual lock command z display loop przed tm.select().
+                int ml_cmd = pending_manual_lock.exchange(-1);
+                if (ml_cmd == 0) {
+                    tm.clear_manual_lock();
+                } else if (ml_cmd > 0) {
+                    tm.set_manual_lock(ml_cmd);
+                }
+
                 std::optional<int> sel = tm.select(tracks);
                 LockState lock_state = lock.step(sel, tracks);
 
@@ -912,7 +934,7 @@ int main(int argc, char** argv) {
 
                 // Video recording z worker (port z legacy linie 1290-1329).
                 // Worker is single-writer dla video_writer = thread-safe.
-                if (video_writer.isOpened() && recording_active) {
+                if (video_writer.isOpened() && rec_active.load()) {
                     cv::Mat wide_vis = draw_wide_overlays(qf.frame, tracks, sel ? *sel : -1,
                                                             tm.persistent_owner_id(),
                                                             lock_state, crop, narrow.state(),
@@ -937,7 +959,7 @@ int main(int argc, char** argv) {
                 }
 
                 // Telemetry write z worker thread (single-writer, thread-safe).
-                if (telemetry_active) {
+                if (tel_active.load()) {
                     FrameTelemetry rec;
                     rec.frame_idx = qf.frame_idx;
                     rec.time_s = static_cast<double>(qf.frame_idx) / fps;
@@ -1019,8 +1041,59 @@ int main(int argc, char** argv) {
                                         snap->narrow_state, snap->narrow_crop, snap->angular,
                                         snap->persistent_owner_id);
             }
-            if (key == 'q' || key == 'Q' || key == 27) {
+            if (key == 27 || key == 'q' || key == 'Q') {
                 quit_disp = true;
+            } else if (key == 's' || key == 'S') {
+                std::ostringstream snap_name;
+                snap_name << "snap_" << disp_frame_idx << ".png";
+                fs::path snap_path = images_dir / snap_name.str();
+                cv::imwrite(snap_path.string(), fd.image);
+                std::cout << "SHOT: " << snap_path.string() << "\n";
+            } else if (key == 'r' || key == 'R') {
+                bool new_state = !rec_active.load();
+                rec_active.store(new_state);
+                std::cout << "RECORDING " << (new_state ? "ON" : "OFF") << "\n";
+            } else if (key == 't' || key == 'T') {
+                bool new_state = !tel_active.load();
+                tel_active.store(new_state);
+                std::cout << "TELEMETRY " << (new_state ? "ON" : "OFF") << "\n";
+            } else if (key == '0') {
+                pending_manual_lock.store(0);
+                std::cout << "MANUAL LOCK CLEARED\n";
+            } else if (key >= '1' && key <= '9') {
+                int idx = key - '1';
+                std::vector<Track> sorted;
+                sorted.reserve(snap->tracks.size());
+                for (const auto& t : snap->tracks) sorted.push_back(t.clone());
+                std::sort(sorted.begin(), sorted.end(),
+                          [](const Track& a, const Track& b) {
+                              return a.track_id < b.track_id;
+                          });
+                if (idx < static_cast<int>(sorted.size())) {
+                    pending_manual_lock.store(sorted[idx].track_id);
+                    std::cout << "MANUAL LOCK -> id " << sorted[idx].track_id << "\n";
+                }
+            } else if (key == ',' || key == '.') {
+                std::vector<Track> sorted;
+                sorted.reserve(snap->tracks.size());
+                for (const auto& t : snap->tracks) sorted.push_back(t.clone());
+                std::sort(sorted.begin(), sorted.end(),
+                          [](const Track& a, const Track& b) {
+                              return a.track_id < b.track_id;
+                          });
+                if (!sorted.empty()) {
+                    int cur_idx = 0;
+                    if (snap->sel_id > 0) {
+                        for (size_t i = 0; i < sorted.size(); ++i) {
+                            if (sorted[i].track_id == snap->sel_id) { cur_idx = static_cast<int>(i); break; }
+                        }
+                    }
+                    int step = (key == ',') ? -1 : 1;
+                    int n = static_cast<int>(sorted.size());
+                    int next_idx = ((cur_idx + step) % n + n) % n;
+                    pending_manual_lock.store(sorted[next_idx].track_id);
+                    std::cout << "MANUAL LOCK -> id " << sorted[next_idx].track_id << "\n";
+                }
             }
 
             // Pacing: spij do nastepnej target frame time (ale nie cofamy gdy behind).

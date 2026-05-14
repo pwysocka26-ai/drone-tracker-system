@@ -159,7 +159,13 @@ static Detections filter_and_pad(const Detections& raw, int frame_w, int frame_h
     Detections out;
     out.reserve(raw.size());
     const float bottom_y = static_cast<float>(frame_h) * 0.82f;
-    const float max_area = static_cast<float>(frame_w) * static_cast<float>(frame_h) * 0.035f;
+    // 2026-05-14 BUG FIX: 0.035 (era v3/v4 z malymi dronami 5-50 px) odrzucalo
+    // Phantom 3 close-up w test.mp4 (bbox 444x244 = 108k px^2 = 5.2% klatki >
+    // 3.5%). Telemetry blind spot 1-33 by\xC5\x82 ARTIFACT tego filtra, nie YOLO miss.
+    // Python ONNX CPU dawal conf 0.72-0.79, C++ filter rzucal jako "too big".
+    // 0.15 = 15% klatki = ~560x560 max bbox dla 1920x1080. Safe margin dla
+    // close-up bez wpuszczania whole-frame FPs.
+    const float max_area = static_cast<float>(frame_w) * static_cast<float>(frame_h) * 0.15f;
     for (const auto& d : raw) {
         float bw = d.bbox.width();
         float bh = d.bbox.height();

@@ -86,6 +86,10 @@ struct CliArgs {
     // alignment zachowane (display frame N-1 z detections N-1).
     // Default ON od 2026-05-13 — 20-23% szybszy cycle, sync output bit-exact.
     bool async = true;
+    // 2026-05-13: Async display thread (Opcja A). Wide window renderuje source
+    // klatki w real-time, tracker w osobnym watku async. Bbox moze byc N-2/N-3
+    // klatek stary, ale display nie czeka na tracker = zero wizualnego lagu.
+    bool display_thread = false;
 };
 
 static CliArgs parse_args(int argc, char** argv) {
@@ -123,11 +127,12 @@ static CliArgs parse_args(int argc, char** argv) {
         if (s == "--cpu") { a.use_directml = false; continue; }
         if (s == "--async") { a.async = true; continue; }
         if (s == "--no-async") { a.async = false; continue; }
+        if (s == "--display-thread") { a.display_thread = true; continue; }
         if (s == "-h" || s == "--help") {
             std::cout << "Usage: dtracker_main [--video PATH] [--model PATH] [--out-dir PATH]"
                       << " [--imgsz N] [--conf F] [--min-area F] [--min-side F]"
                       << " [--fov-h-deg F] [--axis-az-mrad F] [--axis-el-mrad F] [--gimbal-csv PATH]"
-                      << " [--max-frames N] [--no-gui] [--no-record] [--cpu] [--no-async]\n";
+                      << " [--max-frames N] [--no-gui] [--no-record] [--cpu] [--no-async] [--display-thread]\n";
             std::exit(0);
         }
     }
@@ -733,6 +738,186 @@ int main(int argc, char** argv) {
     // Runtime toggles (R = recording, T = telemetry). Domyslny stan z CLI flag.
     bool recording_active = a.record;
     bool telemetry_active = true;
+
+    // ====================================================================
+    // === DISPLAY THREAD MODE (Opcja A, 2026-05-13) ===
+    // Wide window renderuje source w real-time, tracker pracuje async.
+    // Bbox moze byc 1-3 klatki stary, ale display nie czeka na tracker.
+    // MVP: bez ROI search, CSRT, telemetry, recording (do dolozenia po
+    // weryfikacji konceptu).
+    // ====================================================================
+    if (a.display_thread) {
+        struct DisplaySnapshot {
+            int frame_idx = -1;
+            std::vector<Track> tracks;
+            int sel_id = -1;
+            LockState lock_state = LockState::UNLOCKED;
+            NarrowState narrow_state;
+            BBox narrow_crop = BBox{0, 0, 0, 0};
+            std::optional<AngularOffset> angular;
+            int persistent_owner_id = -1;
+        };
+        struct QueuedFrame { int frame_idx; cv::Mat frame; };
+        std::queue<QueuedFrame> work_queue;
+        std::mutex queue_mtx;
+        std::condition_variable queue_cv;
+        std::atomic<bool> stop_worker{false};
+        // MSVC nie wspiera std::atomic<std::shared_ptr<T>> trivially copyable
+        // — uzywamy mutex-protected shared_ptr (read/write rzadkie, locking taniejszy
+        // od kopii structu z vector<Track>).
+        std::shared_ptr<DisplaySnapshot> latest_snap = std::make_shared<DisplaySnapshot>();
+        latest_snap->narrow_crop = BBox{0, 0, static_cast<float>(frame_w), static_cast<float>(frame_h)};
+        std::mutex snap_mtx;
+
+        std::thread worker_thread([&]() {
+            int worker_drop_streak = 0;
+            while (!stop_worker.load()) {
+                QueuedFrame qf;
+                {
+                    std::unique_lock<std::mutex> lk(queue_mtx);
+                    queue_cv.wait(lk, [&]{ return !work_queue.empty() || stop_worker.load(); });
+                    if (stop_worker.load() && work_queue.empty()) break;
+                    qf = std::move(work_queue.front());
+                    work_queue.pop();
+                }
+
+                // MVP tracker pipeline (synchronous detect, no ROI/CSRT)
+                Detections raw = detector.detect(qf.frame);
+                Detections filtered = filter_and_pad(raw, frame_w, frame_h, a.min_area, a.min_side);
+                filtered = nms_dedup(filtered, dedup_iou, dedup_center_px);
+
+                std::vector<Track> tracks = mtt.update(filtered, qf.frame);
+                worker_drop_streak = filtered.empty() ? worker_drop_streak + 1 : 0;
+                std::optional<int> sel = tm.select(tracks);
+                LockState lock_state = lock.step(sel, tracks);
+
+                const Track* owner = nullptr;
+                if (sel) {
+                    for (const auto& t : tracks) {
+                        if (t.track_id == *sel) { owner = &t; break; }
+                    }
+                }
+                bool is_locked = (lock_state == LockState::LOCKED);
+                narrow.update(owner, is_locked);
+                BBox crop = narrow.narrow_crop();
+
+                std::optional<AngularOffset> angular_offset;
+                if (owner) {
+                    std::optional<GimbalSnapshot> g;
+                    if (gimbal_csv_source) {
+                        g = gimbal_csv_source->lookup(qf.frame_idx, frame_w, frame_h);
+                    } else if (a.fov_h_deg > 0.0f) {
+                        GimbalSnapshot s;
+                        s.fov_h_rad = deg_to_rad(a.fov_h_deg);
+                        s.fov_v_rad = fov_v_from_h(s.fov_h_rad, frame_w, frame_h);
+                        s.axis_az_mrad = a.axis_az_mrad;
+                        s.axis_el_mrad = a.axis_el_mrad;
+                        g = s;
+                    }
+                    if (g) {
+                        float cx = 0.5f * (owner->bbox.x1 + owner->bbox.x2);
+                        float cy = 0.5f * (owner->bbox.y1 + owner->bbox.y2);
+                        angular_offset = pixel_to_angular(cx, cy, frame_w, frame_h, *g);
+                    }
+                }
+
+                auto snap = std::make_shared<DisplaySnapshot>();
+                snap->frame_idx = qf.frame_idx;
+                snap->tracks.reserve(tracks.size());
+                for (const auto& t : tracks) snap->tracks.push_back(t.clone());
+                snap->sel_id = sel ? *sel : -1;
+                snap->lock_state = lock_state;
+                snap->narrow_state = narrow.state();
+                snap->narrow_crop = crop;
+                snap->angular = angular_offset;
+                snap->persistent_owner_id = tm.persistent_owner_id();
+                {
+                    std::lock_guard<std::mutex> lk(snap_mtx);
+                    latest_snap = snap;
+                }
+            }
+        });
+
+        // === Display loop ===
+        auto t_disp_start = std::chrono::steady_clock::now();
+        int disp_frame_idx = 0;
+        bool quit_disp = false;
+        int dropped_frames = 0;
+        // Pacing do source fps. Bez tego file playback leci as-fast-as-possible
+        // (np. 71 fps na 30-fps source = 2.4x speed). Real-time camera ma natural
+        // pacing przez blocking read, file source nie ma — sztucznie throttle.
+        const double frame_period_us = (fps > 0.0) ? (1e6 / fps) : (1e6 / 30.0);
+        std::cout << "\n=== DISPLAY THREAD MODE === (target " << fps << " fps)\n";
+        while (!quit_disp) {
+            auto t_frame0 = std::chrono::steady_clock::now();
+            dtracker::io::Frame fd;
+            if (!source->read(fd) || fd.image.empty()) break;
+            ++disp_frame_idx;
+            if (a.max_frames > 0 && disp_frame_idx >= a.max_frames) break;
+
+            // Queue for worker (drop if backed up)
+            {
+                std::lock_guard<std::mutex> lk(queue_mtx);
+                if (work_queue.size() < 3) {
+                    work_queue.push({disp_frame_idx, fd.image.clone()});
+                    queue_cv.notify_one();
+                } else {
+                    ++dropped_frames;
+                }
+            }
+
+            std::shared_ptr<DisplaySnapshot> snap;
+            {
+                std::lock_guard<std::mutex> lk(snap_mtx);
+                snap = latest_snap;
+            }
+
+            int key = -1;
+            if (a.gui) {
+                key = dashboard.render(fd.image, snap->tracks, snap->sel_id, snap->lock_state,
+                                        snap->narrow_state, snap->narrow_crop, snap->angular,
+                                        snap->persistent_owner_id);
+            }
+            if (key == 'q' || key == 'Q' || key == 27) {
+                quit_disp = true;
+            }
+
+            // Pacing: spij do nastepnej target frame time (ale nie cofamy gdy behind).
+            auto t_target = t_disp_start + std::chrono::microseconds(
+                static_cast<long long>(disp_frame_idx * frame_period_us));
+            auto now = std::chrono::steady_clock::now();
+            if (now < t_target) {
+                std::this_thread::sleep_until(t_target);
+            }
+        }
+
+        // Cleanup worker
+        stop_worker.store(true);
+        queue_cv.notify_all();
+        worker_thread.join();
+
+        auto t_disp_end = std::chrono::steady_clock::now();
+        double disp_s = std::chrono::duration<double>(t_disp_end - t_disp_start).count();
+        std::shared_ptr<DisplaySnapshot> final_snap;
+        {
+            std::lock_guard<std::mutex> lk(snap_mtx);
+            final_snap = latest_snap;
+        }
+        std::cout << "Display frames: " << disp_frame_idx << " / " << disp_s << "s = "
+                  << (disp_frame_idx > 0 ? disp_frame_idx / disp_s : 0.0) << " fps (display thread)\n";
+        std::cout << "Worker processed up to frame: " << final_snap->frame_idx << "\n";
+        std::cout << "Dropped frames (queue full): " << dropped_frames << "\n";
+
+        if (video_writer.isOpened()) video_writer.release();
+        source->close();
+        if (narrow_source) narrow_source->close();
+        cv::destroyAllWindows();
+        telemetry.close();
+        return 0;
+    }
+    // ====================================================================
+    // === LEGACY SINGLE-THREAD MODE (below) ===
+    // ====================================================================
 
     while (!quit) {
         auto t_cycle0 = std::chrono::steady_clock::now();
